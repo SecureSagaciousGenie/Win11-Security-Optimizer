@@ -1,0 +1,12 @@
+# Logs and backups created at runtime (per machine)
+Win11SecAudit_Reports/
+**/Win11SecurityOptimizer/
+
+# Build output
+dist/
+*.exe
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
