@@ -507,7 +507,7 @@ function Invoke-Background {
     $ps.Runspace = $rs
     [void]$ps.AddScript({
         . $CorePath
-        Initialize-Core | Out-Null
+        Initialize-Core -ReadOnly | Out-Null
         # Progress helper available to $WorkBody as $Report.
         $Report = { param($m) try { $SharedState.Status = $m } catch { } }
         Set-Variable -Name Report -Value $Report -Scope Global
@@ -779,10 +779,9 @@ function Start-DfirScan {
         [pscustomobject]@{ Findings=$f; Summary=(Get-DfirSummary $f) }
     } -OnDone {
         param($res)
-        $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
-        # Alerts/Reviews first, then clean
-        $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $cards | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
+        $cards = @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
+        # Alerts/Reviews first, then clean; severity by rank inside each status
+        $sorted = Sort-DfirFinding -Findings $cards
         $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
         $s = $res.Summary
         $script:UIRef.UI.CardDfir.Text = "$($s.Alerts + $s.Reviews)"
@@ -914,6 +913,18 @@ function Show-ConsentDialog {
     return $null
 }
 
+function Show-SecureSetupNotice {
+    <# Shows the quarantine notice once, then clears it. #>
+    if (-not $script:Core.SecureSetupNotice) { return }
+    $text = $script:Core.SecureSetupNotice
+    $script:Core.SecureSetupNotice = $null
+    try {
+        [System.Windows.MessageBox]::Show($text, 'Untrusted data folder moved aside', 'OK', 'Information') | Out-Null
+    } catch {
+        Write-CoreLog -Message ("Could not show the quarantine notice: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
 function Start-ProScan {
     param([Parameter(Mandatory)][string]$Key)
     $tool = Get-ExternalTool -Key $Key
@@ -933,6 +944,7 @@ function Start-ProScan {
         [System.Windows.MessageBox]::Show("Could not secure the tools folder:`n$($_.Exception.Message)", 'Pro Tools blocked', 'OK', 'Error') | Out-Null
         return
     }
+    Show-SecureSetupNotice
 
     # Already installed? Offer to reuse without re-consenting to a download.
     $installed = Test-ExternalToolInstalled -Key $Key
@@ -965,10 +977,9 @@ function Start-ProScan {
         # Merge the external findings INTO the current Investigate list (keep native ones).
         $existing = @()
         if ($script:UIRef.UI.DfirList.ItemsSource) { $existing = @($script:UIRef.UI.DfirList.ItemsSource) }
-        $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
+        $cards = @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
         $combined = @($existing) + @($cards)
-        $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $combined | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
+        $sorted = Sort-DfirFinding -Findings $combined
         $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
         $alerts = @($combined | Where-Object { $_.Status -eq 'Alert' }).Count
         $reviews = @($combined | Where-Object { $_.Status -eq 'Review' }).Count
@@ -1169,6 +1180,7 @@ function Start-Optimizer {
     # standard user pre-created it and denied Administrators), Initialize-Core fell
     # back to %LOCALAPPDATA% for rollback/backup files. That is user-writable, so
     # warn the user explicitly rather than letting it pass silently.
+    if (-not $SelfTest) { Show-SecureSetupNotice }
     if (-not $SelfTest -and $script:Core.SecureSetupWarning) {
         try {
             [System.Windows.MessageBox]::Show(

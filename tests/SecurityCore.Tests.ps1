@@ -7,6 +7,11 @@
 
 BeforeDiscovery {
     $script:OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or ((Test-Path variable:IsWindows) -and $IsWindows)
+    $script:OnWindowsAdmin = $false
+    if ($script:OnWindows) {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        $script:OnWindowsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
 }
 
 Describe 'SecurityCore' {
@@ -244,40 +249,316 @@ Describe 'SecurityCore' {
     }
 
     Describe 'f. Save-RollbackArtifacts re-owns files in the secure base' {
-        It 'calls Set-ItemOwnerAdministrators on the rollback script' {
-            if (-not (Get-Command Set-ItemOwnerAdministrators -ErrorAction SilentlyContinue)) {
-                function script:Set-ItemOwnerAdministrators { param([string]$Path) }
-            }
+        BeforeAll {
+            $script:SecBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+            New-Item -ItemType Directory -Path (Join-Path $script:SecBase 'backups') -Force | Out-Null
+        }
+        BeforeEach {
             Mock Set-ItemOwnerAdministrators { }
-            $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
-            New-Item -ItemType Directory -Path (Join-Path $base 'backups') -Force | Out-Null
-            $oldR = $script:Core.RollbackFile; $oldB = $script:Core.BackupFile
-            try {
-                $script:Core.RollbackFile = $base + '\backups\Rollback_test.ps1'
-                $script:Core.BackupFile   = $base + '\backups\Backup_test.json'
-                $script:Core.Rollback.Clear(); [void]$script:Core.Rollback.Add("# test`r`nWrite-Output 'x'")
-                $script:Core.Backups.Clear(); [void]$script:Core.Backups.Add([pscustomobject]@{ Kind = 'Registry'; Path = 'HKCU:\x'; Name = 'y' })
-                Save-RollbackArtifacts
-                $rf = $script:Core.RollbackFile
-                Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -eq $rf } -Times 1
-            } finally {
-                $script:Core.RollbackFile = $oldR; $script:Core.BackupFile = $oldB
-                $script:Core.Rollback.Clear(); $script:Core.Backups.Clear()
-            }
+            $script:OldR = $script:Core.RollbackFile; $script:OldB = $script:Core.BackupFile
+            $script:Core.RollbackFile = Join-Path $script:SecBase 'backups\Rollback_test.ps1'
+            $script:Core.BackupFile   = Join-Path $script:SecBase 'backups\Backup_test.json'
+            $script:Core.Rollback.Clear(); [void]$script:Core.Rollback.Add("# test`r`nWrite-Output 'x'")
+            $script:Core.Backups.Clear(); [void]$script:Core.Backups.Add([pscustomobject]@{ Kind = 'Registry'; Path = 'HKCU:\x'; Name = 'y' })
+        }
+        AfterEach {
+            $script:Core.RollbackFile = $script:OldR; $script:Core.BackupFile = $script:OldB
+            $script:Core.Rollback.Clear(); $script:Core.Backups.Clear()
+        }
+        It 'calls Set-ItemOwnerAdministrators on the rollback script and the backup file' {
+            Save-RollbackArtifacts
+            $rf = $script:Core.RollbackFile; $bf = $script:Core.BackupFile
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -eq $rf } -Times 1 -Exactly
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -eq $bf } -Times 1 -Exactly
+        }
+        It 'writes a single backup record as a JSON array' {
+            Save-RollbackArtifacts
+            $json = Get-Content -LiteralPath $script:Core.BackupFile -Raw
+            $json.TrimStart([char]0xFEFF, ' ', "`r", "`n").Substring(0, 1) | Should -Be '['
+            @(ConvertFrom-Json -InputObject $json).Count | Should -Be 1
+        }
+    }
+
+    Describe 'Write-SecureFile' {
+        BeforeEach { Mock Set-ItemOwnerAdministrators { } }
+        It 're-owns a file written inside the secure base' {
+            $dir = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $p = Join-Path $dir 'x.txt'
+            Write-SecureFile -Path $p -Value 'abc'
+            (Get-Content -LiteralPath $p -Raw).Trim() | Should -Be 'abc'
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -eq $p } -Times 1 -Exactly
+        }
+        It 'leaves files outside the secure base alone' {
+            $p = Join-Path $env:LOCALAPPDATA 'x.txt'
+            Write-SecureFile -Path $p -Value ''
+            Test-Path -LiteralPath $p | Should -BeTrue
+            Should -Invoke Set-ItemOwnerAdministrators -Times 0 -Exactly
+        }
+        It 'does not treat a sibling folder with the same prefix as the base' {
+            $dir = $env:ProgramData + [System.IO.Path]::DirectorySeparatorChar + 'Win11SecurityOptimizerEvil'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Write-SecureFile -Path (Join-Path $dir 'x.txt') -Value 'x'
+            Should -Invoke Set-ItemOwnerAdministrators -Times 0 -Exactly
         }
     }
 
     Describe 'g. Initialize-Core -ReadOnly never mutates the secure base' {
-        It 'does not call the securing helpers even when elevated' {
-            Mock Test-IsAdmin { $true }
+        BeforeEach {
             Mock Initialize-SecureBase { Join-Path $env:ProgramData 'Win11SecurityOptimizer' }
             Mock Set-ToolsFolderAcl { }
             Mock Set-TreeOwnerToAdministrators { }
+            Mock Set-ItemOwnerAdministrators { }
+            $script:SecureBackups = Join-Path $env:ProgramData 'Win11SecurityOptimizer\backups'
+            New-Item -ItemType Directory -Path $script:SecureBackups -Force | Out-Null
+        }
+        AfterEach {
+            Mock Test-IsAdmin { $false }
+            Initialize-Core | Out-Null
+        }
+        It 'does not call the securing helpers even when elevated' {
+            Mock Test-IsAdmin { $true }
             Mock Test-FolderOwnedBySystemOrAdmins { $true }
             Initialize-Core -ReadOnly | Out-Null
             Should -Invoke Initialize-SecureBase -Times 0 -Exactly
             Should -Invoke Set-ToolsFolderAcl -Times 0 -Exactly
             Should -Invoke Set-TreeOwnerToAdministrators -Times 0 -Exactly
+            Should -Invoke Set-ItemOwnerAdministrators -Times 0 -Exactly
+        }
+        It 'uses the secure backups folder when elevated and it is owned by Administrators' {
+            Mock Test-IsAdmin { $true }
+            Mock Test-FolderOwnedBySystemOrAdmins { $true }
+            Initialize-Core -ReadOnly | Out-Null
+            $script:Core.BackupDir | Should -Be $script:SecureBackups
+        }
+        It 'falls back to LOCALAPPDATA when the secure backups folder is not owned by Administrators' {
+            Mock Test-IsAdmin { $true }
+            Mock Test-FolderOwnedBySystemOrAdmins { $false }
+            Initialize-Core -ReadOnly | Out-Null
+            $script:Core.BackupDir.StartsWith($env:LOCALAPPDATA, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+        }
+        It 'falls back to LOCALAPPDATA when not elevated' {
+            Mock Test-IsAdmin { $false }
+            Mock Test-FolderOwnedBySystemOrAdmins { $true }
+            Initialize-Core -ReadOnly | Out-Null
+            $script:Core.BackupDir.StartsWith($env:LOCALAPPDATA, [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+        }
+    }
+
+    Describe 'Initialize-SecureBase quarantines an untrusted base' {
+        BeforeEach {
+            Mock Test-IsAdmin { $true }
+            Mock Set-ToolsFolderAcl { }
+            Mock Set-ItemOwnerAdministrators { }
+            Mock Test-FolderOwnedBySystemOrAdmins { $true }
+            $script:QBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+            if (Test-Path -LiteralPath $script:QBase) { Remove-Item -LiteralPath $script:QBase -Recurse -Force }
+            New-Item -ItemType Directory -Path (Join-Path $script:QBase 'backups') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:QBase 'backups\Rollback_20260101_000000.ps1') -Value 'Write-Host planted'
+            $script:Core.SecureSetupNotice = $null
+        }
+        It 'moves the planted tree aside instead of deleting it and explains why' {
+            Mock Test-TreeOwnership { $false }
+            $b = Initialize-SecureBase
+            $b | Should -Be $script:QBase
+            Test-Path -LiteralPath (Join-Path $script:QBase 'backups\Rollback_20260101_000000.ps1') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $script:QBase 'backups') | Should -BeTrue
+            $q = @(Get-ChildItem -LiteralPath $env:ProgramData -Directory | Where-Object { $_.Name -like 'Win11SecurityOptimizer.untrusted-*' })
+            $q.Count | Should -Be 1
+            Test-Path -LiteralPath (Join-Path $q[0].FullName 'backups\Rollback_20260101_000000.ps1') | Should -BeTrue
+            $script:Core.SecureSetupNotice | Should -Match ([regex]::Escape($q[0].FullName))
+            $script:Core.SecureSetupNotice | Should -Match 'Nothing in that folder is ever run'
+            $script:Core.SecureSetupNotice | Should -Match 'untrusted'
+            Remove-Item -LiteralPath $q[0].FullName -Recurse -Force
+        }
+        It 'leaves a trusted base in place and sets no notice' {
+            Mock Test-TreeOwnership { $true }
+            Initialize-SecureBase | Out-Null
+            Test-Path -LiteralPath (Join-Path $script:QBase 'backups\Rollback_20260101_000000.ps1') | Should -BeTrue
+            $script:Core.SecureSetupNotice | Should -BeNullOrEmpty
+        }
+        It 'no longer has a delete-based cleanup' {
+            Get-Command Remove-TreeSafely -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        }
+    }
+
+    Describe 'Install-ExternalTool on the background thread' {
+        BeforeAll {
+            Mock Test-IsAdmin { $true }
+            Mock Initialize-SecureToolsRoot { throw 'must not be called off the main thread' }
+            Mock Initialize-SecureBase { throw 'must not be called off the main thread' }
+            Mock Test-ToolsRootSecure { $true }
+            Mock Test-ExternalToolInstalled { $null }
+            Mock Import-Module { } -ParameterFilter { $Name -eq 'BitsTransfer' }
+            $script:ZipBytes = [byte[]](0x50, 0x4B, 0x03, 0x04, 9, 9, 9, 9)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $script:ZipSha = ([System.BitConverter]::ToString($sha.ComputeHash($script:ZipBytes)) -replace '-', '').ToUpper()
+            Mock Start-BitsTransfer { [System.IO.File]::WriteAllBytes([string]$Destination[0], $script:ZipBytes) }
+            Mock Expand-Archive { Set-Content -LiteralPath (Join-Path $DestinationPath 'hayabusa-4.1.0-win-x64.exe') -Value 'not a real exe' }
+            Mock Set-TreeOwnerToAdministrators { }
+            Mock Set-ToolsFolderAcl { }
+            Mock Set-ItemOwnerAdministrators { }
+        }
+        It 'installs without re-securing the base and re-owns its manifests' {
+            $res = [pscustomobject]@{
+                Key = 'hayabusa'; Name = 'Hayabusa'; Version = 'v4.1.0'; AssetName = 'hayabusa-4.1.0-win-x64.zip'
+                DownloadUrl = 'https://github.com/x/y.zip'; SizeMB = 0; Sha256Expected = $script:ZipSha; Sha256Source = 'pinned'
+            }
+            $r = Install-ExternalTool -Key 'hayabusa' -ConsentAccepted -Resolution $res
+            $r.Message | Should -Be 'Installed.'
+            $r.Success | Should -BeTrue
+            Should -Invoke Initialize-SecureToolsRoot -Times 0 -Exactly
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -like '*install.json' } -Times 1 -Exactly
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -like '*exe.sha256' } -Times 1 -Exactly
+            $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+            Should -Invoke Set-ToolsFolderAcl -ParameterFilter { $Path -eq $base } -Times 0 -Exactly
+            $meta = Get-Content -LiteralPath (Join-Path (Get-ExternalToolInstallPath -Key 'hayabusa' -Version 'v4.1.0') 'install.json') -Raw | ConvertFrom-Json
+            $meta.Sha256 | Should -Be $script:ZipSha
+        }
+    }
+
+    Describe 'Locale-safe Administrators lookup' {
+        It 'asks for the group by SID' {
+            Mock Get-LocalGroupMember {
+                $m = New-Object W11SOTest.FakeGroupMember
+                $m.Name = 'PC\Administrateur'; $m.ObjectClass = 'User'
+                $m.SID = New-Object W11SOTest.FakeSid -ArgumentList 'S-1-5-21-1000-2000-3000-500'
+                $m
+            }
+            $m = @(Get-LocalAdminMember)
+            $m.Count | Should -Be 1
+            $m[0].Name | Should -Be 'PC\Administrateur'
+            $m[0].Sid | Should -Be 'S-1-5-21-1000-2000-3000-500'
+            Should -Invoke Get-LocalGroupMember -ParameterFilter { $SID -eq 'S-1-5-32-544' } -Times 1 -Exactly
+        }
+        It 'parses net localgroup output in any language' {
+            $lines = @(
+                'Aliasname     Administratoren',
+                'Beschreibung  Administratoren haben uneingeschraenkten Vollzugriff',
+                '',
+                'Mitglieder',
+                '',
+                '-------------------------------------------------------------------------------',
+                'Administrator',
+                'PC\eve',
+                'Der Befehl wurde erfolgreich ausgefuehrt.',
+                ''
+            )
+            $m = @(ConvertFrom-NetLocalGroupOutput -Lines $lines)
+            $m.Count | Should -Be 2
+            $m[0] | Should -Be 'Administrator'
+            $m[1] | Should -Be 'PC\eve'
+        }
+        It 'returns nothing when the group has no members' {
+            @(ConvertFrom-NetLocalGroupOutput -Lines @('Alias name x', '-----', 'The command completed successfully.')).Count | Should -Be 0
+        }
+        It 'treats the RID 500 account as expected whatever its name' {
+            Mock Get-LocalAdminMember { [pscustomobject]@{ Name = 'PC\Administrateur'; Sid = 'S-1-5-21-1000-2000-3000-500' } }
+            Mock Get-LocalUser { New-FakeUser -Name 'bob' }
+            Mock Get-StartupItems { }
+            Mock Get-ScheduledTask { }
+            Mock Get-CimInstance { }
+            Mock Get-RegValue { 1 }
+            Mock Get-NetTCPConnection { }
+            Mock Get-SmbShare { }
+            Mock Get-MpPreference { New-Object W11SOTest.FakeMpPreference }
+            (Get-Card @(Invoke-DfirTriage) 'DFIR-ADMIN').Status | Should -Be 'Clean'
+        }
+    }
+
+    Describe 'Locale-safe Guest account' {
+        BeforeEach {
+            Mock Assert-SafeToChange { }
+            Mock Disable-LocalUser { }
+            $script:Core.Rollback.Clear()
+        }
+        It 'finds the Guest account by RID 501 whatever its name' {
+            Mock Get-LocalUser { New-FakeUser -Name 'bob'; New-FakeUser -Name 'Invite' -Enabled $true -Sid 'S-1-5-21-1000-2000-3000-501' }
+            (Get-GuestAccount).Name | Should -Be 'Invite'
+        }
+        It 'disables Guest by SID and writes a SID-based rollback' {
+            $script:GuestEnabled = $true
+            Mock Get-LocalUser { New-FakeUser -Name 'Invite' -Enabled $script:GuestEnabled -Sid 'S-1-5-21-1000-2000-3000-501' }
+            & (Get-SecurityFixAction -Id 'ACCT-GUEST')
+            Should -Invoke Disable-LocalUser -ParameterFilter { "$SID" -eq 'S-1-5-21-1000-2000-3000-501' } -Times 1 -Exactly
+            $text = $script:Core.Rollback.ToArray() -join "`r`n"
+            $text | Should -Match "Enable-LocalUser -SID 'S-1-5-21-1000-2000-3000-501'"
+            $script:GuestEnabled = $false
+            Test-SecurityFixApplied -Id 'ACCT-GUEST' | Should -BeTrue
+        }
+        It 'is idempotent when Guest is already disabled' {
+            Mock Get-LocalUser { New-FakeUser -Name 'Invite' -Enabled $false -Sid 'S-1-5-21-1000-2000-3000-501' }
+            & (Get-SecurityFixAction -Id 'ACCT-GUEST')
+            Should -Invoke Disable-LocalUser -Times 0 -Exactly
+            $script:Core.Rollback.Count | Should -Be 0
+        }
+    }
+
+    Describe 'Sort-DfirFinding' {
+        It 'orders by status then severity rank' {
+            $cards = @(
+                (New-DfirFinding -Id 'a' -Severity 'Low'      -Status 'Review'),
+                (New-DfirFinding -Id 'b' -Severity 'Info'     -Status 'Review'),
+                (New-DfirFinding -Id 'c' -Severity 'Medium'   -Status 'Review'),
+                (New-DfirFinding -Id 'd' -Severity 'Critical' -Status 'Review'),
+                (New-DfirFinding -Id 'e' -Severity 'High'     -Status 'Review'),
+                (New-DfirFinding -Id 'f' -Severity 'Info'     -Status 'Clean'),
+                (New-DfirFinding -Id 'g' -Severity 'Medium'   -Status 'Alert')
+            )
+            (@(Sort-DfirFinding -Findings $cards) | ForEach-Object { $_.Id }) -join '' | Should -Be 'gdecabf'
+        }
+        It 'returns an array for a single card' {
+            @(Sort-DfirFinding -Findings @(New-DfirFinding -Id 'x' -Severity 'Info' -Status 'Info')).Count | Should -Be 1
+        }
+    }
+
+    Describe 'Integration: real ACLs on an elevated Windows host' -Skip:(-not $script:OnWindowsAdmin) {
+        BeforeAll {
+            Mock Test-IsAdmin { $true }
+            $script:IBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+            $script:AdminsSid = 'S-1-5-32-544'
+        }
+        BeforeEach {
+            if (Test-Path -LiteralPath $script:IBase) { [System.IO.Directory]::Delete($script:IBase, $true) }
+            Get-ChildItem -LiteralPath $env:ProgramData -Directory -Filter 'Win11SecurityOptimizer.untrusted-*' -ErrorAction SilentlyContinue |
+                ForEach-Object { cmd.exe /c rmdir /s /q $_.FullName }
+        }
+        It 'Write-SecureFile leaves a file owned by Administrators' {
+            New-Item -ItemType Directory -Path $script:IBase -Force | Out-Null
+            $p = Join-Path $script:IBase 'owned.txt'
+            Write-SecureFile -Path $p -Value 'x'
+            (Get-Acl -LiteralPath $p).GetOwner([System.Security.Principal.SecurityIdentifier]).Value | Should -Be $script:AdminsSid
+        }
+        It 'keeps the rollback script across a relaunch' {
+            Initialize-Core | Out-Null
+            $script:Core.Rollback.Clear(); [void]$script:Core.Rollback.Add("# t`r`nWrite-Output 'x'")
+            $script:Core.Backups.Clear()
+            Save-RollbackArtifacts
+            $rf = $script:Core.RollbackFile
+            Test-Path -LiteralPath $rf | Should -BeTrue
+            Test-TreeOwnership -Root $script:IBase | Should -BeTrue
+            Initialize-Core | Out-Null
+            Test-Path -LiteralPath $rf | Should -BeTrue
+            $script:Core.SecureSetupNotice | Should -BeNullOrEmpty
+            @(Get-ChildItem -LiteralPath $env:ProgramData -Directory -Filter 'Win11SecurityOptimizer.untrusted-*').Count | Should -Be 0
+            $script:Core.Rollback.Clear()
+        }
+        It 'quarantines a tree with a planted junction without touching the junction target' {
+            $canary = Join-Path $TestDrive 'canary'
+            New-Item -ItemType Directory -Path $canary -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $canary 'keep.txt') -Value 'keep'
+            New-Item -ItemType Directory -Path (Join-Path $script:IBase 'backups') -Force | Out-Null
+            New-Item -ItemType Junction -Path (Join-Path $script:IBase 'j') -Target $canary | Out-Null
+            $dest = Move-TreeToQuarantine -Path $script:IBase
+            Test-Path -LiteralPath $script:IBase | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $canary 'keep.txt') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $dest 'j\keep.txt') | Should -BeTrue
+            cmd.exe /c rmdir (Join-Path $dest 'j')
+            Test-Path -LiteralPath (Join-Path $canary 'keep.txt') | Should -BeTrue
+        }
+        AfterAll {
+            Mock Test-IsAdmin { $false }
+            Initialize-Core | Out-Null
         }
     }
 
