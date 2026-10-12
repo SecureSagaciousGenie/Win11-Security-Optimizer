@@ -2198,6 +2198,21 @@ function Expand-ZipEntrySafe {
     return @($out.ToArray())
 }
 
+function Get-ExternalToolInstallDir {
+    <# The version folder (tools\KEY\VERSION) that holds install.json and
+       exe.sha256 for an installed exe. Some archives put the exe in a subfolder
+       (Chainsaw: chainsaw\chainsaw_x86_64-pc-windows-msvc.exe), so walk up from
+       the exe's folder, never above the tools root. $null when none is found. #>
+    param([Parameter(Mandatory)][string]$ExePath)
+    $root = (Get-ExternalToolsRoot).TrimEnd('\', '/')
+    $dir = Split-Path -Path $ExePath -Parent
+    while ($dir -and ($dir.Length -gt $root.Length) -and $dir.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath (Join-Path $dir 'install.json') -PathType Leaf) { return $dir }
+        $dir = Split-Path -Path $dir -Parent
+    }
+    return $null
+}
+
 function Assert-ExternalToolIntegrity {
     <# Run immediately before every elevated run of an external tool. Throws
        unless the tools root is admin-locked, the install manifest and recorded
@@ -2207,7 +2222,8 @@ function Assert-ExternalToolIntegrity {
     if (-not (Test-ToolsRootSecure)) {
         throw "$($Tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
     }
-    $installDir  = Split-Path -Path $ExePath -Parent
+    $installDir  = Get-ExternalToolInstallDir -ExePath $ExePath
+    if (-not $installDir) { $installDir = Split-Path -Path $ExePath -Parent }
     $metaPath    = Join-Path $installDir 'install.json'
     $exeHashPath = Join-Path $installDir 'exe.sha256'
     if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) {

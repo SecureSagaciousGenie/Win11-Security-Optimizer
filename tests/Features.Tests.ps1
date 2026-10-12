@@ -234,6 +234,24 @@ Describe 'Features' {
             try { { Assert-ExternalToolIntegrity -Tool ([pscustomobject]@{ Name = 'X'; Verify = 'Sha256' }) -ExePath $script:Exe } | Should -Throw '*install.json*' }
             finally { Set-Content -LiteralPath (Join-Path $script:Dir 'install.json') -Value '{}' }
         }
+        # Chainsaw's archive puts the exe in a subfolder; the manifest sits in the
+        # version folder above it. v1.2.0 looked only beside the exe and refused
+        # to run every verified Chainsaw install.
+        It 'finds the manifest when the exe sits in a subfolder of the install' {
+            $sub = Join-Path $script:Dir 'chainsaw'
+            New-Item -ItemType Directory -Path $sub -Force | Out-Null
+            $exe2 = Join-Path $sub 'chainsaw_x86_64-pc-windows-msvc.exe'
+            Set-Content -LiteralPath $exe2 -Value 'binary2'
+            Set-Content -LiteralPath (Join-Path $script:Dir 'exe.sha256') -Value (Get-FileHash -LiteralPath $exe2 -Algorithm SHA256).Hash
+            Get-ExternalToolInstallDir -ExePath $exe2 | Should -Be $script:Dir
+            { Assert-ExternalToolIntegrity -Tool ([pscustomobject]@{ Name = 'X'; Verify = 'Sha256' }) -ExePath $exe2 } | Should -Not -Throw
+        }
+        It 'never looks above the tools root for a manifest' {
+            $outside = Join-Path $env:ProgramData 'elsewhere\deep'
+            New-Item -ItemType Directory -Path $outside -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $env:ProgramData 'elsewhere\install.json') -Value '{}'
+            Get-ExternalToolInstallDir -ExePath (Join-Path $outside 'x.exe') | Should -BeNullOrEmpty
+        }
     }
 
     Describe 'Phase 4: Autoruns CSV parser' {

@@ -1430,7 +1430,9 @@ function Get-ProToolInstalledText {
     try { $exe = Test-ExternalToolInstalled -Key $Key } catch { $exe = $null }
     if (-not $exe) { return 'Not installed. Run downloads it first, after a consent screen.' }
     $ver = ''
-    $meta = Join-Path (Split-Path -Path $exe -Parent) 'install.json'
+    $dir = Get-ExternalToolInstallDir -ExePath $exe
+    if (-not $dir) { $dir = Split-Path -Path $exe -Parent }
+    $meta = Join-Path $dir 'install.json'
     try {
         if (Test-Path -LiteralPath $meta -PathType Leaf) {
             $m = Get-Content -LiteralPath $meta -Raw | ConvertFrom-Json

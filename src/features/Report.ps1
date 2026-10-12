@@ -22,7 +22,9 @@ function Get-InstalledToolSummary {
         try { $exe = Test-ExternalToolInstalled -Key $t.Key } catch { $exe = $null }
         if (-not $exe) { continue }
         $ver = ''; $sha = ''
-        $meta = Join-Path (Split-Path -Path $exe -Parent) 'install.json'
+        $dir = Get-ExternalToolInstallDir -ExePath $exe
+        if (-not $dir) { $dir = Split-Path -Path $exe -Parent }
+        $meta = Join-Path $dir 'install.json'
         try {
             if (Test-Path -LiteralPath $meta -PathType Leaf) {
                 $m = Get-Content -LiteralPath $meta -Raw | ConvertFrom-Json
