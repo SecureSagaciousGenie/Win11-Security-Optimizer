@@ -9,6 +9,7 @@ $script:RepoRoot = Split-Path -Parent $PSScriptRoot
 $script:SavedEnv = @{ LOCALAPPDATA = $env:LOCALAPPDATA; ProgramData = $env:ProgramData; W11SO_SESSION_LOG = $env:W11SO_SESSION_LOG; COMPUTERNAME = $env:COMPUTERNAME; SystemRoot = $env:SystemRoot }
 # Non-Windows hosts have no SystemRoot; give path-building code somewhere to point.
 if (-not $env:SystemRoot) { $env:SystemRoot = Join-Path $TestDrive 'Windows' }
+if (-not $env:COMPUTERNAME) { $env:COMPUTERNAME = 'TESTPC' }
 $env:LOCALAPPDATA = Join-Path $TestDrive 'LocalAppData'
 $env:ProgramData  = Join-Path $TestDrive 'ProgramData'
 Remove-Item -Path Env:\W11SO_SESSION_LOG -ErrorAction SilentlyContinue

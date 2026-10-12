@@ -252,3 +252,40 @@ jobs:
           $s = Get-SysmonState
           'After rollback: state {0}, service {1}' -f $s.State, $s.Service
           if ($s.Installed) { throw 'Sysmon is still installed after the rollback.' }
+
+  reporting:
+    name: Headless scan, report and evidence pack on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan.ps1, HTML report, evidence pack
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $json = Join-Path $env:RUNNER_TEMP 'scan.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Scan.ps1 -OutJson $json -Deep
+          $code = $LASTEXITCODE
+          'Scan.ps1 exit code: {0}' -f $code
+          if ($code -eq 3) { throw 'Scan.ps1 reported an error.' }
+          $j = Get-Content -LiteralPath $json -Raw | ConvertFrom-Json
+          'JSON: {0} security findings, {1} investigate cards, recorded exit code {2}, score {3}' -f @($j.Security).Count, @($j.Investigate).Count, $j.ExitCode, $j.Score.Score
+          if ([int]$j.ExitCode -ne $code) { throw 'The exit code does not match the JSON.' }
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $html = New-HtmlReport -SecurityFindings @($j.Security) -DfirCards @($j.Investigate) -Tools @(Get-InstalledToolSummary) -MachineName $env:COMPUTERNAME
+          'Report: {0} characters, contains a script tag: {1}' -f $html.Length, ($html -match '<script')
+          $zip = Join-Path $env:RUNNER_TEMP 'evidence.zip'
+          $r = New-EvidencePack -Destination $zip -Findings @($j.Investigate) -Progress { param($m) [Console]::WriteLine('  ' + $m) }
+          'Evidence pack: {0} files, {1:N1} MB. Notes: {2}' -f $r.FileCount, ($r.SizeBytes / 1MB), (@($r.Notes) -join ' | ')
+          $out = Join-Path $env:RUNNER_TEMP 'ev'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
+          $m = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw | ConvertFrom-Json
+          foreach ($f in @($m.Files)) {
+            if ((Get-FileHash -LiteralPath (Join-Path $out $f.Path) -Algorithm SHA256).Hash -ne $f.Sha256) { throw ("Hash mismatch: {0}" -f $f.Path) }
+          }
+          'Manifest verified for {0} files: {1}' -f @($m.Files).Count, ((@($m.Files) | ForEach-Object { $_.Path }) -join ', ')
+          'Staging removed: {0}' -f (@(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Win11SecurityOptimizer\evidence') -Directory -Filter 'stage_*' -ErrorAction SilentlyContinue).Count -eq 0)
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))

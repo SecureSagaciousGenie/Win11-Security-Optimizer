@@ -58,3 +58,18 @@ function Invoke-NativeCommand {
     $out = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
 }
+
+function Get-ExistingFilePath {
+    <# The paths that exist as files right now, de-duplicated. #>
+    param([AllowEmptyCollection()][string[]]$Path)
+    $seen = @{}
+    $out = New-Object System.Collections.ArrayList
+    foreach ($p in @($Path)) {
+        if (-not $p) { continue }
+        $x = [Environment]::ExpandEnvironmentVariables($p.Trim().Trim('"'))
+        if ($seen.ContainsKey($x.ToLowerInvariant())) { continue }
+        $seen[$x.ToLowerInvariant()] = $true
+        try { if (Test-Path -LiteralPath $x -PathType Leaf) { [void]$out.Add($x) } } catch { Write-CoreLog -Message ("Path check failed for {0}: {1}" -f $x, $_.Exception.Message) -Level DEBUG }
+    }
+    return @($out.ToArray())
+}

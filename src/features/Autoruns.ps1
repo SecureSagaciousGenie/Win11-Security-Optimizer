@@ -115,21 +115,6 @@ function Get-AutorunsRowClass {
     return 'Low'
 }
 
-function Get-ExistingFilePath {
-    <# The paths that exist as files right now, de-duplicated. #>
-    param([AllowEmptyCollection()][string[]]$Path)
-    $seen = @{}
-    $out = New-Object System.Collections.ArrayList
-    foreach ($p in @($Path)) {
-        if (-not $p) { continue }
-        $x = [Environment]::ExpandEnvironmentVariables($p.Trim().Trim('"'))
-        if ($seen.ContainsKey($x.ToLowerInvariant())) { continue }
-        $seen[$x.ToLowerInvariant()] = $true
-        try { if (Test-Path -LiteralPath $x -PathType Leaf) { [void]$out.Add($x) } } catch { Write-CoreLog -Message ("Path check failed for {0}: {1}" -f $x, $_.Exception.Message) -Level DEBUG }
-    }
-    return @($out.ToArray())
-}
-
 function ConvertFrom-AutorunsCsv {
     <# Turns an autorunsc CSV into Investigate cards: one card per category for
        High and Medium rows (at most 25 evidence lines each, the rest in the CSV)

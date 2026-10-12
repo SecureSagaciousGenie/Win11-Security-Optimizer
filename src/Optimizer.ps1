@@ -357,7 +357,7 @@ $script:Xaml = @'
 
         <!-- INVESTIGATE / DFIR -->
         <Grid x:Name="PageInvestigate" Visibility="Collapsed">
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnDfirScan" Style="{StaticResource Primary}" Content="Investigate This PC"/>
             <Button x:Name="BtnDeepScan" Style="{StaticResource Ghost}" Content="+ Deep Scan (processes &amp; logs)" Margin="10,0,0,0"/>
@@ -369,7 +369,16 @@ $script:Xaml = @'
             <Button x:Name="BtnBaselineCompare" Style="{StaticResource Ghost}" Content="Compare with baseline" Margin="10,0,0,0"/>
             <TextBlock x:Name="BaselineStatus" Text="A baseline records how this PC looks now, so later checks show only what is new." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0" TextWrapping="Wrap"/>
           </StackPanel>
-          <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+          <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Show:" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <RadioButton x:Name="FilterAll" GroupName="CardFilter" Content="All" IsChecked="True" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterAlert" GroupName="CardFilter" Content="Alert" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterReview" GroupName="CardFilter" Content="Review" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterInfo" GroupName="CardFilter" Content="Info" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterClean" GroupName="CardFilter" Content="Clean" Foreground="{StaticResource Text}" VerticalAlignment="Center"/>
+          </StackPanel>
+          <TextBlock x:Name="DfirEmpty" Grid.Row="3" Text="Nothing here yet. Click &quot;Investigate This PC&quot; to check for signs of compromise." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="2,8,0,0"/>
+          <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
             <ItemsControl x:Name="DfirList">
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
@@ -389,6 +398,11 @@ $script:Xaml = @'
                           <TextBlock Text="{Binding WhatToDo}" TextWrapping="Wrap" Margin="0,4,0,0" Foreground="{StaticResource Text}"/>
                         </StackPanel>
                       </Border>
+                      <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                        <Button Style="{StaticResource Ghost}" Content="Scan with Defender" Tag="{Binding}" Visibility="{Binding ScanVis}" Margin="0,0,8,0"/>
+                        <Button Style="{StaticResource Ghost}" Content="Open location" Tag="{Binding}" Visibility="{Binding OpenVis}" Margin="0,0,8,0"/>
+                        <Button Style="{StaticResource Ghost}" Content="Copy details" Tag="{Binding}"/>
+                      </StackPanel>
                     </StackPanel>
                   </Border>
                 </DataTemplate>
@@ -435,6 +449,12 @@ $script:Xaml = @'
               <Button x:Name="BtnMakeRestore" Style="{StaticResource Ghost}" Content="Create Restore Point Now" Margin="10,0,0,0"/>
               <Button x:Name="BtnRemoveTools" Style="{StaticResource Ghost}" Content="Remove Downloaded Tools" Margin="10,0,0,0"/>
             </StackPanel>
+            <TextBlock Text="Share and preserve" FontSize="15" FontWeight="SemiBold" Margin="0,18,0,0"/>
+            <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,6,0,0" Text="The report is one HTML file you can print or send to someone helping you. The evidence pack zips event logs and system details for an investigator. Both contain user names and file paths."/>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+              <Button x:Name="BtnSaveReport" Style="{StaticResource Ghost}" Content="Save HTML Report"/>
+              <Button x:Name="BtnEvidencePack" Style="{StaticResource Ghost}" Content="Create Evidence Pack" Margin="10,0,0,0"/>
+            </StackPanel>
           </StackPanel>
           <Border Grid.Row="1" Background="#0B0E14" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8">
             <ScrollViewer x:Name="LogScroller" VerticalScrollBarVisibility="Auto" Padding="12">
@@ -475,6 +495,7 @@ function New-OptimizerWindow {
         'BtnSecScan','BtnSecFixSafe','ChkHighRisk','SecList',
         'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
+        'FilterAll','FilterAlert','FilterReview','FilterInfo','FilterClean','DfirEmpty','BtnSaveReport','BtnEvidencePack',
         'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText','ChipSysmon','ChipSysmonText',
         'BtnStartupScan','StartupListView',
         'BtnOpenData','BtnOpenRollback','BtnMakeRestore','BtnRemoveTools','LogView','LogScroller',
@@ -636,6 +657,10 @@ function ConvertTo-DfirCard {
     $f | Add-Member -NotePropertyName AccentBrush -NotePropertyValue (Get-Brush $hex) -Force
     $f | Add-Member -NotePropertyName WhyVis -NotePropertyValue $(if ($f.Why) { 'Visible' } else { 'Collapsed' }) -Force
     $f | Add-Member -NotePropertyName DoVis  -NotePropertyValue $(if ($f.WhatToDo) { 'Visible' } else { 'Collapsed' }) -Force
+    $paths = @()
+    if ($f.PSObject.Properties.Name -contains 'Paths') { $paths = @($f.Paths | Where-Object { $_ }) }
+    $f | Add-Member -NotePropertyName ScanVis -NotePropertyValue $(if ($paths.Count -gt 0 -and $script:State.IsAdmin) { 'Visible' } else { 'Collapsed' }) -Force
+    $f | Add-Member -NotePropertyName OpenVis -NotePropertyValue $(if ($paths.Count -gt 0) { 'Visible' } else { 'Collapsed' }) -Force
     return $f
 }
 
@@ -825,12 +850,9 @@ function Start-DfirScan {
         [pscustomobject]@{ Findings=$f; Summary=(Get-DfirSummary $f) }
     } -OnDone {
         param($res)
-        $cards = @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
-        # Alerts/Reviews first, then clean; severity by rank inside each status
-        $sorted = Sort-DfirFinding -Findings $cards
-        $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
+        $res = @($res) | Select-Object -First 1
+        Set-DfirList -Cards @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
         $s = $res.Summary
-        $script:UIRef.UI.CardDfir.Text = "$($s.Alerts + $s.Reviews)"
         $script:UIRef.UI.DfirSummary.Text = "$($s.Alerts) alert(s), $($s.Reviews) to review, $($s.Clean) clean."
         $script:UIRef.UI.StatusText.Text = 'Investigation complete.'
     }
@@ -1006,13 +1028,140 @@ function Add-DfirCard {
     <# Merges cards into the Investigate list, replacing earlier cards whose Id
        starts with $ReplacePrefix, then sorts by status and severity rank. #>
     param([AllowEmptyCollection()][object[]]$Cards, [string]$ReplacePrefix)
-    $existing = @()
-    if ($script:UIRef.UI.DfirList.ItemsSource) { $existing = @($script:UIRef.UI.DfirList.ItemsSource) }
+    $existing = @($script:State.Cards)
     if ($ReplacePrefix) { $existing = @($existing | Where-Object { -not ([string]$_.Id).StartsWith($ReplacePrefix, [System.StringComparison]::OrdinalIgnoreCase) }) }
     $new = @(@($Cards) | Where-Object { $_ } | ForEach-Object { ConvertTo-DfirCard $_ })
-    $script:UIRef.UI.DfirList.ItemsSource = @(Sort-DfirFinding -Findings (@($existing) + @($new)))
-    $all = @($script:UIRef.UI.DfirList.ItemsSource)
+    Set-DfirList -Cards (@($existing) + @($new))
+}
+
+function Set-DfirList {
+    <# Keeps every card in $script:State.Cards and shows the ones that match the
+       chosen filter chip, sorted by status then severity rank. #>
+    param([AllowEmptyCollection()][object[]]$Cards)
+    $script:State.Cards = @(Sort-DfirFinding -Findings @($Cards))
+    $all = @($script:State.Cards)
     $script:UIRef.UI.CardDfir.Text = "$(@($all | Where-Object { $_.Status -eq 'Alert' -or $_.Status -eq 'Review' }).Count)"
+    Update-DfirFilter
+}
+
+function Update-DfirFilter {
+    $filter = [string]$script:State.CardFilter
+    $all = @($script:State.Cards)
+    $shown = if ($filter -and $filter -ne 'All') { @($all | Where-Object { $_.Status -eq $filter }) } else { $all }
+    $script:UIRef.UI.DfirList.ItemsSource = @($shown)
+    if ($shown.Count -gt 0) {
+        $script:UIRef.UI.DfirEmpty.Visibility = 'Collapsed'
+    } else {
+        $script:UIRef.UI.DfirEmpty.Text = if ($all.Count -eq 0) { 'Nothing here yet. Click "Investigate This PC" to check for signs of compromise.' } else { ('No cards with the status "{0}". Choose All to see every card.' -f $filter) }
+        $script:UIRef.UI.DfirEmpty.Visibility = 'Visible'
+    }
+}
+
+function Format-CardText {
+    param($Card)
+    $lines = @($Card.Title, ('Severity: {0} | Status: {1}' -f $Card.Severity, $Card.Status), '', [string]$Card.What)
+    if ($Card.Why) { $lines += @('', 'Why it matters: ' + $Card.Why) }
+    if ($Card.WhatToDo) { $lines += @('', 'What to do: ' + $Card.WhatToDo) }
+    if (($Card.PSObject.Properties.Name -contains 'Paths') -and @($Card.Paths).Count -gt 0) { $lines += @('', 'Files:') + @($Card.Paths | ForEach-Object { '  ' + $_ }) }
+    return ($lines -join "`r`n")
+}
+
+function Invoke-CardAction {
+    <# Scan with Defender (background), Open location, Copy details. #>
+    param([Parameter(Mandatory)][string]$Action, [Parameter(Mandatory)]$Card)
+    $paths = @()
+    if ($Card.PSObject.Properties.Name -contains 'Paths') { $paths = @($Card.Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }) }
+    switch ($Action) {
+        'Copy details' {
+            try { Set-Clipboard -Value (Format-CardText -Card $Card); $script:UIRef.UI.StatusText.Text = 'Card details copied to the clipboard.' }
+            catch { [System.Windows.MessageBox]::Show(("Could not copy: {0}" -f $_.Exception.Message), 'Copy failed', 'OK', 'Warning') | Out-Null }
+        }
+        'Open location' {
+            if ($paths.Count -eq 0) { [System.Windows.MessageBox]::Show('The file no longer exists.', 'Open location', 'OK', 'Information') | Out-Null; return }
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}"' -f $paths[0])
+        }
+        'Scan with Defender' {
+            if (-not $script:State.IsAdmin) { return }
+            if ($paths.Count -eq 0) { [System.Windows.MessageBox]::Show('The files on this card no longer exist.', 'Scan with Defender', 'OK', 'Information') | Out-Null; return }
+            Invoke-Background -Status ("Microsoft Defender is scanning {0} file(s)..." -f $paths.Count) -Vars @{ ScanPaths = $paths } -Work {
+                Invoke-DefenderPathScan -Path $ScanPaths
+            } -OnDone {
+                param($res)
+                $r = @($res) | Select-Object -First 1
+                $msg = "Scanned {0} file(s)." -f @($r.Scanned).Count
+                if (@($r.Detections).Count -gt 0) {
+                    $msg += "`n`nDefender found:`n" + ((@($r.Detections) | ForEach-Object { '  Threat {0} in {1} (action succeeded: {2})' -f $_.ThreatId, $_.Resources, $_.ActionSuccess }) -join "`n")
+                    $msg += "`n`nOpen Windows Security > Protection history for details and what Defender did."
+                } else { $msg += "`n`nDefender found nothing in these files." }
+                if (@($r.Errors).Count -gt 0) { $msg += "`n`nNot scanned:`n  " + (@($r.Errors) -join "`n  ") }
+                [System.Windows.MessageBox]::Show($msg, 'Defender scan', 'OK', $(if (@($r.Detections).Count -gt 0) { 'Warning' } else { 'Information' })) | Out-Null
+            }
+        }
+    }
+}
+
+function Invoke-SaveReport {
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
+    $dlg.FileName = ('SecurityReport_{0}_{1}.html' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    $dlg.Filter = 'HTML report (*.html)|*.html'
+    if (-not $dlg.ShowDialog($script:UIRef.Window)) { return }
+    $script:State.Busy = $true
+    $script:UIRef.UI.BtnSaveReport.IsEnabled = $false
+    try {
+        Set-Busy -Text 'Writing the report...'
+        $sec = @($script:State.Security)
+        $html = New-HtmlReport -SecurityFindings $sec -Score $(if ($sec.Count -gt 0) { Get-SecurityScore $sec } else { $null }) -DfirCards @($script:State.Cards) `
+            -Changes @($script:Core.Changes.ToArray()) -RollbackPath $script:Core.RollbackFile -Tools @(Get-InstalledToolSummary) -SessionStart $script:Core.StartTime
+        [System.IO.File]::WriteAllText($dlg.FileName, $html, (New-Object System.Text.UTF8Encoding($false)))
+        Set-Busy -On $false
+        $script:UIRef.UI.StatusText.Text = "Report saved: $($dlg.FileName)"
+    } catch {
+        Set-Busy -On $false
+        [System.Windows.MessageBox]::Show(("The report could not be saved:`n{0}" -f $_.Exception.Message), 'Report not saved', 'OK', 'Error') | Out-Null
+    } finally {
+        $script:State.Busy = $false
+        $script:UIRef.UI.BtnSaveReport.IsEnabled = $true
+    }
+}
+
+function Invoke-EvidencePack {
+    <# Main thread with per-step status: it writes into the secure base. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    if (-not $script:State.IsAdmin) {
+        [System.Windows.MessageBox]::Show('An evidence pack needs administrator rights (the Security log is admin-only). Relaunch via Start.bat.', 'Administrator required', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
+    $dlg.FileName = ('Evidence_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    $dlg.Filter = 'Zip archive (*.zip)|*.zip'
+    if (-not $dlg.ShowDialog($script:UIRef.Window)) { return }
+    $script:State.Busy = $true
+    $script:UIRef.UI.BtnEvidencePack.IsEnabled = $false
+    $progress = {
+        param($m)
+        Set-Busy -Text $m
+        # Let WPF repaint the status line between steps.
+        try { $script:UIRef.Window.Dispatcher.Invoke([action]{ }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
+    }
+    try {
+        $r = New-EvidencePack -Destination $dlg.FileName -Findings @(@($script:State.Security) + @($script:State.Cards)) -Progress $progress
+        Set-Busy -On $false
+        $msg = "Evidence pack saved:`n{0}`n`n{1} files, {2:N1} MB." -f $r.Path, $r.FileCount, ($r.SizeBytes / 1MB)
+        if (@($r.Notes).Count -gt 0) { $msg += "`n`nNotes:`n  " + (@($r.Notes) -join "`n  ") }
+        if ($r.Warning) { $msg += "`n`n" + $r.Warning }
+        $msg += "`n`nIt contains user names, file paths and event logs. Share it only with someone you trust."
+        [System.Windows.MessageBox]::Show($msg, 'Evidence pack ready', 'OK', $(if ($r.Warning) { 'Warning' } else { 'Information' })) | Out-Null
+        Update-LogView
+    } catch {
+        Set-Busy -On $false
+        [System.Windows.MessageBox]::Show(("The evidence pack could not be created:`n{0}" -f $_.Exception.Message), 'Evidence pack failed', 'OK', 'Error') | Out-Null
+    } finally {
+        $script:State.Busy = $false
+        $script:UIRef.UI.BtnEvidencePack.IsEnabled = $true
+    }
 }
 
 function Invoke-BaselineSave {
@@ -1136,16 +1285,10 @@ function Start-ProScan {
             [System.Windows.MessageBox]::Show("$($tool.Name) could not complete:`n$($res.Error)", 'Pro tool failed', 'OK', 'Error') | Out-Null
             return
         }
-        # Merge the external findings INTO the current Investigate list (keep native ones).
-        $existing = @()
-        if ($script:UIRef.UI.DfirList.ItemsSource) { $existing = @($script:UIRef.UI.DfirList.ItemsSource) }
-        $cards = @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
-        $combined = @($existing) + @($cards)
-        $sorted = Sort-DfirFinding -Findings $combined
-        $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
-        $alerts = @($combined | Where-Object { $_.Status -eq 'Alert' }).Count
-        $reviews = @($combined | Where-Object { $_.Status -eq 'Review' }).Count
-        $script:UIRef.UI.CardDfir.Text = "$($alerts + $reviews)"
+        # Merge into the Investigate list, replacing this tool's earlier cards.
+        $cards = @($res.Findings)
+        $prefix = switch ($Key) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '' } }
+        Add-DfirCard -Cards $cards -ReplacePrefix $prefix
         $sigNote = ''
         if (($res.PSObject.Properties.Name -contains 'Signer') -and $res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
         $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s).$sigNote"
@@ -1418,6 +1561,23 @@ function Register-Handlers {
     $u.BtnDeepScan.Add_Click({ Start-DfirScan -Deep })
     $u.BtnProScan.Add_Click({ Show-ProToolMenu })
     $u.BtnBaselineSave.Add_Click({ Invoke-BaselineSave })
+    $u.BtnSaveReport.Add_Click({ Invoke-SaveReport })
+    $u.BtnEvidencePack.Add_Click({ Invoke-EvidencePack })
+    foreach ($pair in @(@('FilterAll', 'All'), @('FilterAlert', 'Alert'), @('FilterReview', 'Review'), @('FilterInfo', 'Info'), @('FilterClean', 'Clean'))) {
+        $u[$pair[0]].Tag = $pair[1]
+        $u[$pair[0]].Add_Checked({ param($snd, $e) $script:State.CardFilter = [string]$snd.Tag; Update-DfirFilter })
+    }
+    # Card buttons: catch the bubbled Click at the list and read Tag (the card).
+    $u.DfirList.AddHandler(
+        [System.Windows.Controls.Button]::ClickEvent,
+        [System.Windows.RoutedEventHandler]{
+            param($snd, $e)
+            $src = $e.OriginalSource
+            if ($src -is [System.Windows.Controls.Button] -and $src.Tag -and ([string]$src.Content -in @('Scan with Defender', 'Open location', 'Copy details'))) {
+                Invoke-CardAction -Action ([string]$src.Content) -Card $src.Tag
+            }
+        }
+    )
     $u.BtnBaselineCompare.Add_Click({ Start-BaselineCompare })
     $u.BtnStartupScan.Add_Click({ Start-StartupScan })
 
@@ -1450,7 +1610,7 @@ function Start-Optimizer {
     $info = Get-CoreSystemInfo
 
     $script:UIRef = New-OptimizerWindow
-    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false }
+    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; IsAdmin=[bool]$info.Admin }
 
     # header / admin badge
     $script:UIRef.UI.VersionText.Text = "v$($script:Core.Version)  -  Build $($info.Build)"

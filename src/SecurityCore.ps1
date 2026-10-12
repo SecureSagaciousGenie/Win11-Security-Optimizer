@@ -1243,7 +1243,8 @@ function Invoke-DfirTriage {
             & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title ("Startup entries worth reviewing: {0}" -f $suspicious.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("These programs run at startup from a temporary/user folder (unsigned ones in AppData are included):`n" + $ev) `
                 -Why 'Malware persists by auto-starting from Temp/AppData. Note that some legitimate apps (OneDrive, Teams, Zoom, Discord) also start from AppData - so this is a review list, not a verdict.' `
-                -WhatToDo 'Recognise each one? Then it is fine. If you do not, disable it in the Startup tab (reversible) and scan the file with Defender.' -Evidence $ev)
+                -WhatToDo 'Recognise each one? Then it is fine. If you do not, disable it in the Startup tab (reversible) and scan the file with Defender.' -Evidence $ev `
+                -Paths @(Get-ExistingFilePath -Path @($suspicious | ForEach-Object { [string]$_.ExePath })))
         } else {
             & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title 'No obviously suspicious startup entries' -Severity 'Info' -Status 'Clean' -What 'No startup entries run unsigned from temp/user folders.' -Why '' -WhatToDo 'No action needed. See the Startup tab for the full list.' -Evidence '')
         }
@@ -1278,10 +1279,12 @@ function Invoke-DfirTriage {
     try {
         $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName })
         $flagged = New-Object System.Collections.ArrayList
+        $svcPaths = New-Object System.Collections.ArrayList
         foreach ($s in $svcs) {
             $exe = ConvertTo-CommandPath -Command ($s.PathName -replace '^"','' )
             if ($exe -match 'Temp|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\') {
                 [void]$flagged.Add(("  {0}  ->  {1}" -f $s.Name, $s.PathName))
+                [void]$svcPaths.Add([string]$exe)
             }
         }
         $flagged = @($flagged)
@@ -1290,7 +1293,8 @@ function Invoke-DfirTriage {
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title ("Services running from user/temp folders: {0}" -f $flagged.Count) -Severity 'High' -Status 'Review' `
                 -What ("Running services whose program lives in a temporary/user folder:`n" + $ev) `
                 -Why 'Legitimate services run from Program Files or System32. A service pointing into Temp/AppData is a strong malware indicator.' `
-                -WhatToDo 'Investigate each service name online. Do not stop critical services blindly; confirm first.' -Evidence $ev)
+                -WhatToDo 'Investigate each service name online. Do not stop critical services blindly; confirm first.' -Evidence $ev `
+                -Paths @(Get-ExistingFilePath -Path @($svcPaths.ToArray())))
         } else {
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title 'No services from suspicious paths' -Severity 'Info' -Status 'Clean' -What 'All running services launch from standard locations.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
@@ -1529,6 +1533,11 @@ function Invoke-ProcessThreatScan {
     $unsignedNetInstalled = New-Object System.Collections.ArrayList
     $badCmd = New-Object System.Collections.ArrayList
     $script:_cmdHasAlert = $false
+    # Executable paths behind each card, for the card actions (scan, open).
+    $pathsFor = @{
+        masq = (New-Object System.Collections.ArrayList); badPath = (New-Object System.Collections.ArrayList)
+        unsignedNet = (New-Object System.Collections.ArrayList); unsignedNetInstalled = (New-Object System.Collections.ArrayList)
+    }
 
     foreach ($p in $procs) {
         $name = $null; $exe = $null; $cmd = $null; $procId = $null
@@ -1548,12 +1557,14 @@ function Invoke-ProcessThreatScan {
                 foreach ($d in $expected) { if ($exeDir -and $exeDir.TrimEnd('\') -ieq $d.TrimEnd('\')) { $okDir = $true; break } }
                 if (-not $okDir) {
                     [void]$masq.Add(("  {0} (PID {1}) runs from: {2}  [should be in {3}]" -f $name, $procId, $exe, ($expected -join ' or ')))
+                    [void]$pathsFor.masq.Add([string]$exe)
                 }
             }
         }
         # Near-miss lookalike names (scvhost, lsas, etc.)
         if ($script:LookalikeNames -contains $base.ToLower()) {
             [void]$masq.Add(("  {0} (PID {1}) at {2}  [name imitates a Windows process]" -f $name, $procId, $(if($exe){$exe}else{'unknown path'})))
+            if ($exe) { [void]$pathsFor.masq.Add([string]$exe) }
         }
 
         # ---- 2. Running from a user/temp folder ----
@@ -1570,6 +1581,7 @@ function Invoke-ProcessThreatScan {
                 $signText = if ($isSigned) { "signed: $($sig.Publisher)" } else { 'UNSIGNED' }
                 if ($tempLoc -or (-not $isSigned)) {
                     [void]$badPath.Add(("  {0} (PID {1}) -> {2}  ({3})" -f $name, $procId, $exe, $signText))
+                    [void]$pathsFor.badPath.Add([string]$exe)
                 }
             }
         }
@@ -1583,8 +1595,10 @@ function Invoke-ProcessThreatScan {
             if ($sig -and -not $sig.Signed -and $exe -notmatch '\\System32\\|\\SysWOW64\\') {
                 if ($exe -match '\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\|\\\$Recycle') {
                     [void]$unsignedNet.Add(("  {0} (PID {1}) -> {2}  [unsigned + network, from a user/temp folder]" -f $name, $procId, $exe))
+                    [void]$pathsFor.unsignedNet.Add([string]$exe)
                 } else {
                     [void]$unsignedNetInstalled.Add(("  {0} (PID {1}) -> {2}" -f $name, $procId, $exe))
+                    [void]$pathsFor.unsignedNetInstalled.Add([string]$exe)
                 }
             }
         }
@@ -1622,7 +1636,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-MASQ' -Category 'Running Processes' -Title ("Process masquerading as Windows: {0}" -f @($masq).Count) -Severity 'Critical' -Status 'Alert' `
             -What ("These running programs use a Windows system name but are NOT in the right place (or imitate a system name):`n" + $ev) `
             -Why 'Real Windows processes like svchost.exe/lsass.exe only run from the System32 folder. Malware copies these trusted names to hide. This is one of the strongest signs of infection.' `
-            -WhatToDo 'Do not ignore this. Note the PID and path, scan the file with Defender (right-click > Scan), and search the exact path online. If confirmed malicious, end the process and remove the file.' -Evidence $ev)
+            -WhatToDo 'Do not ignore this. Note the PID and path, scan the file with Defender (right-click > Scan), and search the exact path online. If confirmed malicious, end the process and remove the file.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.masq.ToArray())))
     } else {
         & $add (New-DfirFinding -Id 'DEEP-MASQ' -Category 'Running Processes' -Title 'No process masquerading detected' -Severity 'Info' -Status 'Clean' -What 'All system-named processes run from their correct Windows folders.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
     }
@@ -1632,7 +1647,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-PROCPATH' -Category 'Running Processes' -Title ("Programs running from temporary/user folders: {0}" -f @($badPath).Count) -Severity 'High' -Status 'Review' `
             -What ("These programs are running from folders malware often hides in (Temp, Downloads, Public, or UNSIGNED from AppData/ProgramData). Signed programs in AppData/ProgramData - like OneDrive/Teams/Zoom - are deliberately excluded:`n" + $ev) `
             -Why 'Legitimate software usually runs from Program Files. Things running from Temp/Downloads, or UNSIGNED from AppData, are more suspicious.' `
-            -WhatToDo 'Look at each. Installers and some updaters are normal here. Anything UNSIGNED that you do not recognise should be scanned with Defender and investigated.' -Evidence $ev)
+            -WhatToDo 'Look at each. Installers and some updaters are normal here. Anything UNSIGNED that you do not recognise should be scanned with Defender and investigated.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.badPath.ToArray())))
     }
 
     if ($unsignedNet.Count -gt 0) {
@@ -1640,7 +1656,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-UNSIGNEDNET' -Category 'Running Processes' -Title ("Unsigned networked programs in user/temp folders: {0}" -f @($unsignedNet).Count) -Severity 'High' -Status 'Review' `
             -What ("These programs have NO digital signature, are using the network, AND run from a user-writable/temp folder:`n" + $ev) `
             -Why 'That combination - unsigned + networked + running from Temp/AppData/Downloads - is a strong malware indicator. Trusted software is signed and installed under Program Files.' `
-            -WhatToDo 'Identify each program. If you do not recognise it, disconnect from the internet, scan with Defender, and investigate the file path before allowing it.' -Evidence $ev)
+            -WhatToDo 'Identify each program. If you do not recognise it, disconnect from the internet, scan with Defender, and investigate the file path before allowing it.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.unsignedNet.ToArray())))
     }
 
     if ($unsignedNetInstalled.Count -gt 0) {
@@ -1648,7 +1665,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-UNSIGNEDNET-INST' -Category 'Running Processes' -Title ("Installed unsigned apps using the network: {0}" -f @($unsignedNetInstalled).Count) -Severity 'Low' -Status 'Review' `
             -What ("These installed programs have no digital signature but are using the network:`n" + $ev) `
             -Why 'Many legitimate open-source and indie apps are unsigned (code-signing certificates cost money). This is usually fine - it is listed only so you can confirm you recognise each one.' `
-            -WhatToDo 'If you installed and trust these, no action is needed. Investigate only ones you do not recognise.' -Evidence $ev)
+            -WhatToDo 'If you installed and trust these, no action is needed. Investigate only ones you do not recognise.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.unsignedNetInstalled.ToArray())))
     }
 
     if ($badCmd.Count -gt 0) {
