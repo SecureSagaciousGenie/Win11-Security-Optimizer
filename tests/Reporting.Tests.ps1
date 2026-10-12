@@ -118,7 +118,9 @@ Describe 'Reporting and responder actions' {
     }
 
     Describe 'Headless scan' {
-        It 'exit code for "<Name>" is <ExpectedExit>' -ForEach @(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures\scan-cases.json') -Raw | ConvertFrom-Json | ForEach-Object { @{ Name = $_.Name; Security = @($_.Security); Investigate = @($_.Investigate); ExpectedExit = [int]$_.ExpectedExit } }) {
+        # foreach, not a pipeline: Windows PowerShell 5.1 ConvertFrom-Json emits a
+        # top-level JSON array as one object.
+        It 'exit code for "<Name>" is <ExpectedExit>' -ForEach $(foreach ($c in (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'fixtures\scan-cases.json') -Raw | ConvertFrom-Json)) { @{ Name = $c.Name; Security = @($c.Security); Investigate = @($c.Investigate); ExpectedExit = [int]$c.ExpectedExit } }) {
             Get-ScanExitCode -SecurityFindings $Security -Cards $Investigate | Should -Be $ExpectedExit
         }
         It 'Scan.ps1 calls no fix, set, remove, install or download function' {
