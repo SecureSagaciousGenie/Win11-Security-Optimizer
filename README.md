@@ -84,18 +84,28 @@ so you can trust it:
    **Restore & Logs** tab.
 
 ### Where your backups live
+The rollback script is designed to be run **elevated**, so it must not sit anywhere
+a non-admin process could tamper with it first. When you run the optimizer as
+administrator (the normal case, via `Start.bat`), the undo script and the
+before-state backups are written to an **ACL-locked folder** that only
+Administrators/SYSTEM can write to:
 ```
-%LOCALAPPDATA%\Win11SecurityOptimizer\
-├─ logs\       session_*.log         (activity log)
+%ProgramData%\Win11SecurityOptimizer\        (admin-locked: Administrators/SYSTEM write, Users read-only)
 └─ backups\    Backup_*.json         (before-state of every change)
                Rollback_*.ps1        (undo script)
+
+%LOCALAPPDATA%\Win11SecurityOptimizer\
+└─ logs\       session_*.log         (activity log — read-only record, never executed)
 ```
+(If the optimizer is ever run without elevation, the backups fall back to
+`%LOCALAPPDATA%`; the logs always live under `%LOCALAPPDATA%` because they are only
+ever read, never executed.)
 
 ### To undo changes
 Open an **elevated** PowerShell and run the rollback script shown in the
-**Restore & Logs** tab:
+**Restore & Logs** tab (the tab shows its exact path):
 ```powershell
-powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Win11SecurityOptimizer\backups\Rollback_<timestamp>.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:ProgramData\Win11SecurityOptimizer\backups\Rollback_<timestamp>.ps1"
 ```
 Or roll the whole machine back using the System Restore point the tool created.
 
@@ -159,17 +169,23 @@ best-in-class open-source DFIR scanners **Hayabusa** (Yamato Security) and
 **Chainsaw** (WithSecure) and fold their results into the same plain-English
 cards.
 
-Because these tools are **GPL-3.0**, they are **not bundled** — the app would have
-to drop its MIT license if it shipped them. Instead, the first time you use them:
+Because these tools are **GPL-3.0**, they are **not bundled** — shipping them would
+attach GPL obligations (ship the license, offer the source) to those binaries in
+every release, and the copies would go stale. (Bundling would not relicense this
+project's own MIT code, but downloading on demand is simpler and lower-obligation.)
+Instead, the first time you use them:
 
 1. A **consent screen** shows the tool's author, its **GPL-3.0 license**, the
    official GitHub source URL, the version, and the download size.
 2. On your acceptance, the app downloads the arch-matched Windows build from the
-   project's **official GitHub release**, verifies it's a valid archive, records
-   its **SHA-256**, extracts it, and smoke-tests the binary.
+   project's **official GitHub release**, verifies it's a valid archive, and
+   checks its **SHA-256 against a trusted hash** (a project-pinned, reviewed hash
+   for the shipped versions, or GitHub's advertised digest for a newer release).
+   If no trusted hash is available it **refuses** the download rather than running
+   an unverified admin binary; otherwise it extracts it and smoke-tests the binary.
 3. It runs the tool **read-only** against your event logs and parses the output
-   into result cards. Downloaded tools live under
-   `%LOCALAPPDATA%\Win11SecurityOptimizer\tools` and can be removed anytime.
+   into result cards. Downloaded tools live under the admin-locked
+   `%ProgramData%\Win11SecurityOptimizer\tools` and can be removed anytime.
 
 > Hayabusa's live-log mode needs administrator rights (the tool enforces this).
 > Note that some antivirus/EDR products flag DFIR tools by category — that's
@@ -180,11 +196,13 @@ This is **triage**, not a full forensic suite — it points you at things worth 
 closer look. When in doubt, don't delete; investigate first.
 
 > **Why not bundle KAPE / Hayabusa / THOR directly?** Licensing. THOR and KAPE are
-> proprietary and can't be freely redistributed; Hayabusa/Chainsaw are GPL, which
-> would force this whole MIT project to become GPL if bundled. So the built-in
-> Deep Scan is our own MIT code, and the heavier external tools are **opt-in,
-> downloaded at runtime by you**, never shipped in the repo. Full explanation:
-> [docs/DFIR-TOOLS.md](docs/DFIR-TOOLS.md).
+> proprietary and can't be freely redistributed. Hayabusa/Chainsaw are GPL-3.0:
+> bundling them wouldn't relicense this project's own MIT code, but it *would*
+> attach GPL obligations (ship the license, offer the source) to that binary in
+> every release — more to carry, and the tools go stale. So the built-in Deep Scan
+> is our own MIT code, and the heavier external tools are **opt-in, downloaded at
+> runtime by you** (verified against a pinned SHA-256), never shipped in the repo.
+> Full explanation: [docs/DFIR-TOOLS.md](docs/DFIR-TOOLS.md).
 
 ---
 

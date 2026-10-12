@@ -26,11 +26,12 @@ Set-StrictMode -Version 2.0
 # ----------------------------------------------------------------------------
 $script:Core = [ordered]@{
     Name          = 'Windows 11 Security Optimizer'
-    Version       = '1.0.0'
+    Version       = '1.1.0'
     StartTime     = Get-Date
     RootPath      = if ($PSScriptRoot) { Split-Path $PSScriptRoot -Parent } else { (Get-Location).Path }
     DataPath      = $null
     LogFile       = $null
+    BackupDir     = $null
     RollbackFile  = $null
     BackupFile    = $null
     TranscriptOn  = $false
@@ -48,7 +49,13 @@ function Initialize-Core {
        Restore & Logs tab sees ALL activity (background scans run in child
        runspaces that each call Initialize-Core). We key it off an environment
        variable - env vars are per-process, so all runspaces inherit the same
-       log path. Rollback/backup files remain per-call-timestamp. #>
+       log path. Rollback/backup files remain per-call-timestamp.
+
+       SECURITY: the rollback script is meant to be run ELEVATED, so it must not
+       live anywhere a non-admin process could tamper with it before the user runs
+       it. When elevated, rollback + backup files are written under an ACL-locked
+       %ProgramData% tree (Administrators/SYSTEM write, Users read-only). Logs stay
+       in %LOCALAPPDATA% because they are only ever read, never executed. #>
     param([string]$DataPath)
     if (-not $DataPath) {
         $DataPath = Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer'
@@ -66,8 +73,20 @@ function Initialize-Core {
         $script:Core.LogFile = Join-Path $DataPath ("logs\session_{0}.log" -f $stamp)
         $env:W11SO_SESSION_LOG = $script:Core.LogFile
     }
-    $script:Core.RollbackFile = Join-Path $DataPath ("backups\Rollback_{0}.ps1" -f $stamp)
-    $script:Core.BackupFile   = Join-Path $DataPath ("backups\Backup_{0}.json"  -f $stamp)
+    # Rollback/backup go to the admin-locked ProgramData tree when elevated.
+    $backupDir = Join-Path $DataPath 'backups'
+    try {
+        if (Test-IsAdmin) {
+            $secureBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+            Set-ToolsFolderAcl -Path $secureBase   # idempotent lock of the base
+            $secureBackups = Join-Path $secureBase 'backups'
+            if (-not (Test-Path $secureBackups)) { New-Item -ItemType Directory -Path $secureBackups -Force | Out-Null }
+            $backupDir = $secureBackups
+        }
+    } catch { }
+    $script:Core.BackupDir    = $backupDir
+    $script:Core.RollbackFile = Join-Path $backupDir ("Rollback_{0}.ps1" -f $stamp)
+    $script:Core.BackupFile   = Join-Path $backupDir ("Backup_{0}.json"  -f $stamp)
     Write-CoreLog -Message ("=== {0} v{1} session started ===" -f $script:Core.Name, $script:Core.Version) -Level INFO
     return $script:Core.DataPath
 }
@@ -171,7 +190,9 @@ function Set-RegValueTracked {
 
 function Add-RollbackCommand {
     param([string]$Command, [string]$Comment = '')
-    $block = if ($Comment) { "# $Comment`r`n$Command" } else { $Command }
+    # Control characters are stripped from the comment so a crafted value name
+    # containing CR/LF cannot break out of the comment onto a live code line.
+    $block = if ($Comment) { "# $(ConvertTo-SafeComment $Comment)`r`n$Command" } else { $Command }
     [void]$script:Core.Rollback.Add($block)
 }
 
@@ -480,9 +501,18 @@ function Get-SecurityFixAction {
         'DEF-PUA'   { return { Set-MpPreference -PUAProtection Enabled -ErrorAction Stop; Add-RollbackCommand 'Set-MpPreference -PUAProtection Disabled' 'Revert PUA'; Add-ChangeRecord 'Enabled PUA protection' } }
         'DEF-SIG'   { return { Update-MpSignature -ErrorAction Stop; Add-ChangeRecord 'Updated Defender signatures' } }
         'DEF-ASR'   { return {
-                        # Set ALL rules in ONE call (passing arrays), or each call
-                        # replaces the whole list and only the last rule survives.
-                        # Includes the LSASS credential-theft rule (9e6c4e1f...).
+                        # MERGE our baseline rules into whatever ASR rules the user
+                        # already has - DO NOT replace. Set-MpPreference with the full
+                        # list would wipe any pre-existing ASR rule the user/their org
+                        # configured; Add-MpPreference adds/updates only our own.
+                        #
+                        # Rule selection: the PSExec/WMI rule (D1E49AAC) is deliberately
+                        # EXCLUDED - Microsoft documents it as incompatible with
+                        # Configuration Manager and it is not in MS's standard set. In
+                        # its place we enable two rules from MS's standard protection
+                        # set: block abuse of exploited vulnerable signed drivers
+                        # (56A863A9) and block persistence via WMI event subscription
+                        # (E6DB77E5). Includes the LSASS credential-theft rule (9E6C4E1F).
                         $rules=@(
                           'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550',  # executable content from email/webmail
                           'D4F940AB-401B-4EFC-AADC-AD5F3C50688A',  # Office child processes
@@ -490,14 +520,44 @@ function Get-SecurityFixAction {
                           '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC',  # obfuscated scripts
                           '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B',  # Win32 API from Office macros
                           '9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2',  # block credential theft from LSASS
-                          'D1E49AAC-8F56-4280-B9BA-993A6D77406C',  # process creations from PSExec/WMI
-                          '3B576869-A4EC-4529-8536-B80A7769E899'   # (dup guard; harmless)
+                          '56A863A9-875E-4185-98A7-B882C64B5CE5',  # block abuse of exploited vulnerable signed drivers
+                          'E6DB77E5-3DF2-4CF1-B95A-636979351E5B'   # block persistence through WMI event subscription
                         ) | Select-Object -Unique
-                        $actions = @(1) * $rules.Count   # 1 = Block
-                        Set-MpPreference -AttackSurfaceReductionRules_Ids $rules -AttackSurfaceReductionRules_Actions $actions -ErrorAction Stop
-                        $disList = "@('" + ($rules -join "','") + "')"
-                        Add-RollbackCommand ("$disList | ForEach-Object { Add-MpPreference -AttackSurfaceReductionRules_Ids `$_ -AttackSurfaceReductionRules_Actions Disabled -ErrorAction SilentlyContinue }") 'Disable ASR rules set by this tool'
-                        Add-ChangeRecord 'Enabled baseline ASR rules in Block mode (incl. LSASS protection)' } }
+
+                        # Back up the user's PRIOR ASR state so rollback can restore it
+                        # exactly (not just blindly disable our seven rules).
+                        $prevIds=@(); $prevActs=@()
+                        try { $pp=Get-MpPreference; $prevIds=@($pp.AttackSurfaceReductionRules_Ids | ForEach-Object { "$_" }); $prevActs=@($pp.AttackSurfaceReductionRules_Actions | ForEach-Object { [int]$_ }) } catch { }
+
+                        # Apply by MERGE. Add-MpPreference adds/updates each rule to
+                        # Block without touching the rest of the list.
+                        foreach ($r in $rules) {
+                            Add-MpPreference -AttackSurfaceReductionRules_Ids $r -AttackSurfaceReductionRules_Actions Enabled -ErrorAction Stop
+                        }
+
+                        # Build a rollback that restores the PRIOR list: remove the rules
+                        # we added that were not present before, then re-assert every
+                        # prior rule's prior action verbatim. GUIDs/ints only -> safe to
+                        # embed (they cannot contain quotes). ASR action ints are mapped
+                        # back to their names so Add-MpPreference binds reliably
+                        # (0=Disabled,1=Enabled/Block,2=AuditMode,6=Warn).
+                        $actName = @{ 0='Disabled'; 1='Enabled'; 2='AuditMode'; 6='Warn' }
+                        $prevSet = @{}; for ($i=0; $i -lt $prevIds.Count; $i++) { $prevSet[$prevIds[$i].ToUpper()] = $true }
+                        $rb = New-Object System.Collections.Generic.List[string]
+                        foreach ($r in $rules) {
+                            if (-not $prevSet.ContainsKey($r.ToUpper())) {
+                                $rb.Add("Remove-MpPreference -AttackSurfaceReductionRules_Ids '$r' -ErrorAction SilentlyContinue")
+                            }
+                        }
+                        for ($i=0; $i -lt $prevIds.Count; $i++) {
+                            if ($i -lt $prevActs.Count) {
+                                $an = if ($actName.ContainsKey($prevActs[$i])) { $actName[$prevActs[$i]] } else { 'Enabled' }
+                                $rb.Add("Add-MpPreference -AttackSurfaceReductionRules_Ids '$($prevIds[$i])' -AttackSurfaceReductionRules_Actions $an -ErrorAction SilentlyContinue")
+                            }
+                        }
+                        if ($rb.Count -eq 0) { $rb.Add('# ASR: no rules existed before and none needed removing - nothing to roll back.') }
+                        Add-RollbackCommand ($rb -join "`r`n") 'Restore ASR rules to their state before this tool ran'
+                        Add-ChangeRecord 'Enabled baseline ASR rules in Block mode by merge (incl. LSASS, vulnerable-driver and WMI-persistence rules); prior ASR state backed up for rollback' } }
         'FW-Domain'  { return { Set-NetFirewallProfile -Profile Domain  -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Domain -Enabled False' 'Revert Domain FW'; Add-ChangeRecord 'Enabled Domain firewall' } }
         'FW-Private' { return { Set-NetFirewallProfile -Profile Private -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Private -Enabled False' 'Revert Private FW'; Add-ChangeRecord 'Enabled Private firewall' } }
         'FW-Public'  { return { Set-NetFirewallProfile -Profile Public  -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Public -Enabled False' 'Revert Public FW'; Add-ChangeRecord 'Enabled Public firewall' } }
@@ -876,10 +936,22 @@ function Get-StartupItems {
 
 function ConvertTo-PsSingleQuoted {
     <# Safely encode an arbitrary string as a PowerShell single-quoted literal.
-       Doubles embedded single quotes so the value can never break out into code. #>
+       Uses the official PowerShell escaper, which (unlike a naive '' doubling)
+       also neutralises the Unicode curly single quotes U+2018/U+2019 that the
+       parser treats as string delimiters. Verified against ASCII and both curly
+       quotes. #>
     param([AllowNull()][string]$Value)
     if ($null -eq $Value) { return "''" }
-    return "'" + ($Value -replace "'","''") + "'"
+    return "'" + [System.Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($Value) + "'"
+}
+
+function ConvertTo-SafeComment {
+    <# Strip control characters (CR/LF/tabs/etc.) from text embedded into a
+       generated-script COMMENT line, so a crafted value/name cannot break out of
+       the comment onto a live code line. #>
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '' }
+    return ($Value -replace '[\x00-\x1F\x7F]', ' ')
 }
 
 function Set-StartupItemState {
@@ -1363,10 +1435,21 @@ function Invoke-ProcessThreatScan {
         }
 
         # ---- 2. Running from a user/temp folder ----
-        if ($exe -and $exe -match '\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\|\\\$Recycle') {
-            $sig = & $getSig $exe
-            $signText = if ($sig -and $sig.Signed) { "signed: $($sig.Publisher)" } else { 'UNSIGNED' }
-            [void]$badPath.Add(("  {0} (PID {1}) -> {2}  ({3})" -f $name, $procId, $exe, $signText))
+        # Tier by signature the SAME way the startup check does, so we don't
+        # blanket-flag every AppData process as High (OneDrive/Teams/Zoom/Discord
+        # legitimately run signed from AppData). Temp/Downloads/Public/$Recycle are
+        # always suspicious; AppData/ProgramData only when UNSIGNED.
+        if ($exe) {
+            $tempLoc = ($exe -match '\\Temp\\|\\Downloads\\|\\Users\\Public\\|\\\$Recycle')
+            $userLoc = ($exe -match '\\AppData\\|\\ProgramData\\')
+            if ($tempLoc -or $userLoc) {
+                $sig = & $getSig $exe
+                $isSigned = ($sig -and $sig.Signed)
+                $signText = if ($isSigned) { "signed: $($sig.Publisher)" } else { 'UNSIGNED' }
+                if ($tempLoc -or (-not $isSigned)) {
+                    [void]$badPath.Add(("  {0} (PID {1}) -> {2}  ({3})" -f $name, $procId, $exe, $signText))
+                }
+            }
         }
 
         # ---- 3. Unsigned binary with live network connection ----
@@ -1425,8 +1508,8 @@ function Invoke-ProcessThreatScan {
     if ($badPath.Count -gt 0) {
         $ev = ($badPath.ToArray() | Select-Object -Unique) -join "`n"
         & $add (New-DfirFinding -Id 'DEEP-PROCPATH' -Category 'Running Processes' -Title ("Programs running from temporary/user folders: {0}" -f @($badPath).Count) -Severity 'High' -Status 'Review' `
-            -What ("These programs are running from folders malware often hides in (Temp, AppData, Downloads, ProgramData):`n" + $ev) `
-            -Why 'Legitimate software usually runs from Program Files. Things running from Temp/AppData/Downloads are more suspicious - especially if UNSIGNED.' `
+            -What ("These programs are running from folders malware often hides in (Temp, Downloads, Public, or UNSIGNED from AppData/ProgramData). Signed programs in AppData/ProgramData - like OneDrive/Teams/Zoom - are deliberately excluded:`n" + $ev) `
+            -Why 'Legitimate software usually runs from Program Files. Things running from Temp/Downloads, or UNSIGNED from AppData, are more suspicious.' `
             -WhatToDo 'Look at each. Installers and some updaters are normal here. Anything UNSIGNED that you do not recognise should be scanned with Defender and investigated.' -Evidence $ev)
     }
 
@@ -1462,6 +1545,41 @@ function Invoke-ProcessThreatScan {
     return $f.ToArray()
 }
 
+function Get-ServiceInstallEventFields {
+    <# Extract the STRUCTURED fields of a 7045 "service installed" event from its
+       event XML, not from the localized message text. The <EventData> carries
+       named <Data> elements (ServiceName, ImagePath, ServiceType, StartType,
+       AccountName) that are the same regardless of OS display language, so a
+       filter built on them cannot be dodged by naming a service after a trusted
+       product. Falls back to positional Properties if the XML can't be read. #>
+    param($Event)
+    $out = [pscustomobject]@{ ServiceName=''; ImagePath=''; ServiceType=''; StartType=''; AccountName='' }
+    if (-not $Event) { return $out }
+    try {
+        [xml]$xml = $Event.ToXml()
+        foreach ($d in $xml.Event.EventData.Data) {
+            switch ($d.Name) {
+                'ServiceName' { $out.ServiceName = [string]$d.'#text' }
+                'ImagePath'   { $out.ImagePath   = [string]$d.'#text' }
+                'ServiceType' { $out.ServiceType = [string]$d.'#text' }
+                'StartType'   { $out.StartType   = [string]$d.'#text' }
+                'AccountName' { $out.AccountName = [string]$d.'#text' }
+            }
+        }
+    } catch {
+        # Fallback: 7045 Properties are positional [ServiceName, ImagePath, ServiceType, StartType, AccountName].
+        try {
+            $p = @($Event.Properties)
+            if ($p.Count -ge 1) { $out.ServiceName = [string]$p[0].Value }
+            if ($p.Count -ge 2) { $out.ImagePath   = [string]$p[1].Value }
+            if ($p.Count -ge 3) { $out.ServiceType = [string]$p[2].Value }
+            if ($p.Count -ge 4) { $out.StartType   = [string]$p[3].Value }
+            if ($p.Count -ge 5) { $out.AccountName = [string]$p[4].Value }
+        } catch { }
+    }
+    return $out
+}
+
 function Invoke-EventLogTriage {
     <#
       Reviews the Windows event logs for attacker footprints (the heart of what
@@ -1483,8 +1601,12 @@ function Invoke-EventLogTriage {
         try {
             return @(Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$Ids; StartTime=$after } -MaxEvents $MaxEvents -ErrorAction Stop)
         } catch {
-            # "No events were found" is a normal empty result, not an error.
-            if ($_.Exception.Message -notmatch 'No events were found') { $script:_lastQueryError = $_.Exception.Message }
+            # "No events were found" is a normal empty result, not an error. Detect it
+            # via the locale-INDEPENDENT FullyQualifiedErrorId rather than the English
+            # message text (which would misread as access-denied on non-English
+            # Windows and wrongly show "Security log needs Administrator" even when
+            # elevated). Anything else is recorded as a genuine read error.
+            if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { $script:_lastQueryError = $_.Exception.Message }
             return @()
         }
     }
@@ -1518,20 +1640,32 @@ function Invoke-EventLogTriage {
     } catch { & $add (New-DfirFinding -Id 'EVT-CLEARED-SYS-ERR' -Category 'Event Log' -Title 'System-log check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---- New service installed (persistence) ----
-    # Defender's own anti-malware kernel-mode drivers (WdFilter/MpKslDrv) install
-    # with random-looking names constantly; filter them out to avoid noise.
+    # Defender's own anti-malware definition-update drivers (MpKslDrv) are
+    # reinstalled constantly under random-looking names. We filter THOSE out, but
+    # match on the event's OWN structured fields (ServiceName + ImagePath), NOT a
+    # substring of the message. A substring filter was bypassable: a malicious
+    # service literally named "Windows Defender Update Service" running from
+    # C:\Users\Public would vanish. The genuine Defender driver has BOTH a service
+    # name like MpKsl + 8 hex chars AND an image path under the Defender
+    # "Definition Updates" tree - a planted service can't fake both.
     try {
+        $defUpdateRx = [regex]::Escape('\Windows Defender\Definition Updates\')
         $svc = @(& $queryEvents 'System' 7045 200) | Where-Object {
-            $_ -and ($_.Message -notmatch 'MpKsl|Windows Defender|WdNisDrv|WdFilter')
+            if (-not $_) { return $false }
+            $info = Get-ServiceInstallEventFields $_
+            $isDefenderDefDriver = ($info.ServiceName -match '^MpKsl[0-9a-fA-F]{8}$') -and ($info.ImagePath -match $defUpdateRx)
+            -not $isDefenderDefDriver
         }
         $svc = @($svc)
         if ($svc.Count -gt 0) {
             $ev = ($svc | ForEach-Object {
-                $m = $_.Message -replace "`r?`n", ' '
-                "  {0}: {1}" -f $_.TimeCreated, ($m.Substring(0,[Math]::Min(160,$m.Length)))
+                $info = Get-ServiceInstallEventFields $_
+                $name = if ($info.ServiceName) { $info.ServiceName } else { '(unknown)' }
+                $img  = if ($info.ImagePath)   { $info.ImagePath }   else { '(unknown path)' }
+                "  {0}: {1}  ->  {2}" -f $_.TimeCreated, $name, $img
             }) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-NEWSVC' -Category 'Event Log' -Title ("New service(s) installed recently: {0}" -f $svc.Count) -Severity 'Medium' -Status 'Review' `
-                -What ("These Windows services were installed in the last $Days days (Defender's own driver installs are filtered out):`n" + $ev) `
+                -What ("These Windows services were installed in the last $Days days (Defender's own definition-update drivers are filtered out):`n" + $ev) `
                 -Why 'Installing a service is a common way malware stays running after reboot. Many are legitimate (apps, updates, drivers) - but attackers hide here too.' `
                 -WhatToDo 'Recognise your recent installs? Then fine. An unfamiliar service - especially one running from Temp/AppData or with a random name - should be investigated.' -Evidence $ev)
         }
@@ -1601,10 +1735,17 @@ function Invoke-EventLogTriage {
             $ev = (@($task | ForEach-Object { $tn = (@($_.Message -split "`n" | Where-Object { $_ -match 'Task Name' } | Select-Object -First 1)); "  {0} - {1}" -f $_.TimeCreated, (($tn -join ' ') -replace '\s+',' ').Trim() })) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-TASK' -Category 'Event Log' -Title ("Scheduled task(s) created: {0}" -f $task.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("New scheduled tasks in the last $Days days:`n" + $ev) -Why 'Scheduled tasks are a favourite persistence trick. Legit apps make them too.' -WhatToDo 'Match against software you installed. Investigate unfamiliar ones in Task Scheduler.' -Evidence $ev)
+        } else {
+            # 4698 requires the "Audit Other Object Access Events" policy, which is OFF
+            # by default on Windows. "No events" therefore does NOT prove no tasks were
+            # created - so we SURFACE that caveat to the user instead of hiding it in a
+            # comment, and point them at the native scheduled-task check which does not
+            # depend on auditing being enabled.
+            & $add (New-DfirFinding -Id 'EVT-TASK' -Category 'Event Log' -Title 'No scheduled-task-creation events logged' -Severity 'Info' -Status 'Info' `
+                -What ("No task-creation (event 4698) records were found in the last $Days days.") `
+                -Why 'Windows only logs event 4698 when the "Audit Other Object Access Events" policy is enabled, which is OFF by default. So an empty result here does NOT prove that no scheduled task was created - the event may simply never have been recorded.' `
+                -WhatToDo 'Rely on the Startup / Investigate scheduled-task list (which inspects the tasks that exist now, regardless of auditing) rather than on this event-log card. To get this card working for the future, enable "Audit Other Object Access Events" in Local Security Policy.' -Evidence '')
         }
-        # Note: event 4698 requires "Audit Other Object Access Events" which is OFF by
-        # default, so absence of this card does NOT prove no tasks were created. The
-        # native scheduled-task check in Invoke-DfirTriage covers current tasks.
     } catch { & $add (New-DfirFinding -Id 'EVT-TASK-ERR' -Category 'Event Log' -Title 'Scheduled-task-event check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---- RDP interactive logons (Logon Type 10) ----
@@ -1649,22 +1790,28 @@ function Invoke-DeepScan {
 #  tools (Hayabusa, Chainsaw) from their official GitHub releases, then parses
 #  their output back into our plain-English finding cards.
 #
-#  WHY THIS DESIGN (licensing): Hayabusa and Chainsaw are GPL-3.0. Bundling them
-#  would force this whole MIT project to become GPL. Instead the END USER fetches
-#  them at runtime after an explicit consent screen (vendor, license, source URL,
-#  version, size). We only INVOKE them as separate processes and read their
-#  output - we never redistribute them - so this project stays MIT. See
-#  docs/DFIR-TOOLS.md and THIRD-PARTY-NOTICES.md.
+#  WHY THIS DESIGN (licensing): Hayabusa and Chainsaw are GPL-3.0. Bundling an
+#  unmodified copy would NOT relicense this project's own MIT code (that is mere
+#  aggregation), but it WOULD attach GPL duties - ship the license, offer the
+#  corresponding source - to that binary in every release, and the shipped copy
+#  would go stale. Instead the END USER fetches them at runtime after an explicit
+#  consent screen (vendor, license, source URL, version, size). We only INVOKE
+#  them as separate processes and read their output - we never redistribute them.
+#  See docs/DFIR-TOOLS.md and THIRD-PARTY-NOTICES.md.
 #
 #  SAFETY:
 #   * Nothing downloads or runs unless the user clicks through consent.
 #   * Downloads come only from api.github.com / github.com release assets of the
 #     official repositories, over TLS 1.2+.
-#   * The archive is verified (zip magic bytes), its SHA-256 is computed, logged
-#     and shown to the user, the binary's --version is checked after extraction.
+#   * The archive is verified (zip magic bytes), and its SHA-256 is checked against
+#     a TRUSTED hash (project-pinned/reviewed, else GitHub's advertised digest)
+#     BEFORE extraction. No trusted hash -> the download is REFUSED (fail closed),
+#     because these binaries run elevated. The extracted exe's own hash is pinned
+#     at install time and re-verified before every run.
 #   * The tools are run strictly READ-ONLY against the local event logs.
-#   * Everything lives under %LOCALAPPDATA%\Win11SecurityOptimizer\tools and can
-#     be deleted anytime (Restore & Logs tab / "Remove downloaded tools").
+#   * Everything lives under the admin-locked %ProgramData%\Win11SecurityOptimizer
+#     \tools (Administrators/SYSTEM write, Users read-only) and can be deleted
+#     anytime (Restore & Logs tab / "Remove downloaded tools").
 # ============================================================================
 
 function Get-ExternalToolRegistry {
@@ -1691,6 +1838,17 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^hayabusa.*\.exe$'
             OutputKind   = 'HayabusaCsv'
             NeedsAdmin   = $true
+            # PINNED version + per-asset SHA-256 (the strongest upstream integrity
+            # anchor). This is the version the project has reviewed; the download is
+            # verified against THESE hashes, not just whatever the API advertises at
+            # runtime - so a malicious upstream re-release of the SAME tag is caught.
+            # To adopt a newer version: verify its hashes out-of-band, then update here.
+            PinnedVersion = 'v4.1.0'
+            PinnedSha256 = @{
+                'hayabusa-4.1.0-win-x64.zip'     = '4D304CC5BAAA750ED08CC24B7B89C58EA058740C7E344502D7B82554637543A8'
+                'hayabusa-4.1.0-win-aarch64.zip' = 'F305183E49FCB65CC1F65921845BEA8C8522A5BD4E1A12117931532CA12F0D3D'
+                'hayabusa-4.1.0-win-x86.zip'     = '2C2966AF9FCA074BCFCF48E1B0EBE645D8F25E0B77234D16BD76E5E24E7D2FB4'
+            }
         },
         [pscustomobject]@{
             Key          = 'chainsaw'
@@ -1709,6 +1867,10 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^chainsaw.*windows.*\.exe$|^chainsaw\.exe$'
             OutputKind   = 'ChainsawJson'
             NeedsAdmin   = $true
+            PinnedVersion = 'v2.16.5'
+            PinnedSha256 = @{
+                'chainsaw_all_platforms+rules.zip' = 'FBD5E12FBD70395BC7FDFDF2D3903E8545F27CA2F35E23059DF6177641B76205'
+            }
         }
     )
 }
@@ -1729,49 +1891,90 @@ function Get-SystemArch {
 
 function Get-ExternalToolsRoot {
     <#
-      External tools run ELEVATED, so they must live where a NON-admin process
-      cannot replace the binary between download and run. %LOCALAPPDATA% is
-      user-writable and therefore unsafe for that. Use a dir under %ProgramData%
-      and lock its ACL to Administrators/SYSTEM (full) + Users (read/execute only).
-      Falls back to the per-user location only if ProgramData cannot be secured
-      (and callers refuse to run from an unsecured location while elevated).
+      Pure path accessor (NO side effects): returns the location external tools
+      must live in. External tools run ELEVATED, so they must sit where a
+      non-admin process cannot plant or replace a binary. That is an ACL-locked
+      folder under %ProgramData%. Creating/locking/verifying is done separately by
+      Initialize-SecureToolsRoot so that read-only checks never mutate state.
     #>
-    $root = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools'
+    return (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')
+}
+
+function Test-FolderOwnedBySystemOrAdmins {
+    <# Read-only: true only if the item's owner is Administrators (S-1-5-32-544)
+       or SYSTEM (S-1-5-18). A standard user owning it (the classic ProgramData
+       pre-creation attack) returns false. #>
+    param([string]$Path)
     try {
-        if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
-        if (Test-IsAdmin) { Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer') }
-        return $root
-    } catch {
-        Write-CoreLog -Message ("ProgramData tools root unavailable ({0}); falling back to LOCALAPPDATA." -f $_.Exception.Message) -Level WARN
-        $fallback = Join-Path $script:Core.DataPath 'tools'
-        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
-        return $fallback
-    }
+        $owner = (Get-Acl -Path $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        return ($owner -eq 'S-1-5-32-544' -or $owner -eq 'S-1-5-18')
+    } catch { return $false }
+}
+
+function Test-ToolsTreeOwnership {
+    <# Read-only: true only if the tools root AND every item under it are owned by
+       Administrators/SYSTEM. Catches a non-admin pre-planting tools\x\evil.exe. #>
+    param([string]$Root)
+    if (-not (Test-Path $Root)) { return $true }   # nothing there yet = fine
+    if (-not (Test-FolderOwnedBySystemOrAdmins $Root)) { return $false }
+    try {
+        foreach ($item in Get-ChildItem -Path $Root -Recurse -Force -ErrorAction Stop) {
+            if (-not (Test-FolderOwnedBySystemOrAdmins $item.FullName)) { return $false }
+        }
+        return $true
+    } catch { return $false }
 }
 
 function Test-ToolsRootSecure {
-    <# True only when the tools root is under ProgramData AND locked so standard
-       Users cannot write to it. Used to refuse running an elevated tool from a
-       user-writable location (which a non-admin process could have tampered with). #>
+    <# READ-ONLY security gate (never mutates). True only when the tools root is
+       under ProgramData, is locked so standard Users cannot write, AND the whole
+       tree is owned by Administrators/SYSTEM. Used to refuse running an elevated
+       tool from a location a non-admin could have tampered with. #>
     $secureBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools'
     $root = Get-ExternalToolsRoot
     if ($root -ne $secureBase) { return $false }
+    if (-not (Test-Path $root)) { return $false }
     try {
         $acl = Get-Acl -Path $root
         foreach ($ace in $acl.Access) {
             $id = "$($ace.IdentityReference)"
             if ($id -match 'Users|Everyone|Authenticated Users' -and $ace.AccessControlType -eq 'Allow') {
                 $rights = $ace.FileSystemRights.ToString()
-                if ($rights -match 'Write|Modify|FullControl|CreateFiles|CreateDirectories') { return $false }
+                if ($rights -match 'Write|Modify|FullControl|CreateFiles|CreateDirectories|AppendData') { return $false }
             }
         }
-        return $true
     } catch { return $false }
+    return (Test-ToolsTreeOwnership -Root $root)
+}
+
+function Initialize-SecureToolsRoot {
+    <# Admin-only: create the ProgramData tools tree, lock its ACL, and — crucially
+       — if it (or anything in it) is NOT already owned by Administrators/SYSTEM
+       (i.e. a standard user pre-created it to plant a binary), DELETE and recreate
+       it so no attacker-planted content survives. Returns the secured root path,
+       or throws if it cannot be secured. #>
+    if (-not (Test-IsAdmin)) { throw 'Administrator rights are required to prepare the secure tools folder.' }
+    $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+    $root = Join-Path $base 'tools'
+
+    if (Test-Path $root) {
+        if (-not (Test-ToolsTreeOwnership -Root $root)) {
+            Write-CoreLog -Message 'Tools folder (or an item in it) is not owned by Administrators/SYSTEM - deleting and recreating to drop any planted content.' -Level WARN
+            Remove-Item -Path $root -Recurse -Force -ErrorAction Stop
+        }
+    }
+    if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
+    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    Set-ToolsFolderAcl -Path $base
+    Set-ToolsFolderAcl -Path $root
+    if (-not (Test-ToolsRootSecure)) { throw 'The tools folder could not be secured (ACL/ownership check failed).' }
+    return $root
 }
 
 function Set-ToolsFolderAcl {
-    <# Lock the tools folder: Administrators + SYSTEM full control; Users read &
-       execute only; disable inheritance so a user-writable parent cannot loosen it. #>
+    <# Lock the folder: Administrators + SYSTEM full control; Users read & execute
+       only; disable inheritance; set owner to Administrators (so a user who
+       pre-created it no longer owns it). #>
     param([string]$Path)
     try {
         if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
@@ -1789,6 +1992,27 @@ function Set-ToolsFolderAcl {
         Set-Acl -Path $Path -AclObject $acl
     } catch {
         Write-CoreLog -Message ("Could not lock tools folder ACL: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
+function Set-TreeOwnerToAdministrators {
+    <# Recursively set the OWNER of a path (and everything under it) to the
+       Administrators group (S-1-5-32-544). Our own freshly-extracted files are
+       owned by the elevated admin USER by default, which would otherwise fail the
+       Administrators/SYSTEM ownership gate; forcing the owner to Administrators
+       lets legitimate installs pass while a non-admin's pre-planted content (owned
+       by a standard-user SID) still fails. Requires elevation. #>
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $targets = @($Path)
+    try { $targets += @(Get-ChildItem -Path $Path -Recurse -Force -ErrorAction Stop | ForEach-Object { $_.FullName }) } catch { }
+    foreach ($p in $targets) {
+        try {
+            $acl = Get-Acl -Path $p
+            $acl.SetOwner($admins)
+            Set-Acl -Path $p -AclObject $acl
+        } catch { }
     }
 }
 
@@ -1822,8 +2046,30 @@ function Resolve-ExternalToolRelease {
     # Capture it so the download can be cryptographically verified before use.
     $digest = $null
     try { if ($asset.PSObject.Properties.Name -contains 'digest' -and $asset.digest) { $digest = [string]$asset.digest } } catch { }
-    $sha256Expected = $null
-    if ($digest -and $digest -match '^sha256:([0-9a-fA-F]{64})$') { $sha256Expected = $Matches[1].ToUpper() }
+    $apiSha256 = $null
+    if ($digest -and $digest -match '^sha256:([0-9a-fA-F]{64})$') { $apiSha256 = $Matches[1].ToUpper() }
+
+    # PINNED hash is the strongest anchor: it was reviewed out-of-band and committed
+    # to this registry, so it also catches a MALICIOUS UPSTREAM re-release of the
+    # same tag (which the API digest, coming from that same release, would not).
+    # Precedence for the hash we verify against:
+    #   1. pinned hash for this exact asset name  (strongest)
+    #   2. the API-advertised digest               (catches in-transit tampering)
+    #   3. none                                     (caller fails closed)
+    $pinnedSha = $null
+    try { if ($tool.PSObject.Properties.Name -contains 'PinnedSha256' -and $tool.PinnedSha256 -and $tool.PinnedSha256.ContainsKey($asset.name)) { $pinnedSha = ([string]$tool.PinnedSha256[$asset.name]).ToUpper() } } catch { }
+    $pinnedVersion = $null
+    try { if ($tool.PSObject.Properties.Name -contains 'PinnedVersion') { $pinnedVersion = [string]$tool.PinnedVersion } } catch { }
+    $versionMatchesPin = ($pinnedVersion -and ($rel.tag_name -eq $pinnedVersion))
+
+    # If a newer tag than the pin shipped, the pinned hash won't match the new
+    # asset. Warn clearly - but still verify against the API digest so the download
+    # is at least transit-verified; the caller refuses if even that is missing.
+    if ($pinnedVersion -and -not $versionMatchesPin) {
+        Write-CoreLog -Message ("{0}: latest release {1} differs from the reviewed/pinned version {2}. Using the GitHub-advertised digest for this release; its hash has not been reviewed by this project." -f $tool.Name, $rel.tag_name, $pinnedVersion) -Level WARN
+    }
+
+    $sha256Expected = if ($pinnedSha) { $pinnedSha } elseif ($apiSha256) { $apiSha256 } else { $null }
 
     [pscustomobject]@{
         Key          = $Key
@@ -1840,7 +2086,10 @@ function Resolve-ExternalToolRelease {
         Arch         = $arch
         NeedsAdmin   = $tool.NeedsAdmin
         Published    = $rel.published_at
-        Sha256Expected = $sha256Expected   # may be $null on very old releases
+        Sha256Expected = $sha256Expected   # pinned hash if we have one, else API digest, else $null
+        Sha256Source   = if ($pinnedSha) { 'pinned' } elseif ($apiSha256) { 'github-digest' } else { 'none' }
+        PinnedVersion  = $pinnedVersion
+        VersionMatchesPin = $versionMatchesPin
     }
 }
 
@@ -1904,6 +2153,12 @@ function Install-ExternalTool {
     try {
         if (-not $Resolution) { $Resolution = Resolve-ExternalToolRelease -Key $Key }
 
+        # Prepare + lock the tools root BEFORE anything is written. This creates the
+        # ProgramData tree, locks its ACL, and - critically - if a standard user
+        # pre-created it (or planted content) so it is NOT owned by
+        # Administrators/SYSTEM, deletes and recreates it. Mutating setup lives here;
+        # the gate below (Test-ToolsRootSecure) stays read-only.
+        [void](Initialize-SecureToolsRoot)
         if (-not (Test-ToolsRootSecure)) {
             throw 'The tools folder is not in a protected (admin-only) location, so an elevated download would be unsafe. Aborting.'
         }
@@ -1952,24 +2207,32 @@ function Install-ExternalTool {
             throw 'Downloaded file is not a valid ZIP archive (unexpected content). Aborting for safety.'
         }
 
-        # Compute the SHA-256 and VERIFY it against the digest GitHub advertised for
-        # this exact asset. This is the real integrity gate - if it does not match,
-        # the file is deleted and nothing is extracted or executed.
+        # Compute the SHA-256 and VERIFY it against the expected hash (pinned hash
+        # preferred, else the digest GitHub advertised for this exact asset). This is
+        # the real integrity gate - if it does not match, OR if there is NO expected
+        # hash at all, the file is deleted and nothing is extracted or executed.
+        # These binaries run ELEVATED, so we FAIL CLOSED rather than trusting an
+        # unverifiable download.
         $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToUpper()
         & $report ("SHA-256: {0}" -f $sha)
-        $expected = $null
+        $expected = $null; $expectedSource = 'none'
         try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected } } catch { }
-        if ($expected) {
-            if ($sha -ne $expected.ToUpper()) {
-                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-                throw ("SHA-256 MISMATCH. Expected {0} but got {1}. The download was corrupted or tampered with; it has been deleted and NOT run." -f $expected.ToUpper(), $sha)
-            }
-            & $report 'SHA-256 verified against the official GitHub release digest.'
-            Write-CoreLog -Message ("{0} {1} SHA-256 verified: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Source') { $expectedSource = [string]$Resolution.Sha256Source } } catch { }
+
+        if (-not $expected) {
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+            throw 'No trusted hash is available for this download (neither a project-pinned hash nor a GitHub-advertised digest). Because this tool runs with administrator rights, it will NOT be installed from an unverifiable download. Aborting.'
+        }
+        if ($sha -ne $expected.ToUpper()) {
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+            throw ("SHA-256 MISMATCH. Expected {0} ({1}) but got {2}. The download was corrupted or tampered with; it has been deleted and NOT run." -f $expected.ToUpper(), $expectedSource, $sha)
+        }
+        if ($expectedSource -eq 'pinned') {
+            & $report 'SHA-256 verified against the project-pinned (reviewed) hash.'
+            Write-CoreLog -Message ("{0} {1} SHA-256 verified against PINNED hash: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
         } else {
-            # No digest advertised by the API: do not silently trust it.
-            & $report 'WARNING: no official digest was advertised for this asset; integrity could not be cryptographically verified.'
-            Write-CoreLog -Message 'No GitHub digest available to verify the download; proceeding on ZIP-structure + TLS trust only.' -Level WARN
+            & $report 'SHA-256 verified against the official GitHub release digest (this version is newer than the project-reviewed pin).'
+            Write-CoreLog -Message ("{0} {1} SHA-256 verified against GitHub digest: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
         }
 
         & $report 'Extracting...'
@@ -1979,11 +2242,12 @@ function Install-ExternalTool {
         $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
         if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
 
-        # Re-assert the lock on the freshly-extracted files so the elevated binary
-        # cannot be swapped by a non-admin process before it is run.
-        if ((Get-ExternalToolsRoot) -eq (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')) {
-            Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer')
-        }
+        # PIN THE EXE HASH NOW - at install time, immediately after extracting from
+        # the hash-verified ZIP - so the trusted baseline is "what we just extracted
+        # from a verified archive", NOT "whatever happens to be on disk at first run".
+        $exeHash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToUpper()
+        $exeHashPath = Join-Path $installPath 'exe.sha256'
+        Set-Content -Path $exeHashPath -Value $exeHash -Encoding ASCII
 
         # Verify the binary runs (sanity + anti-corruption check). Different tools
         # expose version differently (Hayabusa uses a 'help' subcommand, not
@@ -1998,12 +2262,28 @@ function Install-ExternalTool {
         if (-not $verText) { $verText = 'ran (version banner not detected)' }
         & $report ("Verified binary: {0}" -f $verText)
 
-        # Record install metadata (incl. the verified hash) for later re-verification.
+        # Record install metadata (incl. both the verified ZIP hash and the pinned
+        # exe hash) for later re-verification.
         $meta = [pscustomobject]@{
             Key=$Key; Name=$tool.Name; Version=$Resolution.Version; Vendor=$tool.Vendor; License=$tool.License
-            Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
+            Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
         }
         try { $meta | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $installPath 'install.json') -Encoding UTF8 } catch { }
+
+        # LAST: force ownership of the WHOLE tools tree (every tool/version subfolder
+        # and the files we just wrote - exe, rules, install.json, exe.sha256) to the
+        # Administrators group, then re-assert the ACL lock. On modern Windows a
+        # folder created by an elevated admin is owned by that USER, not the
+        # Administrators group, so without this the ownership gate would fail on the
+        # NEXT run. This must happen AFTER the manifests are written. A non-admin's
+        # pre-planted file (owned by a standard-user SID) still fails the gate, which
+        # is the whole point.
+        if ((Get-ExternalToolsRoot) -eq (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')) {
+            Set-TreeOwnerToAdministrators -Path (Get-ExternalToolsRoot)
+            Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer')
+            Set-ToolsFolderAcl -Path (Get-ExternalToolsRoot)
+        }
+
         Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $Resolution.DownloadUrl)
 
         return [pscustomobject]@{ Success=$true; Message='Installed.'; ExePath=$exe; Version=$Resolution.Version; Sha256=$sha }
@@ -2218,31 +2498,36 @@ function Invoke-ExternalDfirScan {
     if (-not $ExePath) { $ExePath = Test-ExternalToolInstalled -Key $Key }
     if (-not $ExePath) { throw "$($tool.Name) is not installed. Download it first." }
 
-    # Re-verify the binary's hash against the hash recorded at install time BEFORE
-    # running it elevated. If the on-disk exe (or its folder) was swapped by a
-    # non-admin process, this catches it and refuses to run.
+    # Re-verify the binary's hash against the hash recorded at INSTALL time BEFORE
+    # running it elevated. Fails CLOSED: if the install manifest or the pinned exe
+    # hash is missing (e.g. a non-admin planted the exe without going through our
+    # verified installer), we refuse to run rather than trusting whatever is there.
     try {
-        $installDir = Split-Path $ExePath -Parent
-        $metaPath = Join-Path $installDir 'install.json'
-        if (Test-Path $metaPath) {
-            $meta = Get-Content $metaPath -Raw | ConvertFrom-Json
-            # The recorded Sha256 is of the ZIP, not the exe, so we additionally
-            # pin the exe hash on first verified run and compare thereafter.
-            $exeHashPath = Join-Path $installDir 'exe.sha256'
-            $curExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToUpper()
-            if (Test-Path $exeHashPath) {
-                $pinned = (Get-Content $exeHashPath -Raw).Trim().ToUpper()
-                if ($pinned -and $pinned -ne $curExeHash) {
-                    throw "The $($tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
-                }
-            } else {
-                # First run after install: pin the current hash (folder is admin-locked).
-                Set-Content -Path $exeHashPath -Value $curExeHash -Encoding ASCII
-            }
-        }
-        # Also refuse if the tools root is not admin-locked (user-writable = unsafe to run elevated).
+        # The tools root must be admin-locked first - a user-writable location means
+        # anything in it (incl. install.json / exe.sha256) could have been forged.
         if (-not (Test-ToolsRootSecure)) {
-            throw "$($tool.Name) lives in a non-protected folder; refusing to run it elevated. Re-download via Pro Tools (as admin)."
+            throw "$($tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
+        }
+
+        $installDir  = Split-Path $ExePath -Parent
+        $metaPath    = Join-Path $installDir 'install.json'
+        $exeHashPath = Join-Path $installDir 'exe.sha256'
+
+        # Fail closed when the trust anchors our installer writes are absent.
+        if (-not (Test-Path $metaPath)) {
+            throw "$($tool.Name) has no install manifest (install.json) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+        }
+        if (-not (Test-Path $exeHashPath)) {
+            throw "$($tool.Name) has no pinned executable hash (exe.sha256) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+        }
+
+        $pinned    = (Get-Content $exeHashPath -Raw).Trim().ToUpper()
+        $curExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToUpper()
+        if (-not $pinned) {
+            throw "$($tool.Name)'s pinned hash file is empty. Refusing to run. Delete it in Restore & Logs and re-download."
+        }
+        if ($pinned -ne $curExeHash) {
+            throw "The $($tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
         }
     } catch {
         if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { } }

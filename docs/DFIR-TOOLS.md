@@ -24,14 +24,15 @@ separate binaries.
 | **Chainsaw** (WithSecure) | Event-log/MFT hunter (Sigma) | **GPL-3.0**. | Same as Hayabusa — downloaded at runtime, not bundled. |
 | **Velociraptor** | Endpoint DFIR/hunting | **AGPL-3.0** (very strong copyleft). | Not used; AGPL is even stricter. |
 
-**The core issue (plain English, not legal advice):** the optimizer is **MIT** so
-anyone — including businesses — can use it freely. THOR and KAPE don't permit free
+**The core issue (plain English):** the optimizer is **MIT** so anyone —
+including businesses — can use it freely. THOR and KAPE don't permit free
 redistribution at all, so they can't ship with it. Hayabusa and Chainsaw are
-GPL-3.0: you *can* redistribute them, but doing so puts GPL obligations on that
-distribution (provide the licence, offer the corresponding source, etc.). The
-cleanest way to keep the project simple and MIT is to not ship them at all and let
-the user fetch them on demand. (See the "soft" note at the bottom — I'm not a
-lawyer; this is an engineering decision, not legal counsel.)
+GPL-3.0: you *can* redistribute them, but bundling an unmodified GPL binary that
+the app merely invokes adds GPL obligations **for that binary** (ship its license,
+offer its corresponding source) — it does not relicense this project's own MIT
+code. The cleanest way to keep the project simple and low-obligation is to not
+ship them at all and let the user fetch them on demand. See the detailed note at
+the bottom for the precise reasoning.
 
 ## What it does instead: native "Deep Scan" (MIT, no bundling)
 
@@ -55,7 +56,9 @@ in beginner language.
 **Event-log triage** (a distilled subset of what Hayabusa/Chainsaw do with full
 Sigma rulesets):
 - Security/System **log cleared** (1102/104) — strong anti-forensics signal.
-- **New service installed** (7045, with Defender's own driver installs filtered).
+- **New service installed** (7045, with Defender's own definition-update drivers
+  filtered out by their structured service-name + image-path fields, not by a
+  message substring).
 - **Account created / added to Administrators** (4720/4728/4732).
 - **Brute force** — bursts of failed logons (4625), lockouts (4740).
 - **Defender detections** (1116/1117).
@@ -88,15 +91,22 @@ problems.
 The right pattern is **opt-in orchestration, not bundling**:
 
 1. The tools are kept **out of the repo** entirely (see `.gitignore`; they live
-   under `%LOCALAPPDATA%\Win11SecurityOptimizer\tools` at runtime).
+   under an admin-locked folder at
+   `%ProgramData%\Win11SecurityOptimizer\tools` at runtime, so a standard user
+   cannot swap the elevated binary).
 2. The **"+ Pro Tools"** button lets the user pick Hayabusa or Chainsaw. Before
    anything downloads, a **consent screen** shows the tool name, author, its
    **GPL-3.0 license**, the official source URL, the resolved version, and the
    download size, with a mandatory "I understand/accept" checkbox.
 3. On accept, the tool is downloaded from its **official GitHub release** (arch-
-   matched Windows build), the archive is validated (ZIP magic bytes), its
-   **SHA-256 is computed and logged**, it is extracted, and the binary is
-   smoke-tested before use.
+   matched Windows build), the archive is validated (ZIP magic bytes), and its
+   **SHA-256 is verified against a trusted hash before anything is extracted or
+   run**. The trusted hash is a **project-pinned, reviewed hash** for the versions
+   this project ships (Hayabusa v4.1.0, Chainsaw v2.16.5); for a newer upstream
+   release it falls back to the hash GitHub advertises for that asset. If **no**
+   trusted hash is available, the download is **refused** rather than run — these
+   binaries execute with administrator rights, so the installer fails closed. The
+   extracted binary is then smoke-tested and its own hash pinned before use.
 4. It is run **read-only** against the local event logs, and its output
    (Hayabusa CSV / Chainsaw JSON) is **parsed back into the same plain-English
    finding cards** as everything else, merged into the Investigate list.
@@ -127,15 +137,18 @@ many MIT-licensed front-ends legally drive GPL command-line tools.
 - **Native Deep Scan** — MIT, no downloads, plain-English, always available —
   a fast first look, not a full forensic suite. ✓
 
-## A note on the GPL reasoning (not legal advice)
+## A note on the GPL reasoning
 
-An earlier draft said bundling a GPL tool would "relicense your whole MIT project."
-That overstates it. Shipping Hayabusa as a **separate, unmodified binary** that the
-app merely invokes is generally treated as *aggregation / use of a separate
-program* — it would add GPL duties **for that binary** (ship its license, offer its
-source), not automatically relicense this project's own MIT code. Downloading at
-runtime is still the cleaner choice here (less to ship, always current, obligations
-stay entirely on the upstream project), but the honest reason is "simpler and
-lower-obligation," not "bundling forces MIT→GPL on our code." I'm not a lawyer —
-treat this as an engineering read, and get real legal advice before redistributing
-GPL binaries yourself.
+Bundling a GPL tool does **not** "relicense your whole MIT project." Shipping
+Hayabusa or Chainsaw as a **separate, unmodified binary** that the app merely
+invokes is treated as *aggregation / use of a separate program*: it would add GPL
+duties **for that binary** (ship its license, offer its corresponding source), but
+it would **not** relicense this project's own MIT code. This project downloads the
+tools at runtime instead, for three practical reasons: there is less to ship, the
+user always gets the current upstream version, and all GPL obligations stay
+entirely with the upstream project rather than attaching to anything this project
+distributes.
+
+This is an engineering summary of how the licenses interact, not legal advice. If
+you intend to **redistribute** GPL binaries yourself, review the GPL-3.0 terms (or
+consult a lawyer) first.

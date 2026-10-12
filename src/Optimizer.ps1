@@ -823,8 +823,10 @@ $script:ConsentXaml = @'
               <TextBlock Grid.Column="0" Text="Version" Foreground="#8B949E"/><TextBlock x:Name="CVersion" Grid.Column="1" Foreground="#E6EDF3"/></Grid>
             <Grid Margin="0,0,0,6"><Grid.ColumnDefinitions><ColumnDefinition Width="120"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
               <TextBlock Grid.Column="0" Text="Download size" Foreground="#8B949E"/><TextBlock x:Name="CSize" Grid.Column="1" Foreground="#E6EDF3"/></Grid>
-            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="120"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+            <Grid Margin="0,0,0,6"><Grid.ColumnDefinitions><ColumnDefinition Width="120"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
               <TextBlock Grid.Column="0" Text="Source (official)" Foreground="#8B949E"/><TextBlock x:Name="CUrl" Grid.Column="1" Foreground="#2F81F7" TextWrapping="Wrap"/></Grid>
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="120"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="Integrity" Foreground="#8B949E"/><TextBlock x:Name="CIntegrity" Grid.Column="1" Foreground="#E6EDF3" TextWrapping="Wrap"/></Grid>
           </StackPanel>
         </Border>
         <TextBlock x:Name="CDesc" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="2,0,0,12" LineHeight="19"/>
@@ -834,7 +836,7 @@ $script:ConsentXaml = @'
             <TextBlock TextWrapping="Wrap" Foreground="#C9D1D9" LineHeight="19">
               - This downloads a separate program from the internet (the official GitHub release above) and runs it on your PC to read your Windows event logs.<LineBreak/>
               - It is licensed under its own license (shown above), NOT the optimizer's MIT license. The optimizer only runs it; it does not include or redistribute it.<LineBreak/>
-              - It runs read-only against your logs. The optimizer verifies the download (checks it is a valid archive and records its SHA-256), but you are trusting the upstream project.<LineBreak/>
+              - It runs read-only against your logs. The optimizer refuses to install unless the download's SHA-256 matches a trusted hash (see "Integrity" above), but you are trusting the upstream project itself.<LineBreak/>
               - Some antivirus/EDR products flag security tools like these (they are "hacktools" by category). That does not necessarily mean they are malicious, but you should be comfortable with that.
             </TextBlock>
           </StackPanel>
@@ -883,6 +885,23 @@ function Show-ConsentDialog {
     (& $g 'CUrl').Text        = $res.DownloadUrl
     (& $g 'CDesc').Text       = $res.Summary
 
+    # Integrity line + fail-closed guard. These tools run elevated, so if there is
+    # no trusted hash (neither a project-pinned hash nor a GitHub-advertised
+    # digest) we refuse the download outright rather than offer to run it anyway.
+    $src = ''; try { $src = [string]$res.Sha256Source } catch { }
+    $hasHash = $false; try { $hasHash = [bool]$res.Sha256Expected } catch { }
+    $cInteg = & $g 'CIntegrity'
+    if (-not $hasHash -or $src -eq 'none') {
+        [System.Windows.MessageBox]::Show("$($tool.Name) cannot be installed: no trusted SHA-256 is available for this download (the project has no pinned hash for it and GitHub advertised no digest).`n`nBecause this tool runs with administrator rights, it will not be downloaded from an unverifiable source.", 'Download refused (no verifiable hash)', 'OK', 'Warning') | Out-Null
+        return $null
+    } elseif ($src -eq 'pinned') {
+        $cInteg.Text = 'SHA-256 pinned & reviewed by this project (verified before running)'
+        try { $cInteg.Foreground = '#3FB950' } catch { }
+    } else {
+        $cInteg.Text = ("SHA-256 from GitHub release digest (verified before running). Note: version {0} is newer than this project's reviewed version {1}." -f $res.Version, $res.PinnedVersion)
+        try { $cInteg.Foreground = '#D29922' } catch { }
+    }
+
     $accept = & $g 'CAccept'; $ok = & $g 'COk'; $cancel = & $g 'CCancel'
     $accept.Add_Checked({   $ok.IsEnabled = $true })
     $accept.Add_Unchecked({ $ok.IsEnabled = $false })
@@ -901,6 +920,17 @@ function Start-ProScan {
 
     if (-not (Test-IsAdmin)) {
         [System.Windows.MessageBox]::Show("$($tool.Name) needs administrator rights to read the Windows Security log. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    # Prepare + lock the secure tools root up front. If a standard user pre-created
+    # the ProgramData folder (or planted a binary in it) so it is not owned by
+    # Administrators/SYSTEM, this deletes and recreates it - so the "already
+    # installed?" check below cannot be tricked into skipping consent and running
+    # attacker-planted content.
+    try { [void](Initialize-SecureToolsRoot) }
+    catch {
+        [System.Windows.MessageBox]::Show("Could not secure the tools folder:`n$($_.Exception.Message)", 'Pro Tools blocked', 'OK', 'Error') | Out-Null
         return
     }
 
