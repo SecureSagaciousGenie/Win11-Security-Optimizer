@@ -139,7 +139,9 @@ jobs:
           Initialize-Core | Out-Null
           [void](Initialize-SecureToolsRoot)
           $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $failed = @()
           foreach ($key in @('hayabusa', 'chainsaw')) {
+           try {
             $res = Resolve-ExternalToolRelease -Key $key
             'Resolved {0} {1} (integrity: {2})' -f $res.Name, $res.Version, $res.Sha256Source
             if ($res.Sha256Source -ne 'pinned') { throw "$key did not resolve to the pinned, reviewed hash" }
@@ -152,8 +154,17 @@ jobs:
             $summary
             Write-Output ('::notice title=' + $key + '::' + ($summary -replace '[\r\n]', ' '))
             if ($cards.Count -eq 0) { throw "$key produced no cards" }
-            if (@($cards | Where-Object { $_.Id -match 'NONE$' }).Count -gt 0) { throw "$key produced no output file" }
+            if (@($cards | Where-Object { $_.Id -match 'NONE$' }).Count -gt 0) {
+              $log = Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer\logs') -Filter 'session_*.log' | Sort-Object LastWriteTime | Select-Object -Last 1
+              $why = (@(Get-Content -LiteralPath $log.FullName | Where-Object { $_ -match 'wrote no results|finished \(exit' }) | Select-Object -Last 2) -join ' / '
+              throw "$key produced no output file: $why"
+            }
+           } catch {
+            $failed += $key
+            Write-Output ('::error title=' + $key + '::' + (($_.Exception.Message + ' @ ' + $_.InvocationInfo.PositionMessage) -replace '[\r\n]+', ' '))
+           }
           }
+          if ($failed.Count -gt 0) { throw ('Failed: ' + ($failed -join ', ')) }
           'Tools root still secure: {0}' -f (Test-ToolsRootSecure)
           if (-not (Test-ToolsRootSecure)) { throw 'The tools root failed the ownership gate after the runs.' }
 

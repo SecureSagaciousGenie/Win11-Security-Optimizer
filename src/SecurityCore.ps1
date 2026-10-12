@@ -2804,13 +2804,13 @@ function Invoke-HayabusaScan {
     # -K no color, -Q quiet errors. (Subcommand/flags verified against v4.x.)
     $hArgs = @('dfir-timeline','-l','-w','-C','-o', $outCsv, '-m', $MinLevel, '-p','standard','-K','-Q')
     & $report ("Running Hayabusa (min level: {0}) - this can take a few minutes..." -f $MinLevel)
-    $stdout = ''
+    $run = $null
     try {
         Push-Location $toolDir
-        $stdout = (& $ExePath @hArgs 2>&1 | Out-String)
+        $run = Invoke-NativeCommand -FilePath $ExePath -ArgumentList $hArgs
     } finally { Pop-Location }
-    Write-CoreLog -Message ("Hayabusa finished. Output: {0}" -f $outCsv) -Level INFO
-    return [pscustomobject]@{ OutputPath=$outCsv; StdOut=$stdout; Kind='HayabusaCsv' }
+    Write-CoreLog -Message ("Hayabusa finished (exit {0}). Output: {1}" -f $run.ExitCode, $outCsv) -Level INFO
+    return [pscustomobject]@{ OutputPath=$outCsv; StdOut=[string]$run.Output; ExitCode=$run.ExitCode; Kind='HayabusaCsv' }
 }
 
 function Get-ExternalLevelAtOrAbove {
@@ -2853,19 +2853,27 @@ function Invoke-ChainsawScan {
     # Pass --level only when this build's hunt help lists it; the parser also
     # filters by level, so older builds still honour the minimum.
     $helpText = ''
-    try { $helpText = (& $ExePath 'hunt' '--help' 2>&1 | Out-String) } catch { Write-CoreLog -Message ("chainsaw hunt --help failed: {0}" -f $_.Exception.Message) -Level WARN }
+    try { $helpText = [string](Invoke-NativeCommand -FilePath $ExePath -ArgumentList @('hunt', '--help')).Output } catch { Write-CoreLog -Message ("chainsaw hunt --help failed: {0}" -f $_.Exception.Message) -Level WARN }
     if ($helpText -match '--level') {
         foreach ($lv in @(Get-ExternalLevelAtOrAbove -MinLevel $MinLevel)) { $csArgs += @('--level', $lv) }
     }
 
     & $report 'Running Chainsaw against the local event logs - this can take a few minutes...'
-    $stdout = ''
+    # Invoke-NativeCommand: Chainsaw prints its banner and progress to stderr,
+    # which Windows PowerShell 5.1 turns into a terminating error when the
+    # caller runs with ErrorActionPreference Stop.
+    $run = $null
     try {
         Push-Location $toolDir
-        $stdout = (& $ExePath @csArgs 2>&1 | Out-String)
+        $run = Invoke-NativeCommand -FilePath $ExePath -ArgumentList $csArgs
     } finally { Pop-Location }
-    Write-CoreLog -Message ("Chainsaw finished. Output: {0}" -f $outJson) -Level INFO
-    return [pscustomobject]@{ OutputPath=$outJson; StdOut=$stdout; Kind='ChainsawJson' }
+    Write-CoreLog -Message ("Chainsaw finished (exit {0}). Output: {1}" -f $run.ExitCode, $outJson) -Level INFO
+    if (-not (Test-Path -LiteralPath $outJson)) {
+        $tail = [string]$run.Output
+        if ($tail.Length -gt 600) { $tail = $tail.Substring($tail.Length - 600) }
+        Write-CoreLog -Message ("Chainsaw wrote no results file. Exit code {0}. Last output: {1}" -f $run.ExitCode, $tail) -Level WARN
+    }
+    return [pscustomobject]@{ OutputPath=$outJson; StdOut=[string]$run.Output; ExitCode=$run.ExitCode; Kind='ChainsawJson' }
 }
 
 # ----------------------------------------------------------------------------
