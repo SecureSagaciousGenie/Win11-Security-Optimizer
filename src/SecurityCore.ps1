@@ -2459,6 +2459,9 @@ function Resolve-ExternalToolRelease {
 
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
     $headers = @{ 'User-Agent' = 'Win11SecurityOptimizer'; 'Accept' = 'application/vnd.github+json' }
+    # Optional token for the GitHub API (CI runners share IPs and hit the
+    # unauthenticated rate limit). Users never need to set this.
+    if ($env:W11SO_GITHUB_TOKEN) { $headers['Authorization'] = 'Bearer ' + $env:W11SO_GITHUB_TOKEN }
 
     # Decide which release to fetch. Default = the pinned tag (so the pin holds);
     # -UseLatest or no pin configured = /releases/latest.
