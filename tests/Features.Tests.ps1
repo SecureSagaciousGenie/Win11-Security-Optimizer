@@ -104,12 +104,19 @@ Describe 'Features' {
             Mock Get-AuthenticodeSignature { [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null } }
             Test-MicrosoftSigned -Path 'C:\x.exe' | Should -BeFalse
         }
+        # Real signature checks run with the real ProgramData: Windows signature
+        # verification keeps state files open under %ProgramData%, which would
+        # otherwise land in TestDrive and block its clean-up.
         It 'accepts a real MS-signed binary' -Skip:(-not $script:OnWindows) {
-            Test-MicrosoftSigned -Path (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe') | Should -BeTrue
+            $saved = $env:ProgramData; $env:ProgramData = $script:SavedEnv.ProgramData
+            try { Test-MicrosoftSigned -Path (Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe') | Should -BeTrue }
+            finally { $env:ProgramData = $saved }
         }
         It 'rejects a non-MS file' -Skip:(-not $script:OnWindows) {
             $p = Join-Path $TestDrive 'x.ps1'; Set-Content -LiteralPath $p -Value 'x'
-            Test-MicrosoftSigned -Path $p | Should -BeFalse
+            $saved = $env:ProgramData; $env:ProgramData = $script:SavedEnv.ProgramData
+            try { Test-MicrosoftSigned -Path $p | Should -BeFalse }
+            finally { $env:ProgramData = $saved }
         }
     }
 
