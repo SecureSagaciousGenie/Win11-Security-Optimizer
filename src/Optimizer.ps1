@@ -1,6 +1,7 @@
 <#
     Optimizer.ps1  --  Windows 11 Security Optimizer (WPF GUI)
     ----------------------------------------------------------
+    Author: Ahmad Shaukat
     Everything the user does happens in this window:
       Dashboard | Security | Debloat | Investigate (DFIR) | Startup | Restore & Logs
 
@@ -507,7 +508,7 @@ function Invoke-Background {
     $ps.Runspace = $rs
     [void]$ps.AddScript({
         . $CorePath
-        Initialize-Core | Out-Null
+        Initialize-Core -ReadOnly | Out-Null
         # Progress helper available to $WorkBody as $Report.
         $Report = { param($m) try { $SharedState.Status = $m } catch { } }
         Set-Variable -Name Report -Value $Report -Scope Global
@@ -573,6 +574,7 @@ function Show-Page {
 # ============================================================================
 #  PRESENTATION HELPERS  (attach display props to backend objects)
 # ============================================================================
+$script:SevRank = @{ 'Critical'=0; 'High'=1; 'Medium'=2; 'Low'=3; 'Info'=4 }
 $script:SevBrush = @{
     'Critical'='#F85149'; 'High'='#F85149'; 'Medium'='#D29922'; 'Low'='#6E7681'; 'Info'='#2F81F7'
 }
@@ -782,7 +784,7 @@ function Start-DfirScan {
         $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
         # Alerts/Reviews first, then clean
         $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $cards | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
+        $sorted = $cards | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $script:SevRank[$_.Severity] } }
         $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
         $s = $res.Summary
         $script:UIRef.UI.CardDfir.Text = "$($s.Alerts + $s.Reviews)"
@@ -968,7 +970,7 @@ function Start-ProScan {
         $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
         $combined = @($existing) + @($cards)
         $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $combined | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
+        $sorted = $combined | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $script:SevRank[$_.Severity] } }
         $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
         $alerts = @($combined | Where-Object { $_.Status -eq 'Alert' }).Count
         $reviews = @($combined | Where-Object { $_.Status -eq 'Review' }).Count
@@ -1169,6 +1171,11 @@ function Start-Optimizer {
     # standard user pre-created it and denied Administrators), Initialize-Core fell
     # back to %LOCALAPPDATA% for rollback/backup files. That is user-writable, so
     # warn the user explicitly rather than letting it pass silently.
+    if (-not $SelfTest -and $script:Core.SecureSetupNotice) {
+        try {
+            [System.Windows.MessageBox]::Show($script:Core.SecureSetupNotice, 'Untrusted folder moved aside', 'OK', 'Information') | Out-Null
+        } catch { }
+    }
     if (-not $SelfTest -and $script:Core.SecureSetupWarning) {
         try {
             [System.Windows.MessageBox]::Show(

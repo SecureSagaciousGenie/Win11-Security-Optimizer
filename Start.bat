@@ -2,6 +2,7 @@
 setlocal
 rem ===================================================================
 rem  Windows 11 Security Optimizer - one-click launcher
+rem  Author: Ahmad Shaukat
 rem  Double-click this file. It will:
 rem    1. Ask for administrator rights (needed to apply fixes).
 rem    2. Launch the GUI with PowerShell in STA mode.

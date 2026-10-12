@@ -1,6 +1,7 @@
 <#
     SecurityCore.ps1
     ----------------
+    Author: Ahmad Shaukat
     Backend engine for the Windows 11 Security Optimizer.
 
     This module contains ALL logic (scanning, hardening, debloat, DFIR triage,
@@ -35,6 +36,7 @@ $script:Core = [ordered]@{
     RollbackFile  = $null
     BackupFile    = $null
     SecureSetupWarning = $null
+    SecureSetupNotice  = $null
     TranscriptOn  = $false
     RestorePointMade = $false
     Rollback      = (New-Object System.Collections.ArrayList)   # apply-order rollback blocks
@@ -57,7 +59,7 @@ function Initialize-Core {
        it. When elevated, rollback + backup files are written under an ACL-locked
        %ProgramData% tree (Administrators/SYSTEM write, Users read-only). Logs stay
        in %LOCALAPPDATA% because they are only ever read, never executed. #>
-    param([string]$DataPath)
+    param([string]$DataPath, [switch]$ReadOnly)
     if (-not $DataPath) {
         $DataPath = Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer'
     }
@@ -82,14 +84,22 @@ function Initialize-Core {
     # keeps ownership and could swap in a malicious Rollback_*.ps1). If securing
     # fails while elevated we DO fall back to %LOCALAPPDATA% so the app still works,
     # but we record a warning for the UI instead of failing silently.
+    # -ReadOnly is used by background runspaces: they only resolve paths and never
+    # create, lock, re-own or quarantine anything. The main thread secures the base
+    # once at startup.
     $backupDir = Join-Path $DataPath 'backups'
     $script:Core.SecureSetupWarning = $null
-    if (Test-IsAdmin) {
+    $script:Core.SecureSetupNotice  = $null
+    if ($ReadOnly) {
+        if (Test-IsAdmin) {
+            $secureBackups = Join-Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer') 'backups'
+            if ((Test-Path -LiteralPath $secureBackups) -and (Test-FolderOwnedBySystemOrAdmins $secureBackups)) { $backupDir = $secureBackups }
+        }
+    } elseif (Test-IsAdmin) {
         try {
-            $secureBase = Initialize-SecureBase    # verifies ownership, recreates if planted, locks ACL
+            $secureBase = Initialize-SecureBase    # verifies ownership, quarantines planted content, locks ACL
             $secureBackups = Join-Path $secureBase 'backups'
-            if (-not (Test-Path $secureBackups)) { New-Item -ItemType Directory -Path $secureBackups -Force | Out-Null }
-            Set-TreeOwnerToAdministrators -Path $secureBackups   # our own folder -> Administrators-owned so the gate stays green
+            New-SecureDirectory -Path $secureBackups
             $backupDir = $secureBackups
         } catch {
             $script:Core.SecureSetupWarning = ("Could not secure the system data folder C:\ProgramData\Win11SecurityOptimizer ({0}). Rollback and backup files for this session will be written to your user profile (%LOCALAPPDATA%) instead, where another program running as you could modify them before you run the rollback. Re-run as administrator, or check who owns that folder in File Explorer (Properties > Security > Advanced > Owner)." -f $_.Exception.Message)
@@ -232,8 +242,15 @@ Write-Host 'Rolling back Windows 11 Security Optimizer changes...' -ForegroundCo
 "@
     $body = $script:Core.Rollback.ToArray(); [array]::Reverse($body)
     $full = $header + ($body -join "`r`n`r`n") + "`r`n`r`nWrite-Host 'Rollback complete. A restart is recommended.' -ForegroundColor Green`r`n"
-    Set-Content -Path $script:Core.RollbackFile -Value $full -Encoding UTF8
-    try { $script:Core.Backups.ToArray() | ConvertTo-Json -Depth 6 | Set-Content -Path $script:Core.BackupFile -Encoding UTF8 } catch { }
+    # Write-SecureFile re-owns the file to Administrators when it lands in the
+    # secure base, so the base ownership gate never trips on our own output.
+    Write-SecureFile -Path $script:Core.RollbackFile -Value $full
+    try {
+        # -InputObject keeps a single record as a JSON array in Windows PowerShell 5.1.
+        Write-SecureFile -Path $script:Core.BackupFile -Value (ConvertTo-Json -InputObject @($script:Core.Backups.ToArray()) -Depth 6)
+    } catch {
+        Write-CoreLog -Message ("Backup JSON not written: {0}" -f $_.Exception.Message) -Level WARN
+    }
     Write-CoreLog -Message ("Rollback script written: {0}" -f $script:Core.RollbackFile) -Level OK
 }
 
@@ -409,7 +426,7 @@ function Invoke-SecurityScan {
         -Detail 'USB autorun is a classic worm vector.' -Advice 'Disable AutoRun on all drive types.' -RiskTier 'Safe' -Fixable ($ar -ne 255))
 
     # ---- Guest account ----
-    $guest = $null; try { $guest = Get-LocalUser -Name 'Guest' -ErrorAction Stop } catch { }
+    $guest = $null; try { $guest = Get-GuestAccount } catch { }
     if ($guest) {
         $en = [bool]$guest.Enabled
         & $add (New-Finding -Id 'ACCT-GUEST' -Category 'Accounts' -Name 'Built-in Guest account' -Severity 'Medium' `
@@ -580,7 +597,13 @@ function Get-SecurityFixAction {
         'SMB1'       { return { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null; Add-RollbackCommand 'Enable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart' 'Re-enable SMBv1'; Add-ChangeRecord 'Disabled SMBv1 (restart may be needed)' } }
         'LLMNR'      { return { Set-RegValueTracked -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' -Value 0 -Type DWord } }
         'AUTORUN'    { return { Set-RegValueTracked -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoDriveTypeAutoRun' -Value 255 -Type DWord } }
-        'ACCT-GUEST' { return { Disable-LocalUser -Name 'Guest' -ErrorAction Stop; Add-RollbackCommand 'Enable-LocalUser -Name ''Guest''' 'Re-enable Guest'; Add-ChangeRecord 'Disabled Guest account' } }
+        'ACCT-GUEST' { return {
+                        $g = Get-GuestAccount
+                        if (-not $g) { throw 'The built-in Guest account was not found.' }
+                        $gsid = [string]$g.SID.Value   # matched ^S-1-5-21-...-501$, safe to embed
+                        Disable-LocalUser -SID $gsid -ErrorAction Stop
+                        Add-RollbackCommand ("Enable-LocalUser -SID '{0}'" -f $gsid) 'Re-enable Guest'
+                        Add-ChangeRecord 'Disabled Guest account' } }
         'WU-SVC'     { return { Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop; Add-RollbackCommand 'Set-Service -Name wuauserv -StartupType Disabled' 'Revert WU service'; Add-ChangeRecord 'Set Windows Update to Manual' } }
         'HVCI'       { return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled' -Value 1 -Type DWord } }
         'RDP-ENABLED'{ return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord } }
@@ -623,7 +646,7 @@ function Test-SecurityFixApplied {
             'UAC-SECUREDESK'{ return ((Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'PromptOnSecureDesktop') -eq 1) }
             'LLMNR'      { return ((Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast') -eq 0) }
             'AUTORUN'    { return ((Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun') -eq 255) }
-            'ACCT-GUEST' { return (-not (Get-LocalUser -Name 'Guest' -ErrorAction SilentlyContinue).Enabled) }
+            'ACCT-GUEST' { $g = Get-GuestAccount; return ($g -and -not $g.Enabled) }
             'WU-SVC'     { return ((Get-Service wuauserv).StartType -ne 'Disabled') }
             'DEF-ASR'    {
                 try {
@@ -1048,6 +1071,42 @@ function Set-StartupItemState {
 #  explanation, and a "WhatToDo". Returns an array of finding objects.
 # ============================================================================
 
+function Get-LocalAdminMembers {
+    <# Members of the local Administrators group (S-1-5-32-544) as objects with
+       Name and Sid. Looks the group up by SID so it works on every Windows
+       language. Falls back to "net localgroup" when Get-LocalGroupMember fails
+       (it throws on orphaned SIDs); that path has names only. #>
+    try {
+        return @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_.Name; Sid = $(if ($_.SID) { [string]$_.SID.Value } else { $null }) }
+        })
+    } catch {
+        $groupName = 'Administrators'
+        try { $groupName = (New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544').Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1] } catch { }
+        $raw = @(& net.exe localgroup $groupName 2>$null)
+        return @(ConvertFrom-NetLocalGroupOutput -Lines $raw)
+    }
+}
+
+function ConvertFrom-NetLocalGroupOutput {
+    <# Parse "net localgroup NAME" output. Members sit between the dashed separator
+       and the final status line, whatever language that status line is in. #>
+    param([AllowNull()][AllowEmptyCollection()][string[]]$Lines)
+    $l = @($Lines | Where-Object { $_ -and $_.Trim() })
+    $sep = -1
+    for ($i = 0; $i -lt $l.Count; $i++) { if ($l[$i] -match '^-{5,}') { $sep = $i; break } }
+    if ($sep -lt 0) { throw 'Could not read the Administrators group.' }
+    $out = @()
+    for ($i = $sep + 1; $i -lt ($l.Count - 1); $i++) { $out += [pscustomobject]@{ Name = $l[$i].Trim(); Sid = $null } }
+    return $out
+}
+
+function Get-GuestAccount {
+    <# The built-in Guest account, found by RID 501 instead of its localised name. #>
+    $all = @(Get-LocalUser -ErrorAction Stop)
+    return (@($all | Where-Object { $_.SID -and ([string]$_.SID.Value) -match '^S-1-5-21-\d+-\d+-\d+-501$' }) | Select-Object -First 1)
+}
+
 function New-DfirFinding {
     param(
         [string]$Id, [string]$Category, [string]$Title,
@@ -1067,39 +1126,31 @@ function Invoke-DfirTriage {
     $add = { param($x) [void]$f.Add($x) }
 
     # ---------- 1. Local administrators ----------
+    # Identities are matched by SID so the check works on every Windows language.
     try {
-        $adminMembers = @()
-        try {
-            $grp = Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop
-            $adminMembers = $grp | ForEach-Object { $_.Name }
-        } catch {
-            # Fallback via net localgroup for odd SID/translation cases
-            $raw = (net localgroup administrators) 2>$null
-            if ($raw) {
-                $capture=$false
-                foreach ($line in $raw) {
-                    if ($line -match '^----') { $capture=$true; continue }
-                    if ($line -match 'completed successfully') { $capture=$false; continue }
-                    if ($capture -and $line.Trim()) { $adminMembers += $line.Trim() }
-                }
-            }
-        }
-        $adminMembers = @($adminMembers | Where-Object { $_ } | Select-Object -Unique)
-        # Known/expected: current user, built-in Administrator, Domain Admins
-        $expectedPatterns = @('*\Administrator', 'Administrator', "*\$env:USERNAME", $env:USERNAME, '*\Domain Admins', '*\Enterprise Admins')
+        $members = @(Get-LocalAdminMembers)
+        $adminMembers = @($members | ForEach-Object { $_.Name } | Where-Object { $_ } | Select-Object -Unique)
+        $mySid = $null
+        try { $mySid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { }
         $unexpected = @()
-        foreach ($m in $adminMembers) {
+        foreach ($m in $members) {
+            $sid = [string]$m.Sid
             $isExpected = $false
-            foreach ($pat in $expectedPatterns) { if ($m -like $pat) { $isExpected=$true; break } }
-            if (-not $isExpected) { $unexpected += $m }
+            if ($sid) {
+                if ($sid -match '-(500|512|519)$') { $isExpected = $true }      # built-in Administrator, Domain Admins, Enterprise Admins
+                elseif ($mySid -and $sid -eq $mySid) { $isExpected = $true }   # the signed-in user
+            } elseif ($m.Name -and ($m.Name -eq $env:USERNAME -or $m.Name -like ("*" + $env:USERNAME))) {
+                $isExpected = $true
+            }
+            if (-not $isExpected) { $unexpected += $m.Name }
         }
-        $unexpected = @($unexpected)
+        $unexpected = @($unexpected | Where-Object { $_ })
         $evidence = ($adminMembers -join "`n")
         if ($unexpected.Count -gt 0) {
             & $add (New-DfirFinding -Id 'DFIR-ADMIN' -Category 'Accounts & Access' -Title 'Extra accounts in the Administrators group' -Severity 'High' -Status 'Review' `
                 -What ("These accounts have full administrator rights on this PC:`n  " + ($adminMembers -join "`n  ")) `
                 -Why 'Attackers add a hidden admin account to keep control. Any account here can change anything, install software, and read all files.' `
-                -WhatToDo ("Confirm you recognise every account above. If one is unfamiliar (especially these: " + ($unexpected -join ', ') + "), it may have been added without your knowledge. Investigate before removing. Remove with: Remove-LocalGroupMember -Group Administrators -Member '<name>'.") `
+                -WhatToDo ("Confirm you recognise every account above. If one is unfamiliar (especially these: " + ($unexpected -join ', ') + "), it may have been added without your knowledge. Investigate before removing. Remove with: Remove-LocalGroupMember -SID S-1-5-32-544 -Member 'ACCOUNT' (replace ACCOUNT with the name).") `
                 -Evidence $evidence)
         } else {
             & $add (New-DfirFinding -Id 'DFIR-ADMIN' -Category 'Accounts & Access' -Title 'Administrators group looks normal' -Severity 'Info' -Status 'Clean' `
@@ -1564,11 +1615,11 @@ function Get-ServiceInstallEventFields {
        AccountName) that are the same regardless of OS display language, so a
        filter built on them cannot be dodged by naming a service after a trusted
        product. Falls back to positional Properties if the XML can't be read. #>
-    param($Event)
+    param($EventRecord)
     $out = [pscustomobject]@{ ServiceName=''; ImagePath=''; ServiceType=''; StartType=''; AccountName='' }
-    if (-not $Event) { return $out }
+    if (-not $EventRecord) { return $out }
     try {
-        [xml]$xml = $Event.ToXml()
+        [xml]$xml = $EventRecord.ToXml()
         foreach ($d in $xml.Event.EventData.Data) {
             switch ($d.Name) {
                 'ServiceName' { $out.ServiceName = [string]$d.'#text' }
@@ -1581,7 +1632,7 @@ function Get-ServiceInstallEventFields {
     } catch {
         # Fallback: 7045 Properties are positional [ServiceName, ImagePath, ServiceType, StartType, AccountName].
         try {
-            $p = @($Event.Properties)
+            $p = @($EventRecord.Properties)
             if ($p.Count -ge 1) { $out.ServiceName = [string]$p[0].Value }
             if ($p.Count -ge 2) { $out.ImagePath   = [string]$p[1].Value }
             if ($p.Count -ge 3) { $out.ServiceType = [string]$p[2].Value }
@@ -1612,9 +1663,14 @@ function Test-IsDefenderDefinitionDriver {
     if ($path -match '^(\\\?\?\\|\\\\\?\\)(.+)$') { $path = $Matches[2] }
     $path = $path.Trim()
 
+    # Reject relative segments: "...\Definition Updates\..\..\Users\Public\x.sys"
+    # would otherwise pass the prefix and suffix checks. Windows accepts both
+    # slash forms as separators, so split on both.
+    if (@($path -split '[\\/]' | Where-Object { $_ -eq '.' -or $_ -eq '..' }).Count -gt 0) { return $false }
+
     # The genuine driver image is a bare .sys path (no quotes, no trailing args).
     # Build the expected prefix from the real ProgramData location on this machine.
-    $expectedPrefix = (Join-Path $env:ProgramData 'Microsoft\Windows Defender\Definition Updates\')
+    $expectedPrefix = $env:ProgramData.TrimEnd('\') + '\Microsoft\Windows Defender\Definition Updates\'
     $startsOk = $path.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
     $endsOk   = $path.EndsWith('\MpKslDrv.sys', [System.StringComparison]::OrdinalIgnoreCase)
     # Reject anything with a quote or whitespace-delimited argument after the .sys.
@@ -1947,7 +2003,7 @@ function Test-FolderOwnedBySystemOrAdmins {
        pre-creation attack) returns false. #>
     param([string]$Path)
     try {
-        $owner = (Get-Acl -Path $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        $owner = (Get-Acl -LiteralPath $Path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         return ($owner -eq 'S-1-5-32-544' -or $owner -eq 'S-1-5-18')
     } catch { return $false }
 }
@@ -1957,11 +2013,23 @@ function Test-TreeOwnership {
        Administrators/SYSTEM. Catches a non-admin pre-planting content anywhere in
        the tree (tools\x\evil.exe, or a swapped backups\Rollback_*.ps1). #>
     param([string]$Root)
-    if (-not (Test-Path $Root)) { return $true }   # nothing there yet = fine
+    if (-not (Test-Path -LiteralPath $Root)) { return $true }   # nothing there yet = fine
     if (-not (Test-FolderOwnedBySystemOrAdmins $Root)) { return $false }
+    # Manual walk: Windows PowerShell 5.1 Get-ChildItem -Recurse follows junctions.
+    # This tool never creates links, so any reparse point is treated as planted.
+    $reparse = [System.IO.FileAttributes]::ReparsePoint
     try {
-        foreach ($item in Get-ChildItem -Path $Root -Recurse -Force -ErrorAction Stop) {
-            if (-not (Test-FolderOwnedBySystemOrAdmins $item.FullName)) { return $false }
+        $rootInfo = New-Object System.IO.DirectoryInfo $Root
+        if (($rootInfo.Attributes -band $reparse) -eq $reparse) { return $false }
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($rootInfo)
+        while ($stack.Count -gt 0) {
+            $dir = $stack.Pop()
+            foreach ($item in $dir.GetFileSystemInfos()) {
+                if (($item.Attributes -band $reparse) -eq $reparse) { return $false }
+                if (-not (Test-FolderOwnedBySystemOrAdmins $item.FullName)) { return $false }
+                if ($item -is [System.IO.DirectoryInfo]) { $stack.Push($item) }
+            }
         }
         return $true
     } catch { return $false }
@@ -1973,65 +2041,67 @@ function Test-ToolsTreeOwnership {
     return (Test-TreeOwnership -Root $Root)
 }
 
-function Remove-TreeSafely {
-    <# Delete a directory tree that a STANDARD USER may have built, while running
-       ELEVATED, without following a planted junction/symlink out of the tree. A
-       reparse point (junction/symlink) planted inside the tree could otherwise
-       turn `Remove-Item -Recurse` into an elevated delete of whatever it targets.
-       So: first walk the tree and remove every reparse-point item WITHOUT
-       recursing into it (deleting only the link, never its target), deepest-first;
-       then remove whatever remains. #>
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return }
-    $reparse = [System.IO.FileAttributes]::ReparsePoint
-    # Deepest-first so we unlink nested junctions before their parents are touched.
-    $items = @()
-    try { $items = @(Get-ChildItem -Path $Path -Recurse -Force -ErrorAction Stop) } catch { $items = @() }
-    $items = $items | Sort-Object { $_.FullName.Length } -Descending
-    foreach ($it in $items) {
-        try {
-            if (($it.Attributes -band $reparse) -eq $reparse) {
-                # It's a junction/symlink. Delete the LINK only - never -Recurse,
-                # which would traverse into (and delete the contents of) the target.
-                if ($it.PSIsContainer) {
-                    [System.IO.Directory]::Delete($it.FullName, $false)
-                } else {
-                    [System.IO.File]::Delete($it.FullName)
-                }
-            }
-        } catch {
-            Write-CoreLog -Message ("Could not unlink reparse point {0}: {1}" -f $it.FullName, $_.Exception.Message) -Level WARN
-        }
-    }
-    # If the ROOT itself is a reparse point, unlink it (not its target) and stop.
-    try {
-        $rootInfo = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        if (($rootInfo.Attributes -band $reparse) -eq $reparse) {
-            [System.IO.Directory]::Delete($Path, $false)
-            return
-        }
-    } catch { }
-    # Remaining real files/folders: safe to recurse now (no reparse points left inside).
-    Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+function Move-TreeToQuarantine {
+    <# Rename an untrusted tree aside instead of deleting it. A rename cannot
+       traverse a junction, keeps the evidence and keeps any legitimate rollback
+       scripts recoverable. Nothing in the quarantine folder is ever run. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $dest = '{0}.untrusted-{1}' -f $Path.TrimEnd('\'), [guid]::NewGuid().ToString('N')
+    [System.IO.Directory]::Move($Path, $dest)
+    return $dest
+}
+
+function Set-ItemOwnerAdministrators {
+    <# Set the owner of one file or folder to BUILTIN\Administrators. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner($admins)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Test-InSecureBase {
+    <# True when a path sits inside %ProgramData%\Win11SecurityOptimizer. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $base = (Join-Path $env:ProgramData 'Win11SecurityOptimizer').TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    return $Path.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Write-SecureFile {
+    <# Write a text file. Inside the secure base, re-own it to Administrators so
+       the base ownership gate never trips on the tool's own output. #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    Set-Content -LiteralPath $Path -Value $Value -Encoding UTF8
+    if (Test-InSecureBase -Path $Path) { Set-ItemOwnerAdministrators -Path $Path }
+}
+
+function New-SecureDirectory {
+    <# Create a folder (if missing). Inside the secure base, re-own it to
+       Administrators. #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+    if (Test-InSecureBase -Path $Path) { Set-ItemOwnerAdministrators -Path $Path }
 }
 
 function Initialize-SecureBase {
-    <# Admin-only: ensure the WHOLE base folder
-       (%ProgramData%\Win11SecurityOptimizer) is owned by Administrators/SYSTEM and
-       ACL-locked. If it (or anything under it - backups, tools, logs) is NOT so
-       owned (a standard user pre-created it), DELETE and recreate it so no planted
-       content (e.g. a malicious Rollback_*.ps1) survives. Returns the secured base
-       path, or throws if it cannot be secured. Shared by both the tools folder and
-       the rollback/backup folder. #>
+    <# Admin-only, main thread only. Ensure %ProgramData%\Win11SecurityOptimizer
+       and everything under it is owned by Administrators/SYSTEM, contains no
+       reparse points and is ACL-locked. If not (a standard user pre-created it or
+       planted content), rename the whole tree aside and start clean. Returns the
+       secured base path, or throws if it cannot be secured. #>
     if (-not (Test-IsAdmin)) { throw 'Administrator rights are required to prepare the secure data folder.' }
     $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
-    if (Test-Path $base) {
+    if (Test-Path -LiteralPath $base) {
         if (-not (Test-TreeOwnership -Root $base)) {
-            Write-CoreLog -Message 'System data folder (or an item in it) is not owned by Administrators/SYSTEM - deleting and recreating to drop any planted content.' -Level WARN
-            Remove-TreeSafely -Path $base
+            $q = Move-TreeToQuarantine -Path $base
+            $script:Core.SecureSetupNotice = ("The folder {0} contained items not owned by Administrators or SYSTEM, so it was moved to {1} and a clean folder was created. Nothing in the moved folder is ever run by this tool. Any older rollback scripts inside it are untrusted: review them in a text editor before using them." -f $base, $q)
+            Write-CoreLog -Message $script:Core.SecureSetupNotice -Level WARN
         }
     }
-    if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
     Set-ToolsFolderAcl -Path $base
     if (-not (Test-FolderOwnedBySystemOrAdmins $base)) { throw 'The system data folder could not be secured (ownership check failed after locking).' }
     return $base
@@ -2096,24 +2166,34 @@ function Set-ToolsFolderAcl {
 }
 
 function Set-TreeOwnerToAdministrators {
-    <# Recursively set the OWNER of a path (and everything under it) to the
-       Administrators group (S-1-5-32-544). Our own freshly-extracted files are
-       owned by the elevated admin USER by default, which would otherwise fail the
-       Administrators/SYSTEM ownership gate; forcing the owner to Administrators
-       lets legitimate installs pass while a non-admin's pre-planted content (owned
-       by a standard-user SID) still fails. Requires elevation. #>
+    <# Set the owner of a folder and everything under it to BUILTIN\Administrators
+       so the tool's own files pass the ownership gate. Walks the tree by hand and
+       never descends into, or re-owns, a reparse point: Windows PowerShell 5.1
+       Get-ChildItem -Recurse follows junctions, which would re-own files outside
+       the tree. Requires elevation. #>
     param([string]$Path)
-    if (-not (Test-Path $Path)) { return }
-    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
-    $targets = @($Path)
-    try { $targets += @(Get-ChildItem -Path $Path -Recurse -Force -ErrorAction Stop | ForEach-Object { $_.FullName }) } catch { }
-    foreach ($p in $targets) {
-        try {
-            $acl = Get-Acl -Path $p
-            $acl.SetOwner($admins)
-            Set-Acl -Path $p -AclObject $acl
-        } catch { }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $reparse = [System.IO.FileAttributes]::ReparsePoint
+    $rootInfo = New-Object System.IO.DirectoryInfo $Path
+    if (($rootInfo.Attributes -band $reparse) -eq $reparse) {
+        Write-CoreLog -Message ("Refusing to re-own a reparse point: {0}" -f $Path) -Level WARN
+        return
     }
+    $failed = 0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($rootInfo)
+    try { Set-ItemOwnerAdministrators -Path $rootInfo.FullName } catch { $failed++ }
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        $children = @()
+        try { $children = @($dir.GetFileSystemInfos()) } catch { $failed++ }
+        foreach ($item in $children) {
+            if (($item.Attributes -band $reparse) -eq $reparse) { continue }
+            try { Set-ItemOwnerAdministrators -Path $item.FullName } catch { $failed++ }
+            if ($item -is [System.IO.DirectoryInfo]) { $stack.Push($item) }
+        }
+    }
+    if ($failed -gt 0) { Write-CoreLog -Message ("Could not re-own {0} item(s) under {1}." -f $failed, $Path) -Level WARN }
 }
 
 function Resolve-ExternalToolRelease {
@@ -2283,12 +2363,8 @@ function Install-ExternalTool {
     try {
         if (-not $Resolution) { $Resolution = Resolve-ExternalToolRelease -Key $Key }
 
-        # Prepare + lock the tools root BEFORE anything is written. This creates the
-        # ProgramData tree, locks its ACL, and - critically - if a standard user
-        # pre-created it (or planted content) so it is NOT owned by
-        # Administrators/SYSTEM, deletes and recreates it. Mutating setup lives here;
-        # the gate below (Test-ToolsRootSecure) stays read-only.
-        [void](Initialize-SecureToolsRoot)
+        # The main thread (Start-ProScan) already ran Initialize-SecureToolsRoot.
+        # This runs in a background runspace, so it only checks, read-only.
         if (-not (Test-ToolsRootSecure)) {
             throw 'The tools folder is not in a protected (admin-only) location, so an elevated download would be unsafe. Aborting.'
         }
@@ -2377,7 +2453,7 @@ function Install-ExternalTool {
         # from a verified archive", NOT "whatever happens to be on disk at first run".
         $exeHash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToUpper()
         $exeHashPath = Join-Path $installPath 'exe.sha256'
-        Set-Content -Path $exeHashPath -Value $exeHash -Encoding ASCII
+        Write-SecureFile -Path $exeHashPath -Value $exeHash
 
         # Verify the binary runs (sanity + anti-corruption check). Different tools
         # expose version differently (Hayabusa uses a 'help' subcommand, not
@@ -2398,7 +2474,9 @@ function Install-ExternalTool {
             Key=$Key; Name=$tool.Name; Version=$Resolution.Version; Vendor=$tool.Vendor; License=$tool.License
             Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
         }
-        try { $meta | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $installPath 'install.json') -Encoding UTF8 } catch { }
+        # No try/catch: without install.json the tool would refuse to run later, so a
+        # failed write must fail the install visibly.
+        Write-SecureFile -Path (Join-Path $installPath 'install.json') -Value (ConvertTo-Json -InputObject $meta -Depth 4)
 
         # LAST: force ownership of the WHOLE tools tree (every tool/version subfolder
         # and the files we just wrote - exe, rules, install.json, exe.sha256) to the
@@ -2408,18 +2486,25 @@ function Install-ExternalTool {
         # NEXT run. This must happen AFTER the manifests are written. A non-admin's
         # pre-planted file (owned by a standard-user SID) still fails the gate, which
         # is the whole point.
-        if ((Get-ExternalToolsRoot) -eq (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')) {
-            Set-TreeOwnerToAdministrators -Path (Get-ExternalToolsRoot)
-            Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer')
-            Set-ToolsFolderAcl -Path (Get-ExternalToolsRoot)
-        }
-
         Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $Resolution.DownloadUrl)
 
         return [pscustomobject]@{ Success=$true; Message='Installed.'; ExePath=$exe; Version=$Resolution.Version; Sha256=$sha }
     } catch {
         Write-CoreLog -Message ("Install-ExternalTool {0} failed: {1}" -f $Key, $_.Exception.Message) -Level ERROR
         return [pscustomobject]@{ Success=$false; Message=$_.Exception.Message; ExePath=$null; Version=$null; Sha256=$null }
+    } finally {
+        # Success or failure, everything this install wrote under the tools tree is
+        # re-owned to Administrators and re-locked, so a half-finished install never
+        # trips the base ownership gate on the next launch.
+        try {
+            $tr = Get-ExternalToolsRoot
+            if (Test-Path -LiteralPath $tr) {
+                Set-TreeOwnerToAdministrators -Path $tr
+                Set-ToolsFolderAcl -Path $tr
+            }
+        } catch {
+            Write-CoreLog -Message ("Could not re-own the tools folder after install: {0}" -f $_.Exception.Message) -Level WARN
+        }
     }
 }
 

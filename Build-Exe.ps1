@@ -1,6 +1,7 @@
 <#
     Build-Exe.ps1  --  OPTIONAL: compile the optimizer into a single .exe
     -------------------------------------------------------------------
+    Author: Ahmad Shaukat
     The recommended way to run this tool is Start.bat (no build needed, no
     antivirus/SmartScreen friction). This script is only for maintainers who
     want to ship a packaged .exe and are prepared to CODE-SIGN it.

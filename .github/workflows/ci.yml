@@ -1,0 +1,54 @@
+# CI for Win11-Security-Optimizer
+# Author: Ahmad Shaukat
+# Runs the Pester suite and PSScriptAnalyzer under Windows PowerShell 5.1,
+# the runtime the tool ships for.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Pester 5 and PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Pester (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          $cfg.TestResult.Enabled = $true
+          $cfg.TestResult.OutputPath = 'testResults.xml'
+          Invoke-Pester -Configuration $cfg
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $r = @(Invoke-ScriptAnalyzer -Path src -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          $r | Format-Table Severity, RuleName, ScriptName, Line -AutoSize | Out-String -Width 220 | Write-Host
+          $errors = @($r | Where-Object Severity -eq 'Error')
+          if ($errors.Count -gt 0) { Write-Host "Analyzer errors: $($errors.Count)"; exit 1 }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: testResults.xml
