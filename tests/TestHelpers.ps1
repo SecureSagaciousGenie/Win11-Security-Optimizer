@@ -215,3 +215,46 @@ function Get-HandlerLocalViolation {
     }
     return @($out.ToArray())
 }
+
+function Get-WorkBlockVariableViolation {
+    <# A -Work block of Invoke-Background is rebuilt from its text inside a
+       fresh background runspace, so it sees only what it assigns itself, the
+       -Vars keys passed with it and $Report. Any other variable is unset there
+       and throws under StrictMode. Returns one line per such variable. #>
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
+    $auto = @('_', 'PSItem', 'true', 'false', 'null', 'args', 'input', 'this', 'Matches', 'LASTEXITCODE', 'PSScriptRoot', 'PSVersionTable', 'ErrorActionPreference', 'PWD', 'HOME', 'Host', 'ExecutionContext', 'MyInvocation', 'PSBoundParameters', 'PSCmdlet', 'Error', '?', 'Report')
+    $out = New-Object System.Collections.ArrayList
+    $calls = @($Ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -eq 'Invoke-Background' }, $true))
+    foreach ($c in $calls) {
+        $els = $c.CommandElements
+        $varKeys = @{}
+        $work = $null
+        for ($i = 0; $i -lt $els.Count - 1; $i++) {
+            if (-not ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst])) { continue }
+            if ($els[$i].ParameterName -eq 'Vars' -and $els[$i + 1] -is [System.Management.Automation.Language.HashtableAst]) {
+                foreach ($kv in $els[$i + 1].KeyValuePairs) { $varKeys[[string]$kv.Item1.Extent.Text.Trim("'", '"')] = $true }
+            }
+            if ($els[$i].ParameterName -eq 'Work' -and $els[$i + 1] -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $work = $els[$i + 1].ScriptBlock }
+        }
+        if (-not $work) { continue }
+        $own = @{}
+        foreach ($a in @($work.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))) {
+            $lv = $a.Left
+            if ($lv -is [System.Management.Automation.Language.ConvertExpressionAst]) { $lv = $lv.Child }
+            if ($lv -is [System.Management.Automation.Language.VariableExpressionAst]) { $own[$lv.VariablePath.UserPath] = $true }
+        }
+        foreach ($fe in @($work.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true))) { $own[$fe.Variable.VariablePath.UserPath] = $true }
+        foreach ($p in @($work.FindAll({ param($n) $n -is [System.Management.Automation.Language.ParameterAst] }, $true))) { $own[$p.Name.VariablePath.UserPath] = $true }
+        foreach ($v in @($work.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true))) {
+            $vp = $v.VariablePath
+            if ($vp.IsScript -or $vp.IsGlobal -or $vp.DriveName) {
+                if (-not $vp.DriveName) { [void]$out.Add(('{0}:{1} -Work block reads ${2}; the background runspace has no such script state' -f $v.Extent.File, $v.Extent.StartLineNumber, $vp.UserPath)) }
+                continue
+            }
+            $n = $vp.UserPath
+            if (($auto -contains $n) -or $own.ContainsKey($n) -or $varKeys.ContainsKey($n)) { continue }
+            [void]$out.Add(('{0}:{1} -Work block reads ${2}, which is neither assigned in it nor passed with -Vars' -f $v.Extent.File, $v.Extent.StartLineNumber, $n))
+        }
+    }
+    return @($out.ToArray())
+}

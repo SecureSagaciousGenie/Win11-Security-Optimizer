@@ -72,6 +72,10 @@ Describe 'Static checks' {
             $parsed = Get-ScriptAst -Path $Path
             @(Get-HandlerLocalViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
         }
+        It '<Name> has no -Work block that reads a variable it was not given' -ForEach $script:SrcFiles {
+            $parsed = Get-ScriptAst -Path $Path
+            @(Get-WorkBlockVariableViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
+        }
     }
 
     Context 'Background jobs' {
@@ -125,6 +129,19 @@ Describe 'Static checks' {
                 }
             }
             @($bad) | Should -BeNullOrEmpty
+        }
+        # The self-test drives every action; a direct modal would block it.
+        It 'every message box and Save dialog goes through the self-test aware wrappers' {
+            $direct = @($script:OptAst.FindAll({ param($n)
+                (($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and ($n.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) -and
+                 ($n.Expression.TypeName.FullName -eq 'System.Windows.MessageBox')) -or
+                (($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -eq 'New-Object' -and $n.Extent.Text -match 'SaveFileDialog|OpenFileDialog')
+            }, $true) | Where-Object {
+                $p = $_.Parent
+                while ($p -and -not ($p -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $p = $p.Parent }
+                -not ($p -and $p.Name -in @('Show-AppMessage', 'Select-SaveFilePath'))
+            } | ForEach-Object { 'line {0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text.Substring(0, [Math]::Min(60, $_.Extent.Text.Length)) })
+            $direct | Should -BeNullOrEmpty
         }
         It '<_> forwards -Next to Invoke-Background' -ForEach @('Start-SecurityScan', 'Start-BloatScan', 'Start-DfirScan', 'Start-StartupScan') {
             $fn = Get-OptFunction $_
