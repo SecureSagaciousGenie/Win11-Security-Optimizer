@@ -180,3 +180,41 @@ jobs:
           foreach ($c in $cards) { '  [{0}/{1}] {2}' -f $c.Status, $c.Severity, $c.Title }
           if (@($cards | Where-Object { $_.Status -eq 'Alert' }).Count -gt 0) { throw 'An immediate re-compare raised an Alert.' }
           'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))
+
+  hardening:
+    name: Hardening checks, fixes and rollback on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checks, apply twice, run the rollback script
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          foreach ($f in @(Invoke-ExtraSecurityCheck)) { '  [{0}] {1}: {2} (fixable: {3})' -f $f.Status, $f.Id, $f.Observed, $f.Fixable }
+          # Put WDigest in the unsafe state first so its fix and rollback both do real work.
+          New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential' -Value 1 -PropertyType DWord -Force | Out-Null
+          $ids = @('WDIGEST', 'MDNS', 'SMB-SIGN', 'NBTNS')
+          $before = @{}
+          foreach ($id in $ids) { $before[$id] = [bool](Test-SecurityFixApplied -Id $id) }
+          foreach ($id in $ids) {
+            $r = Invoke-SecurityFix -Id $id
+            '{0}: success {1}, verified {2} {3}' -f $id, $r.Success, $r.Verified, $r.Message
+            if (-not $r.Success -or -not $r.Verified) { throw "$id did not apply." }
+          }
+          $n = $script:Core.Rollback.Count
+          foreach ($id in $ids) { [void](Invoke-SecurityFix -Id $id) }
+          'Rollback entries after first apply: {0}, after second apply: {1}' -f $n, $script:Core.Rollback.Count
+          if ($script:Core.Rollback.Count -ne $n) { throw 'A second apply added rollback entries.' }
+          'Rollback script: {0} (owned by Administrators: {1})' -f $script:Core.RollbackFile, (Test-FolderOwnedBySystemOrAdmins $script:Core.RollbackFile)
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:Core.RollbackFile
+          'Rollback exit code: {0}' -f $LASTEXITCODE
+          foreach ($id in $ids) {
+            $after = [bool](Test-SecurityFixApplied -Id $id)
+            '{0}: before {1}, after rollback {2}' -f $id, $before[$id], $after
+            if ($after -ne $before[$id]) { throw "$id was not restored by the rollback script." }
+          }
