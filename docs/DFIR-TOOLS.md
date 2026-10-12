@@ -1,61 +1,84 @@
 # DFIR tools: what we built in, and what we deliberately did NOT bundle
 
-You asked about merging **KAPE**, **Hayabusa**, **THOR**, and similar DFIR tools
-into the optimizer. Here's the honest licensing + design reality, and what the
-tool does instead.
+This document explains why the optimizer does not **bundle** KAPE, Hayabusa, THOR
+or similar DFIR tools, and what it does instead.
 
 ## TL;DR
 
-We built a **native "Deep Scan"** engine (MIT, our own code) that does the
-high-value things those tools do — hunt malicious processes and triage the event
-logs — and explains every finding in plain English. We **did not bundle** KAPE,
-Hayabusa, or THOR, because their licenses make bundling into a free, open-source,
-"anyone can download and run" tool either **not allowed** or **legally messy**.
+The optimizer has a native **Deep Scan** engine (MIT, its own code) that does some
+of the high-value things those tools do — hunt suspicious processes and triage the
+event logs — and explains every finding in plain English. It does **not bundle**
+KAPE, Hayabusa, THOR or Chainsaw, because their licenses make bundling into a
+free, open-source, "anyone can download and run" tool either **not allowed** or
+**legally messy**. Hayabusa and Chainsaw can instead be **downloaded on demand**
+by the user (see "Pro Tools"), which keeps their GPL duties attached only to those
+separate binaries.
 
-## The license problem (why bundling is a trap)
+## The license problem (why bundling is avoided)
 
-| Tool | What it is | License | Can we bundle it in an MIT open-source app anyone downloads? |
+| Tool | What it is | License | Can it be bundled in an MIT app anyone downloads? |
 |------|-----------|---------|---------------------------------------------------------------|
-| **THOR / THOR Lite** (Nextron) | APT scanner, YARA/IOC engine | **Proprietary, commercial.** THOR Lite is free *for personal use* but is **not open source** and its EULA restricts redistribution/commercial use. | **No.** You already spotted this. Bundling it would break their license and can't be MIT. |
-| **KAPE** (Kroll) | Artifact collector (`.tkape`/`.mkape`) | **Free but proprietary.** Free for most, **license required for commercial use**, and redistribution is restricted. | **No** — can't redistribute it inside your repo, and the commercial-use limit is incompatible with "anyone can use this." |
-| **Hayabusa** (Yamato Security) | Fast Windows event-log hunter (Sigma rules) | **GPL-3.0** (open source). | **Technically** (GPL allows redistribution) **but it would force your whole combined work to GPL-3.0**, not MIT, and you'd have to ship full GPL notices + source offer. It also pulls in Sigma rules under their own terms. |
-| **Chainsaw** (WithSecure) | Event-log/MFT hunter (Sigma) | **GPL-3.0**/BSD-ish depending on component. | Same GPL "copyleft" catch as Hayabusa. |
-| **Velociraptor** | Endpoint DFIR/hunting | **AGPL-3.0** (very strong copyleft). | **Worst fit** for bundling — AGPL is even stricter than GPL. |
+| **THOR / THOR Lite** (Nextron) | APT scanner, YARA/IOC engine | **Proprietary, commercial.** THOR Lite is free *for personal use* but is **not open source** and its EULA restricts redistribution/commercial use. | **No** — bundling or redistributing it would break their license. |
+| **KAPE** (Kroll) | Artifact collector (`.tkape`/`.mkape`) | **Free but proprietary.** Free for most, **license required for commercial use**, redistribution restricted. | **No** — can't redistribute it inside the repo, and the commercial-use limit conflicts with "anyone can use this." |
+| **Hayabusa** (Yamato Security) | Fast Windows event-log hunter (Sigma rules) | **GPL-3.0** (open source). | **Not bundled.** Shipping it inside the app would attach GPL-3.0 obligations to that distribution. Downloaded at runtime instead (see below). |
+| **Chainsaw** (WithSecure) | Event-log/MFT hunter (Sigma) | **GPL-3.0**. | Same as Hayabusa — downloaded at runtime, not bundled. |
+| **Velociraptor** | Endpoint DFIR/hunting | **AGPL-3.0** (very strong copyleft). | Not used; AGPL is even stricter. |
 
-**The core issue:** your optimizer is **MIT** so anyone (including businesses) can
-use it freely. The moment you *bundle* a GPL/AGPL tool, the combined product must
-become GPL/AGPL too — you'd lose MIT. And THOR/KAPE simply don't permit free
-redistribution at all. So "merge them in" isn't a packaging detail; it changes
-what your project legally *is*.
+**The core issue (plain English, not legal advice):** the optimizer is **MIT** so
+anyone — including businesses — can use it freely. THOR and KAPE don't permit free
+redistribution at all, so they can't ship with it. Hayabusa and Chainsaw are
+GPL-3.0: you *can* redistribute them, but doing so puts GPL obligations on that
+distribution (provide the licence, offer the corresponding source, etc.). The
+cleanest way to keep the project simple and MIT is to not ship them at all and let
+the user fetch them on demand. (See the "soft" note at the bottom — I'm not a
+lawyer; this is an engineering decision, not legal counsel.)
 
-## What we did instead: native "Deep Scan" (MIT, no bundling)
+## What it does instead: native "Deep Scan" (MIT, no bundling)
 
-Rather than ship someone else's licensed binary, the optimizer now has its own
-**Deep Scan** on the Investigate tab. It reimplements the highest-signal checks
-these tools are famous for, from scratch, and — crucially for your goal — says
-*what it found, why it matters, and what to do* in beginner language.
+Rather than ship someone else's licensed binary, the optimizer has its own
+**Deep Scan** on the Investigate tab. It reimplements several high-signal checks
+these tools are known for, and says *what it found, why it matters, and what to do*
+in beginner language.
 
-**Process threat hunt** (what an EDR/THOR-style scan looks for):
+**Process threat hunt** (EDR/THOR-style, at a basic level):
 - **Masquerading** — a process using a Windows system name (svchost, lsass…) from
   the wrong folder, or a look-alike name (`scvhost`, `lsas`). *Critical / Alert.*
 - **Runs-from-temp** — programs executing from Temp/AppData/Downloads/ProgramData.
 - **Unsigned + networked** — tiered so legit indie apps in Program Files are
   low-priority, while unsigned networked binaries in user/temp folders are flagged.
-- **Suspicious command lines** — encoded PowerShell, download-and-run cradles,
-  LOLBin abuse (mshta/regsvr32/rundll32/certutil/bitsadmin), hidden windows, and
-  **shadow-copy/backup deletion** (ransomware) — each tagged `[ALERT]` (high
-  confidence) vs `[REVIEW]` (also used by legit software) to cut false alarms.
+- **Suspicious command lines** — encoded PowerShell (incl. `-e`/`-ec`/`-en` short
+  forms and `… | iex` ordering), download-and-run cradles, LOLBin abuse
+  (mshta/regsvr32/rundll32/certutil/bitsadmin), hidden windows, and
+  **shadow-copy/backup deletion** (ransomware, incl. the WMIC variant) — each
+  tagged `[ALERT]` (high confidence) vs `[REVIEW]` (also used by legit software).
 
-**Event-log triage** (what Hayabusa/Chainsaw do with Sigma rules, distilled):
+**Event-log triage** (a distilled subset of what Hayabusa/Chainsaw do with full
+Sigma rulesets):
 - Security/System **log cleared** (1102/104) — strong anti-forensics signal.
-- **New service installed** (7045) — persistence.
+- **New service installed** (7045, with Defender's own driver installs filtered).
 - **Account created / added to Administrators** (4720/4728/4732).
 - **Brute force** — bursts of failed logons (4625), lockouts (4740).
 - **Defender detections** (1116/1117).
-- **Scheduled task created** (4698), **RDP logons** (4624 type 10).
+- **Scheduled task created** (4698), **RDP logons** (4624, matched by numeric logon
+  type so it works on non-English Windows).
 
-This gets a non-expert ~80% of the practical value with **zero license risk,
-zero downloads, and the same clear-language explanations** as the rest of the app.
+### Honest limits of the native Deep Scan
+This is **lightweight triage, not a replacement** for Hayabusa/Chainsaw/THOR. Known gaps:
+- **Process/command-line checks only see what is running at scan time** — a
+  ransomware `vssadmin delete shadows` that already finished is caught only if the
+  event-log/Defender side recorded it, not by the live-process check.
+- **Event 4698 (scheduled-task created) needs "Audit Other Object Access", which is
+  OFF by default** — so a missing 4698 card does **not** prove no task was created.
+  (The native current-task scan in Investigate covers existing tasks regardless.)
+- It does **not** yet cover several persistence spots a full tool would: Winlogon
+  Shell/Userinit, Image File Execution Options, WMI event subscriptions, service
+  `ServiceDll`, and `SpecialAccounts\UserList`-hidden accounts.
+- It uses a small hand-written pattern set, **not** the thousands of community
+  Sigma rules Hayabusa/Chainsaw ship.
+
+For a thorough hunt, use the **Pro Tools** button to run the real Hayabusa/Chainsaw
+(below). Treat the native Deep Scan as a fast first look that points you at obvious
+problems.
 
 ## If you later want the *real* Hayabusa/Chainsaw power
 
@@ -95,9 +118,24 @@ many MIT-licensed front-ends legally drive GPL command-line tools.
 
 ## Bottom line
 
-- **THOR** — you were right, it's commercial; we can't bundle it. ✗
-- **KAPE** — free but can't be redistributed / commercial-limited. ✗
-- **Hayabusa / Chainsaw** — great and open, but **GPL copyleft** would relicense
-  your whole project if bundled; so they are **opt-in, downloaded at runtime** via
-  the "+ Pro Tools" button, never shipped in the repo. ✓ (implemented)
-- **Our native Deep Scan** — MIT, no downloads, plain-English, always available. ✓
+- **THOR** — proprietary/commercial; cannot be bundled or redistributed. ✗
+- **KAPE** — free but redistribution-restricted / commercial-limited. ✗
+- **Hayabusa / Chainsaw** — open source but **GPL-3.0**. Bundling them would attach
+  GPL obligations to the distribution; to keep things simple and MIT they are
+  **opt-in, downloaded at runtime** via the "+ Pro Tools" button, never shipped in
+  the repo. ✓ (implemented)
+- **Native Deep Scan** — MIT, no downloads, plain-English, always available —
+  a fast first look, not a full forensic suite. ✓
+
+## A note on the GPL reasoning (not legal advice)
+
+An earlier draft said bundling a GPL tool would "relicense your whole MIT project."
+That overstates it. Shipping Hayabusa as a **separate, unmodified binary** that the
+app merely invokes is generally treated as *aggregation / use of a separate
+program* — it would add GPL duties **for that binary** (ship its license, offer its
+source), not automatically relicense this project's own MIT code. Downloading at
+runtime is still the cleaner choice here (less to ship, always current, obligations
+stay entirely on the upstream project), but the honest reason is "simpler and
+lower-obligation," not "bundling forces MIT→GPL on our code." I'm not a lawyer —
+treat this as an engineering read, and get real legal advice before redistributing
+GPL binaries yourself.

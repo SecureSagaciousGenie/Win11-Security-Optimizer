@@ -51,7 +51,13 @@ That's it. Explore each tab, tick what you want, and confirm.
 - **Administrator rights** to *apply* changes (`Start.bat` asks for this). You
   can scan and investigate without admin.
 
-No internet connection is required. No data ever leaves your PC.
+The core tool needs no internet connection and sends none of your files or
+activity to any third party. Two **opt-in** features are the only exceptions, and
+both are clearly flagged in-app: enabling **cloud-delivered protection** turns on
+Microsoft Defender's normal cloud sample submission (`SubmitSamplesConsent =
+SendSafeSamples` — Defender may upload files it deems safe to Microsoft; this is
+reverted by the rollback script), and **Pro Tools** downloads Hayabusa/Chainsaw
+from GitHub. Nothing else leaves your PC.
 
 ---
 
@@ -109,8 +115,12 @@ Each fix is labelled so you know its impact before applying:
   firmware or need careful handling (Secure Boot, TPM, BitLocker, Tamper
   Protection).
 
-"Apply All Safe Fixes" only touches **Safe** and **Elevated** items (and
-High-risk only if you tick the box).
+The **"Apply Recommended Fixes"** button applies **Safe** and **Elevated** items
+(and High-risk only if you tick **"Include high-risk fixes"**). Before it runs it
+shows a confirmation that **groups every change by its risk tier**, so you can see
+exactly which items are the more impactful Elevated ones (SMBv1, LLMNR, ASR in
+Block mode, RDP NLA) rather than just low-risk toggles. Nothing is applied until
+you confirm.
 
 ---
 
@@ -235,9 +245,12 @@ Applying fixes, removing apps, or toggling startup needs admin (relaunch via
 **Can I undo everything?** Yes — the rollback script, the per-change JSON backup,
 and the System Restore point all let you revert.
 
-**Is my data sent anywhere?** No. The tool makes no network calls with your data.
-The only outbound traffic is Windows' own (e.g. Defender signature updates if you
-choose that fix).
+**Is my data sent anywhere?** The tool itself does not upload your files or
+activity. Three things can cause outbound traffic, all opt-in and flagged: the
+**cloud-protection fix** turns on Defender's own cloud sample submission
+(`SendSafeSamples` — reverted by the rollback script), **Pro Tools** downloads
+Hayabusa/Chainsaw from GitHub, and the **update-signatures fix** fetches Defender
+updates from Microsoft. No telemetry is sent to the project authors.
 
 ---
 

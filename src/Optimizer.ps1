@@ -292,7 +292,7 @@ $script:Xaml = @'
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnSecScan" Style="{StaticResource Primary}" Content="Scan Security"/>
-            <Button x:Name="BtnSecFixSafe" Style="{StaticResource Ghost}" Content="Apply All Safe Fixes" Margin="10,0,0,0"/>
+            <Button x:Name="BtnSecFixSafe" Style="{StaticResource Ghost}" Content="Apply Recommended Fixes" Margin="10,0,0,0"/>
             <CheckBox x:Name="ChkHighRisk" Content="Include high-risk fixes" Margin="16,0,0,0"/>
           </StackPanel>
           <ListView x:Name="SecList" Grid.Row="1">
@@ -417,6 +417,7 @@ $script:Xaml = @'
               <Button x:Name="BtnOpenData" Style="{StaticResource Ghost}" Content="Open Backup Folder"/>
               <Button x:Name="BtnOpenRollback" Style="{StaticResource Ghost}" Content="Open Rollback Script" Margin="10,0,0,0"/>
               <Button x:Name="BtnMakeRestore" Style="{StaticResource Ghost}" Content="Create Restore Point Now" Margin="10,0,0,0"/>
+              <Button x:Name="BtnRemoveTools" Style="{StaticResource Ghost}" Content="Remove Downloaded Tools" Margin="10,0,0,0"/>
             </StackPanel>
           </StackPanel>
           <Border Grid.Row="1" Background="#0B0E14" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8">
@@ -459,7 +460,7 @@ function New-OptimizerWindow {
         'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
         'BtnStartupScan','StartupListView',
-        'BtnOpenData','BtnOpenRollback','BtnMakeRestore','LogView','LogScroller',
+        'BtnOpenData','BtnOpenRollback','BtnMakeRestore','BtnRemoveTools','LogView','LogScroller',
         'StatusText','Busy'
     )
     foreach ($n in $names) { $ui[$n] = $win.FindName($n) }
@@ -662,8 +663,16 @@ function Invoke-SecApplyAllSafe {
         [System.Windows.MessageBox]::Show('Nothing to apply with the current options.', 'Nothing to do', 'OK', 'Information') | Out-Null
         return
     }
-    $list = ($targets | ForEach-Object { " - $($_.Name)" }) -join "`n"
-    $r = [System.Windows.MessageBox]::Show("Apply the following $(@($targets).Count) fix(es)?`n`n$list`n`nA restore point is created first; everything is reversible.", 'Confirm batch', 'YesNo', 'Question')
+    # Group by tier so the user sees exactly what is Safe vs the more impactful
+    # "Elevated"/"High-risk" standard-hardening items (SMBv1, LLMNR, ASR Block, RDP NLA).
+    $safe     = @($targets | Where-Object { $_.RiskTier -eq 'Safe' })
+    $elevated = @($targets | Where-Object { $_.RiskTier -eq 'Elevated' })
+    $high     = @($targets | Where-Object { $_.RiskTier -eq 'HighRisk' })
+    $sb = New-Object System.Text.StringBuilder
+    if ($safe.Count)     { [void]$sb.AppendLine("SAFE (low-risk):");          $safe     | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
+    if ($elevated.Count) { [void]$sb.AppendLine("");[void]$sb.AppendLine("ELEVATED (standard hardening, may affect some setups):"); $elevated | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
+    if ($high.Count)     { [void]$sb.AppendLine("");[void]$sb.AppendLine("HIGH-RISK:"); $high | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
+    $r = [System.Windows.MessageBox]::Show(("Apply these {0} fix(es)? They are grouped by risk tier below.`n`n{1}`nA System Restore point is created first; every change is reversible via the rollback script." -f @($targets).Count, $sb.ToString()), 'Confirm batch', 'YesNo', 'Question')
     if ($r -ne 'Yes') { return }
 
     # State-changing actions run SYNCHRONOUSLY on the main thread, because the
@@ -962,6 +971,7 @@ function Start-StartupScan {
             $row.Command=$i.Command; $row.Location=$i.Location; $row.Scope=$i.Scope
             # remember how to toggle it
             $row | Add-Member -NotePropertyName _Type -NotePropertyValue $i.Type -Force
+            $row | Add-Member -NotePropertyName _ValueType -NotePropertyValue $(if ($i.PSObject.Properties.Name -contains 'ValueType') { $i.ValueType } else { 'String' }) -Force
             $rows.Add($row)
             $row.add_PropertyChanged({ param($snd,$e)
                 if ($e.PropertyName -eq 'Enabled') { Invoke-StartupToggle -Row $snd }
@@ -982,7 +992,7 @@ function Invoke-StartupToggle {
         [System.Windows.MessageBox]::Show("Changing startup items needs administrator rights. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
         return
     }
-    $res = Set-StartupItemState -Type $Row._Type -Location $Row.Location -Name $Row.Name -Enable $Row.Enabled -Command $Row.Command
+    $res = Set-StartupItemState -Type $Row._Type -Location $Row.Location -Name $Row.Name -Enable $Row.Enabled -Command $Row.Command -ValueType $Row._ValueType
     if ($res.Success) {
         $script:UIRef.UI.StatusText.Text = "$($Row.Name): $($res.Message)"
     } else {
@@ -1077,6 +1087,14 @@ function Register-Handlers {
     $u.BtnOpenData.Add_Click({ Open-DataFolder })
     $u.BtnOpenRollback.Add_Click({ Open-RollbackScript })
     $u.BtnMakeRestore.Add_Click({ Invoke-MakeRestorePoint })
+    $u.BtnRemoveTools.Add_Click({
+        $r = [System.Windows.MessageBox]::Show('Delete all downloaded Pro Tools (Hayabusa/Chainsaw)? They can be re-downloaded later.', 'Remove downloaded tools', 'YesNo', 'Question')
+        if ($r -eq 'Yes') {
+            try { $n = Remove-ExternalTools; [System.Windows.MessageBox]::Show("Removed $n downloaded tool folder(s).", 'Done', 'OK', 'Information') | Out-Null }
+            catch { [System.Windows.MessageBox]::Show("Could not remove tools: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null }
+            Update-LogView
+        }
+    })
 }
 
 # ============================================================================

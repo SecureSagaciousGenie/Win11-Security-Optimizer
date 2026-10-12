@@ -43,7 +43,12 @@ $script:Core = [ordered]@{
 $script:SeverityWeight = @{ 'Critical'=10; 'High'=7; 'Medium'=4; 'Low'=2; 'Info'=0 }
 
 function Initialize-Core {
-    <# Sets up the data/log folder. Safe to call repeatedly. #>
+    <# Sets up the data/log folder. Safe to call repeatedly.
+       The session LOG file is shared across every runspace in this process so the
+       Restore & Logs tab sees ALL activity (background scans run in child
+       runspaces that each call Initialize-Core). We key it off an environment
+       variable - env vars are per-process, so all runspaces inherit the same
+       log path. Rollback/backup files remain per-call-timestamp. #>
     param([string]$DataPath)
     if (-not $DataPath) {
         $DataPath = Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer'
@@ -54,7 +59,13 @@ function Initialize-Core {
         if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
     }
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $script:Core.LogFile      = Join-Path $DataPath ("logs\session_{0}.log"     -f $stamp)
+    # Shared session log: reuse the one already chosen for this process if present.
+    if ($env:W11SO_SESSION_LOG) {
+        $script:Core.LogFile = $env:W11SO_SESSION_LOG
+    } else {
+        $script:Core.LogFile = Join-Path $DataPath ("logs\session_{0}.log" -f $stamp)
+        $env:W11SO_SESSION_LOG = $script:Core.LogFile
+    }
     $script:Core.RollbackFile = Join-Path $DataPath ("backups\Rollback_{0}.ps1" -f $stamp)
     $script:Core.BackupFile   = Join-Path $DataPath ("backups\Backup_{0}.json"  -f $stamp)
     Write-CoreLog -Message ("=== {0} v{1} session started ===" -f $script:Core.Name, $script:Core.Version) -Level INFO
@@ -274,10 +285,21 @@ function Invoke-SecurityScan {
             -Status $sigStatus -Observed $(if($age -ne $null){"$age day(s) old"}else{'Unknown'}) -Expected 'Updated within 3 days' `
             -Detail 'Old signatures miss recent threats.' -Advice 'Update Defender signatures.' -RiskTier 'Safe' -Fixable ($age -ne $null -and $age -gt 3))
 
-        $asr = 0; try { $p=Get-MpPreference; if($p.AttackSurfaceReductionRules_Ids){$asr=@($p.AttackSurfaceReductionRules_Ids).Count} } catch { }
+        # ASR: count rules actually set to BLOCK (action 1). A GUID present but set
+        # to Disabled(0)/Audit(2)/Warn(6) does NOT count as protecting you.
+        $asrBlock = 0; $asrOther = 0
+        try {
+            $p = Get-MpPreference
+            $ids = @($p.AttackSurfaceReductionRules_Ids)
+            $acts = @($p.AttackSurfaceReductionRules_Actions)
+            for ($i=0; $i -lt $ids.Count; $i++) {
+                if ($i -lt $acts.Count -and [int]$acts[$i] -eq 1) { $asrBlock++ } else { $asrOther++ }
+            }
+        } catch { }
+        $asrObs = if ($asrBlock -gt 0 -or $asrOther -gt 0) { "$asrBlock in Block, $asrOther in Audit/Warn/Off" } else { 'none configured' }
         & $add (New-Finding -Id 'DEF-ASR' -Category 'Microsoft Defender' -Name 'Attack Surface Reduction rules' -Severity 'Medium' `
-            -Status $(if($asr -ge 1){'Pass'}else{'Warning'}) -Observed "$asr rule(s)" -Expected 'Key rules enabled' `
-            -Detail 'Blocks common exploit behaviors (e.g. Office spawning executables).' -Advice 'Enable baseline ASR rules.' -RiskTier 'Elevated' -Fixable ($asr -lt 1))
+            -Status $(if($asrBlock -ge 3){'Pass'}else{'Warning'}) -Observed $asrObs -Expected 'Key rules in Block mode' `
+            -Detail 'ASR rules block common exploit behaviors (e.g. Office spawning executables, LSASS credential theft). Only rules set to Block actually protect you.' -Advice 'Enable the baseline ASR rules in Block mode.' -RiskTier 'Elevated' -Fixable ($asrBlock -lt 3))
     } else {
         & $add (New-Finding -Id 'DEF-000' -Category 'Microsoft Defender' -Name 'Defender availability' -Severity 'Info' `
             -Status 'Info' -Observed 'Not queryable' -Expected 'Present' -Detail 'A third-party AV may be active.' -Advice 'Verify your AV is up to date.' -RiskTier 'AuditOnly')
@@ -307,20 +329,40 @@ function Invoke-SecurityScan {
     & $add (New-Finding -Id 'UAC-ENABLE' -Category 'User Account Control' -Name 'UAC enabled (EnableLUA)' -Severity 'Critical' `
         -Status $(if($enable -eq 1){'Pass'}else{'Fail'}) -Observed $(if($enable -ne $null){"$enable"}else{'Not set'}) -Expected '1' `
         -Detail 'Core privilege isolation.' -Advice 'Enable UAC.' -RiskTier 'Safe' -Fixable ($enable -ne 1))
+    # ConsentPromptBehaviorAdmin: 0 = elevate silently (WEAK). 1 = prompt for
+    # CREDENTIALS on the secure desktop (strictest). 2 = prompt for consent on
+    # secure desktop. 5 = prompt for consent for non-Windows binaries (default).
+    # Only 0 is bad; 1 is actually stricter than 2/5, so do not "fix" it.
+    $consentOk = ($consent -ne $null -and $consent -ne 0)
     & $add (New-Finding -Id 'UAC-CONSENT' -Category 'User Account Control' -Name 'Admin consent prompt' -Severity 'Medium' `
-        -Status $(if($consent -ge 2){'Pass'}else{'Warning'}) -Observed $(if($consent -ne $null){"$consent"}else{'Not set'}) -Expected '2 or 5' `
-        -Detail '0 = silent elevation (weak).' -Advice 'Prompt for consent on the secure desktop.' -RiskTier 'Safe' -Fixable ($consent -ne $null -and $consent -lt 2))
+        -Status $(if($consentOk){'Pass'}else{'Warning'}) -Observed $(if($consent -ne $null){"$consent"}else{'Not set'}) -Expected 'Non-zero (1, 2 or 5)' `
+        -Detail '0 = silent elevation (weak). 1 = prompt for credentials (strictest). 2/5 = prompt for consent.' -Advice 'Require a prompt instead of silent elevation.' -RiskTier 'Safe' -Fixable ($consent -eq 0))
     & $add (New-Finding -Id 'UAC-SECUREDESK' -Category 'User Account Control' -Name 'Prompt on secure desktop' -Severity 'Low' `
         -Status $(if($secure -eq 1){'Pass'}else{'Warning'}) -Observed $(if($secure -ne $null){"$secure"}else{'Not set'}) -Expected '1' `
         -Detail 'Stops other apps spoofing the UAC prompt.' -Advice 'Enable secure-desktop prompting.' -RiskTier 'Safe' -Fixable ($secure -ne 1))
 
     # ---- Legacy protocols ----
-    $smb1 = $null; try { $smb1 = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop).State } catch { }
+    # Get-WindowsOptionalFeature needs elevation; without admin we must NOT claim a
+    # false Pass. Fall back to the server-side registry switch; if neither is
+    # readable, report Info/unknown.
+    $smb1 = $null
+    try { $smb1 = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop).State } catch { }
     $smb1srv = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' -Name 'SMB1'
-    $smb1on = ($smb1 -eq 'Enabled') -or ($smb1srv -eq 1)
-    & $add (New-Finding -Id 'SMB1' -Category 'Legacy Protocols' -Name 'SMBv1 protocol' -Severity 'High' `
-        -Status $(if($smb1on){'Fail'}else{'Pass'}) -Observed $(if($smb1){"Feature: $smb1"}elseif($smb1srv -ne $null){"reg=$smb1srv"}else{'Not present'}) -Expected 'Disabled' `
-        -Detail 'SMBv1 enabled WannaCry/EternalBlue.' -Advice 'Disable SMBv1 unless a legacy NAS needs it.' -RiskTier 'Elevated' -Fixable $smb1on)
+    if ($smb1 -ne $null) {
+        $smb1on = ($smb1 -eq 'Enabled')
+        & $add (New-Finding -Id 'SMB1' -Category 'Legacy Protocols' -Name 'SMBv1 protocol' -Severity 'High' `
+            -Status $(if($smb1on){'Fail'}else{'Pass'}) -Observed ("Feature: {0}" -f $smb1) -Expected 'Disabled' `
+            -Detail 'SMBv1 enabled WannaCry/EternalBlue.' -Advice 'Disable SMBv1 unless a legacy NAS needs it.' -RiskTier 'Elevated' -Fixable $smb1on)
+    } elseif ($smb1srv -ne $null) {
+        $smb1on = ($smb1srv -eq 1)
+        & $add (New-Finding -Id 'SMB1' -Category 'Legacy Protocols' -Name 'SMBv1 protocol' -Severity 'High' `
+            -Status $(if($smb1on){'Fail'}else{'Pass'}) -Observed ("Server SMB1 reg = {0}" -f $smb1srv) -Expected 'Disabled' `
+            -Detail 'SMBv1 enabled WannaCry/EternalBlue. (Feature state needs admin; using the server registry switch.)' -Advice 'Disable SMBv1 unless a legacy NAS needs it.' -RiskTier 'Elevated' -Fixable $smb1on)
+    } else {
+        & $add (New-Finding -Id 'SMB1' -Category 'Legacy Protocols' -Name 'SMBv1 protocol' -Severity 'Medium' `
+            -Status 'Info' -Observed 'Unknown (needs Administrator to read the feature state)' -Expected 'Disabled' `
+            -Detail 'The SMBv1 feature state could not be read without elevation.' -Advice 'Relaunch via Start.bat (elevated) to check SMBv1.' -RiskTier 'AuditOnly')
+    }
 
     $llmnr = Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast'
     & $add (New-Finding -Id 'LLMNR' -Category 'Legacy Protocols' -Name 'LLMNR multicast name resolution' -Severity 'Medium' `
@@ -386,8 +428,17 @@ function Invoke-SecurityScan {
     }
 
     # ---- Core Isolation / HVCI ----
-    $hvci = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled'
-    & $add (New-Finding -Id 'HVCI' -Category 'Exploit Protection' -Name 'Memory Integrity (HVCI)' -Severity 'Medium' -Status $(if($hvci -eq 1){'Pass'}else{'Warning'}) -Observed $(if($hvci -ne $null){"Enabled=$hvci"}else{'Not configured'}) -Expected 'Enabled (1)' -Detail 'Protects kernel code integrity. Needs compatible drivers.' -Advice 'Enable Memory Integrity (may need driver updates).' -RiskTier 'HighRisk' -Fixable ($hvci -ne 1))
+    # Registry 'Enabled' is only the configured intent; actual enforcement shows
+    # in Win32_DeviceGuard.SecurityServicesRunning (2 = HVCI running).
+    $hvciCfg = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled'
+    $hvciRunning = $false
+    try {
+        $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction Stop
+        $hvciRunning = (@($dg.SecurityServicesRunning) -contains 2)
+    } catch { }
+    $hvciStatus = if ($hvciRunning) { 'Pass' } elseif ($hvciCfg -eq 1) { 'Warning' } else { 'Warning' }
+    $hvciObs = if ($hvciRunning) { 'Running' } elseif ($hvciCfg -eq 1) { 'Configured but NOT running (reboot or incompatible driver)' } else { 'Off' }
+    & $add (New-Finding -Id 'HVCI' -Category 'Exploit Protection' -Name 'Memory Integrity (HVCI)' -Severity 'Medium' -Status $hvciStatus -Observed $hvciObs -Expected 'Running' -Detail 'Protects kernel code integrity. Needs compatible drivers; a blocking driver can stop it running even when enabled.' -Advice 'Enable Memory Integrity (may need driver updates), then reboot.' -RiskTier 'HighRisk' -Fixable (-not $hvciRunning))
 
     # ---- RDP ----
     $deny = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections'
@@ -425,14 +476,28 @@ function Get-SecurityFixAction {
     param([string]$Id)
     switch ($Id) {
         'DEF-RTP'   { return { Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction Stop; Add-RollbackCommand 'Set-MpPreference -DisableRealtimeMonitoring $true' 'Revert real-time protection'; Add-ChangeRecord 'Enabled Defender real-time protection' } }
-        'DEF-CLOUD' { return { Set-MpPreference -MAPSReporting Advanced -ErrorAction Stop; Set-MpPreference -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue; Add-RollbackCommand 'Set-MpPreference -MAPSReporting Disabled' 'Revert cloud protection'; Add-ChangeRecord 'Enabled cloud-delivered protection' } }
+        'DEF-CLOUD' { return { $prev=$null; try { $prev=(Get-MpPreference).SubmitSamplesConsent } catch {}; Set-MpPreference -MAPSReporting Advanced -ErrorAction Stop; Set-MpPreference -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue; Add-RollbackCommand ("Set-MpPreference -MAPSReporting Disabled -ErrorAction SilentlyContinue; Set-MpPreference -SubmitSamplesConsent " + $(if($prev -ne $null){$prev}else{'AlwaysPrompt'}) + " -ErrorAction SilentlyContinue") 'Revert cloud protection + sample submission'; Add-ChangeRecord 'Enabled cloud-delivered protection and set SubmitSamplesConsent=SendSafeSamples (auto-sends files Defender deems safe to Microsoft)' } }
         'DEF-PUA'   { return { Set-MpPreference -PUAProtection Enabled -ErrorAction Stop; Add-RollbackCommand 'Set-MpPreference -PUAProtection Disabled' 'Revert PUA'; Add-ChangeRecord 'Enabled PUA protection' } }
         'DEF-SIG'   { return { Update-MpSignature -ErrorAction Stop; Add-ChangeRecord 'Updated Defender signatures' } }
         'DEF-ASR'   { return {
-                        $rules=@('BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550','D4F940AB-401B-4EFC-AADC-AD5F3C50688A','3B576869-A4EC-4529-8536-B80A7769E899','5BEB7EFE-FD9A-4556-801D-275E5FFC04CC','92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B')
-                        foreach($g in $rules){ Set-MpPreference -AttackSurfaceReductionRules_Ids $g -AttackSurfaceReductionRules_Actions Enabled -ErrorAction SilentlyContinue }
-                        Add-RollbackCommand ("@('"+($rules -join "','")+"') | ForEach-Object { Set-MpPreference -AttackSurfaceReductionRules_Ids `$_ -AttackSurfaceReductionRules_Actions Disabled -ErrorAction SilentlyContinue }") 'Disable ASR rules'
-                        Add-ChangeRecord 'Enabled baseline ASR rules' } }
+                        # Set ALL rules in ONE call (passing arrays), or each call
+                        # replaces the whole list and only the last rule survives.
+                        # Includes the LSASS credential-theft rule (9e6c4e1f...).
+                        $rules=@(
+                          'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550',  # executable content from email/webmail
+                          'D4F940AB-401B-4EFC-AADC-AD5F3C50688A',  # Office child processes
+                          '3B576869-A4EC-4529-8536-B80A7769E899',  # Office executable content
+                          '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC',  # obfuscated scripts
+                          '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B',  # Win32 API from Office macros
+                          '9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2',  # block credential theft from LSASS
+                          'D1E49AAC-8F56-4280-B9BA-993A6D77406C',  # process creations from PSExec/WMI
+                          '3B576869-A4EC-4529-8536-B80A7769E899'   # (dup guard; harmless)
+                        ) | Select-Object -Unique
+                        $actions = @(1) * $rules.Count   # 1 = Block
+                        Set-MpPreference -AttackSurfaceReductionRules_Ids $rules -AttackSurfaceReductionRules_Actions $actions -ErrorAction Stop
+                        $disList = "@('" + ($rules -join "','") + "')"
+                        Add-RollbackCommand ("$disList | ForEach-Object { Add-MpPreference -AttackSurfaceReductionRules_Ids `$_ -AttackSurfaceReductionRules_Actions Disabled -ErrorAction SilentlyContinue }") 'Disable ASR rules set by this tool'
+                        Add-ChangeRecord 'Enabled baseline ASR rules in Block mode (incl. LSASS protection)' } }
         'FW-Domain'  { return { Set-NetFirewallProfile -Profile Domain  -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Domain -Enabled False' 'Revert Domain FW'; Add-ChangeRecord 'Enabled Domain firewall' } }
         'FW-Private' { return { Set-NetFirewallProfile -Profile Private -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Private -Enabled False' 'Revert Private FW'; Add-ChangeRecord 'Enabled Private firewall' } }
         'FW-Public'  { return { Set-NetFirewallProfile -Profile Public  -Enabled True -ErrorAction Stop; Add-RollbackCommand 'Set-NetFirewallProfile -Profile Public -Enabled False' 'Revert Public FW'; Add-ChangeRecord 'Enabled Public firewall' } }
@@ -488,7 +553,26 @@ function Test-SecurityFixApplied {
             'AUTORUN'    { return ((Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun') -eq 255) }
             'ACCT-GUEST' { return (-not (Get-LocalUser -Name 'Guest' -ErrorAction SilentlyContinue).Enabled) }
             'WU-SVC'     { return ((Get-Service wuauserv).StartType -ne 'Disabled') }
-            'HVCI'       { return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled') -eq 1) }
+            'DEF-ASR'    {
+                try {
+                    $p = Get-MpPreference
+                    $ids = @($p.AttackSurfaceReductionRules_Ids); $acts = @($p.AttackSurfaceReductionRules_Actions)
+                    $block = 0; for ($i=0; $i -lt $ids.Count; $i++) { if ($i -lt $acts.Count -and [int]$acts[$i] -eq 1) { $block++ } }
+                    return ($block -ge 3)
+                } catch { return $false }
+            }
+            'HVCI'       {
+                # The registry key only expresses INTENT. Real enforcement is in
+                # Win32_DeviceGuard.SecurityServicesRunning (2 = HVCI running).
+                try {
+                    $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard' -ErrorAction Stop
+                    if (@($dg.SecurityServicesRunning) -contains 2) { return $true }
+                    # Configured but not yet running (needs reboot) -> report inconclusive as not-yet-verified.
+                    return $false
+                } catch {
+                    return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled') -eq 1)
+                }
+            }
             'RDP-ENABLED'{ return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') -eq 1) }
             'RDP-NLA'    { return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication') -eq 1) }
             'SMB1'       { try { return ((Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol).State -ne 'Enabled') } catch { return $true } }
@@ -519,7 +603,9 @@ function Get-DebloatCatalog {
         ReinstallNote - how to get it back
     #>
     @(
-        [pscustomobject]@{ Key='xbox';        Name='Xbox apps & Game Bar';        Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.Xbox*';                         Recommended=$true;  Description='Xbox console companion, Game Bar overlay and related background services. Safe to remove if you do not use Xbox features; PC games still run.'; ReinstallNote='Reinstall "Xbox" from the Microsoft Store.' }
+        [pscustomobject]@{ Key='xbox';        Name='Xbox Game Bar & overlay';     Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxGamingOverlay*';            Recommended=$true;  Description='The Xbox Game Bar overlay (Win+G) and app companion. Safe to remove if you do not use it; PC games still run. Does NOT touch Game Pass sign-in.'; ReinstallNote='Reinstall "Xbox Game Bar" from the Microsoft Store.' }
+        [pscustomobject]@{ Key='xboxtcui';    Name='Xbox Game UI (TCUI)';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.Xbox.TCUI*';                    Recommended=$false; Description='In-game Xbox UI used by some titles for invites/profiles. Removing it CAN break in-game social features. Leave it unless you are sure.'; ReinstallNote='Reinstall "Xbox" components from the Microsoft Store.' }
+        [pscustomobject]@{ Key='xboxspeech';  Name='Xbox Speech To Text';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxSpeechToTextOverlay*';      Recommended=$true;  Description='Game-chat speech-to-text overlay. Rarely used; safe to remove.'; ReinstallNote='Reinstall from the Microsoft Store.' }
         [pscustomobject]@{ Key='gamingapp';   Name='Xbox Gaming App';             Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.GamingApp*';                    Recommended=$false; Description='The main Xbox PC gaming app / Game Pass launcher. Remove only if you do not use Game Pass.'; ReinstallNote='Reinstall "Xbox" from the Microsoft Store.' }
         [pscustomobject]@{ Key='bingnews';    Name='Microsoft News (Bing News)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingNews*';                     Recommended=$true;  Description='News feed app that runs live-tile/background updates. Pure bloat for most users.'; ReinstallNote='Reinstall "Microsoft News" from the Store.' }
         [pscustomobject]@{ Key='bingweather'; Name='MSN Weather (Bing Weather)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingWeather*';                  Recommended=$true;  Description='Weather app with background refresh. Removable; use a website or widget instead.'; ReinstallNote='Reinstall "MSN Weather" from the Store.' }
@@ -578,6 +664,26 @@ function Remove-DebloatApp {
       Returns @{Success;Message}.
     #>
     param([Parameter(Mandatory)][string]$AppxName, [string]$FriendlyName = '')
+    # Hard safety net: never remove packages that break OS/gaming sign-in or
+    # core platform plumbing, even if a wildcard would otherwise match them.
+    $protected = @(
+        'Microsoft.XboxIdentityProvider',   # Xbox / Game Pass / Minecraft sign-in
+        'Microsoft.GamingServices',         # Game Pass game installs
+        'Microsoft.XboxGameCallableUI',
+        'Microsoft.VCLibs',
+        'Microsoft.NET',
+        'Microsoft.UI.Xaml',
+        'Microsoft.WindowsStore',           # the Store itself (needed to reinstall!)
+        'Microsoft.DesktopAppInstaller',
+        'Microsoft.StorePurchaseApp',
+        'Microsoft.SecHealthUI',            # Windows Security UI
+        'MicrosoftWindows.Client'
+    )
+    foreach ($pp in $protected) {
+        if ($AppxName -like "$pp*") {
+            return [pscustomobject]@{ Success=$false; Message=("Refused: '{0}' is a protected system/sign-in package and will not be removed." -f $pp) }
+        }
+    }
     try {
         Assert-SafeToChange
     } catch {
@@ -587,7 +693,11 @@ function Remove-DebloatApp {
     $removedAny = $false
     $familyNames = @()
     try {
-        $pkgs = Get-AppxPackage -Name $AppxName -ErrorAction SilentlyContinue
+        $pkgs = @(Get-AppxPackage -Name $AppxName -ErrorAction SilentlyContinue) | Where-Object {
+            # second guard: skip any protected package caught by a broad wildcard
+            $n = $_.Name
+            -not ($protected | Where-Object { $n -like "$_*" })
+        }
         foreach ($pkg in $pkgs) {
             $familyNames += $pkg.PackageFamilyName
             Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
@@ -637,7 +747,9 @@ function Get-FileSignatureInfo {
 }
 
 function ConvertTo-CommandPath {
-    <# Extracts the executable path from a Run-key command string for signing checks. #>
+    <# Extracts the executable path from a Run-key command string for signing checks.
+       Handles: quoted paths, unquoted paths WITH spaces (probes for the real .exe
+       by testing successively longer prefixes), and bare paths. #>
     param([string]$Command)
     if (-not $Command) { return $null }
     $c = $Command.Trim()
@@ -645,13 +757,27 @@ function ConvertTo-CommandPath {
         $end = $c.IndexOf('"',1)
         if ($end -gt 1) { return $c.Substring(1,$end-1) }
     }
-    $space = $c.IndexOf(' ')
-    if ($space -gt 0) { return $c.Substring(0,$space) }
-    return $c
+    # Unquoted. A naive split on the first space breaks "C:\Program Files\App\x.exe".
+    # Expand env vars, then walk each space boundary and return the first prefix
+    # that is an existing file (optionally with .exe appended).
+    $expanded = [Environment]::ExpandEnvironmentVariables($c)
+    if ($expanded -notmatch ' ') { return $expanded }
+    $idx = 0
+    while (($idx = $expanded.IndexOf(' ', $idx)) -ge 0) {
+        $candidate = $expanded.Substring(0, $idx)
+        if (Test-Path -LiteralPath $candidate -PathType Leaf -ErrorAction SilentlyContinue) { return $candidate }
+        if (Test-Path -LiteralPath ($candidate + '.exe') -PathType Leaf -ErrorAction SilentlyContinue) { return ($candidate + '.exe') }
+        $idx++
+    }
+    # No existing-file prefix found; fall back to the first token.
+    $space = $expanded.IndexOf(' ')
+    if ($space -gt 0) { return $expanded.Substring(0,$space) }
+    return $expanded
 }
 
 function Get-StartupItems {
-    <# Read-only enumeration of startup entries. #>
+    <# Read-only enumeration of startup entries, including items this tool has
+       disabled (so they remain visible and can be re-enabled). #>
     $items = New-Object System.Collections.ArrayList
     $runKeys = @(
         @{ Scope='HKLM'; Path='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' },
@@ -660,23 +786,59 @@ function Get-StartupItems {
         @{ Scope='HKCU'; Path='HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' },
         @{ Scope='HKLM'; Path='HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run' }
     )
-    foreach ($rk in $runKeys) {
-        if (-not (Test-Path $rk.Path)) { continue }
+
+    # Helper: read the real registry value KIND so we can preserve REG_EXPAND_SZ.
+    $getValueType = {
+        param($RegPath, $ValueName)
         try {
-            $props = Get-ItemProperty -Path $rk.Path -ErrorAction Stop
-            foreach ($p in $props.PSObject.Properties) {
-                if ($p.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
-                $exe = ConvertTo-CommandPath -Command ([string]$p.Value)
-                $sig = Get-FileSignatureInfo -Path $exe
-                [void]$items.Add([pscustomobject]@{
-                    Type='RegistryRun'; Scope=$rk.Scope; Location=$rk.Path; Name=$p.Name
-                    Command=[string]$p.Value; ExePath=$exe; Publisher=$sig.Publisher; Signed=$sig.Signed; SignStatus=$sig.Status
-                    Enabled=$true
-                })
+            $noDrive = $RegPath -replace '^HK(LM|CU):\\', ''
+            $root = if ($RegPath -match '^HKLM:') { [Microsoft.Win32.Registry]::LocalMachine } else { [Microsoft.Win32.Registry]::CurrentUser }
+            $sub = $root.OpenSubKey($noDrive)
+            if ($sub) {
+                $kind = $sub.GetValueKind($ValueName)
+                $sub.Close()
+                if ($kind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) { return 'ExpandString' }
             }
         } catch { }
+        return 'String'
     }
-    # Startup folders (.lnk)
+
+    foreach ($rk in $runKeys) {
+        # Active (enabled) entries
+        if (Test-Path $rk.Path) {
+            try {
+                $props = Get-ItemProperty -Path $rk.Path -ErrorAction Stop
+                foreach ($p in $props.PSObject.Properties) {
+                    if ($p.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+                    $exe = ConvertTo-CommandPath -Command ([string]$p.Value)
+                    $sig = Get-FileSignatureInfo -Path $exe
+                    [void]$items.Add([pscustomobject]@{
+                        Type='RegistryRun'; Scope=$rk.Scope; Location=$rk.Path; Name=$p.Name
+                        Command=[string]$p.Value; ExePath=$exe; Publisher=$sig.Publisher; Signed=$sig.Signed; SignStatus=$sig.Status
+                        Enabled=$true; ValueType=(& $getValueType $rk.Path $p.Name)
+                    })
+                }
+            } catch { }
+        }
+        # Disabled store written by this tool (so disabled items stay visible)
+        $disabledPath = ($rk.Path -replace '\\Run(Once)?$', '\RunDisabledByOptimizer')
+        if (Test-Path $disabledPath) {
+            try {
+                $dprops = Get-ItemProperty -Path $disabledPath -ErrorAction Stop
+                foreach ($p in $dprops.PSObject.Properties) {
+                    if ($p.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+                    $exe = ConvertTo-CommandPath -Command ([string]$p.Value)
+                    $sig = Get-FileSignatureInfo -Path $exe
+                    [void]$items.Add([pscustomobject]@{
+                        Type='RegistryRun'; Scope=$rk.Scope; Location=$rk.Path; Name=$p.Name
+                        Command=[string]$p.Value; ExePath=$exe; Publisher=$sig.Publisher; Signed=$sig.Signed; SignStatus=$sig.Status
+                        Enabled=$false; ValueType=(& $getValueType $disabledPath $p.Name)
+                    })
+                }
+            } catch { }
+        }
+    }
+    # Startup folders (.lnk enabled, .lnk.disabled disabled)
     $folders = @(
         @{ Scope='User';   Path=[Environment]::GetFolderPath('Startup') },
         @{ Scope='Common'; Path=[Environment]::GetFolderPath('CommonStartup') }
@@ -691,13 +853,33 @@ function Get-StartupItems {
                 [void]$items.Add([pscustomobject]@{
                     Type='StartupFolder'; Scope=$f.Scope; Location=$f.Path; Name=$_.BaseName
                     Command=$target; ExePath=$target; Publisher=$sig.Publisher; Signed=$sig.Signed; SignStatus=$sig.Status
-                    Enabled=$true
+                    Enabled=$true; ValueType='String'
+                })
+            }
+            Get-ChildItem -Path $f.Path -Filter *.lnk.disabled -ErrorAction SilentlyContinue | ForEach-Object {
+                $target = $null
+                $realLnk = $_.FullName -replace '\.disabled$',''
+                try { $sh = New-Object -ComObject WScript.Shell; $target = $sh.CreateShortcut($realLnk).TargetPath } catch { }
+                $sig = Get-FileSignatureInfo -Path $target
+                $base = ($_.BaseName -replace '\.lnk$','')
+                [void]$items.Add([pscustomobject]@{
+                    Type='StartupFolder'; Scope=$f.Scope; Location=$f.Path; Name=$base
+                    Command=$target; ExePath=$target; Publisher=$sig.Publisher; Signed=$sig.Signed; SignStatus=$sig.Status
+                    Enabled=$false; ValueType='String'
                 })
             }
         } catch { }
     }
     Write-CoreLog -Message ("Startup scan: {0} item(s)." -f $items.Count) -Level INFO
     return $items.ToArray()
+}
+
+function ConvertTo-PsSingleQuoted {
+    <# Safely encode an arbitrary string as a PowerShell single-quoted literal.
+       Doubles embedded single quotes so the value can never break out into code. #>
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return "''" }
+    return "'" + ($Value -replace "'","''") + "'"
 }
 
 function Set-StartupItemState {
@@ -707,49 +889,64 @@ function Set-StartupItemState {
       store (same technique Sysinternals Autoruns uses) instead of deleting.
       For Startup-folder shortcuts: rename .lnk <-> .lnk.disabled.
       Returns @{Success;Message}.
+
+      SECURITY: every value interpolated into the rollback script is passed through
+      ConvertTo-PsSingleQuoted so a malicious Run value (e.g. containing '; cmd; ')
+      cannot inject live code into the generated Rollback_*.ps1.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('RegistryRun','StartupFolder')][string]$Type,
         [Parameter(Mandatory)][string]$Location,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][bool]$Enable,
-        [string]$Command
+        [string]$Command,
+        [string]$ValueType = 'String'   # preserve REG_EXPAND_SZ when applicable
     )
     try {
         Assert-SafeToChange
+        $qLoc  = ConvertTo-PsSingleQuoted $Location
+        $qName = ConvertTo-PsSingleQuoted $Name
         if ($Type -eq 'RegistryRun') {
             $disabledPath = ($Location -replace '\\Run(Once)?$', '\RunDisabledByOptimizer')
+            $qDis = ConvertTo-PsSingleQuoted $disabledPath
+            $propType = if ($ValueType -eq 'ExpandString') { 'ExpandString' } else { 'String' }
             if ($Enable) {
                 # move back from disabled store
                 $v = Get-RegValue -Path $disabledPath -Name $Name
                 if ($v -ne $null) {
                     if (-not (Test-Path $Location)) { New-Item -Path $Location -Force | Out-Null }
-                    New-ItemProperty -Path $Location -Name $Name -Value $v -PropertyType String -Force | Out-Null
+                    New-ItemProperty -Path $Location -Name $Name -Value $v -PropertyType $propType -Force | Out-Null
                     Remove-ItemProperty -Path $disabledPath -Name $Name -ErrorAction SilentlyContinue
                 }
                 Add-ChangeRecord "Re-enabled startup entry '$Name'"
-                Add-RollbackCommand "# Re-disable startup '$Name': handled by the app's Startup tab" "startup $Name enabled"
+                $qVal = ConvertTo-PsSingleQuoted ([string]$v)
+                Add-RollbackCommand ("if (-not (Test-Path $qDis)) { New-Item -Path $qDis -Force | Out-Null }`r`nNew-ItemProperty -Path $qDis -Name $qName -Value $qVal -PropertyType $propType -Force | Out-Null`r`nRemove-ItemProperty -Path $qLoc -Name $qName -ErrorAction SilentlyContinue") "Re-disable startup '$Name'"
             } else {
                 $cur = Get-RegValue -Path $Location -Name $Name
                 if ($cur -eq $null -and $Command) { $cur = $Command }
                 if (-not (Test-Path $disabledPath)) { New-Item -Path $disabledPath -Force | Out-Null }
-                New-ItemProperty -Path $disabledPath -Name $Name -Value $cur -PropertyType String -Force | Out-Null
+                New-ItemProperty -Path $disabledPath -Name $Name -Value $cur -PropertyType $propType -Force | Out-Null
                 Remove-ItemProperty -Path $Location -Name $Name -ErrorAction SilentlyContinue
                 Add-ChangeRecord "Disabled startup entry '$Name'"
-                Add-RollbackCommand "if (-not (Test-Path '$Location')) { New-Item -Path '$Location' -Force | Out-Null }`r`nNew-ItemProperty -Path '$Location' -Name '$Name' -Value '$cur' -PropertyType String -Force | Out-Null`r`nRemove-ItemProperty -Path '$disabledPath' -Name '$Name' -ErrorAction SilentlyContinue" "Re-enable startup '$Name'"
+                $qVal = ConvertTo-PsSingleQuoted ([string]$cur)
+                Add-RollbackCommand ("if (-not (Test-Path $qLoc)) { New-Item -Path $qLoc -Force | Out-Null }`r`nNew-ItemProperty -Path $qLoc -Name $qName -Value $qVal -PropertyType $propType -Force | Out-Null`r`nRemove-ItemProperty -Path $qDis -Name $qName -ErrorAction SilentlyContinue") "Re-enable startup '$Name'"
             }
         } else {
             # StartupFolder
             $lnk = Join-Path $Location ($Name + '.lnk')
             $dis = $lnk + '.disabled'
+            $qLnk = ConvertTo-PsSingleQuoted $lnk
+            $qDisLnk = ConvertTo-PsSingleQuoted $dis
+            $qLnkName = ConvertTo-PsSingleQuoted ($Name + '.lnk')
+            $qDisName = ConvertTo-PsSingleQuoted ($Name + '.lnk.disabled')
             if ($Enable) {
                 if (Test-Path $dis) { Rename-Item -Path $dis -NewName ($Name + '.lnk') -Force }
                 Add-ChangeRecord "Re-enabled startup shortcut '$Name'"
-                Add-RollbackCommand "Rename-Item -Path '$lnk' -NewName '$($Name).lnk.disabled' -Force -ErrorAction SilentlyContinue" "Re-disable '$Name'"
+                Add-RollbackCommand ("Rename-Item -Path $qLnk -NewName $qDisName -Force -ErrorAction SilentlyContinue") "Re-disable '$Name'"
             } else {
                 if (Test-Path $lnk) { Rename-Item -Path $lnk -NewName ($Name + '.lnk.disabled') -Force }
                 Add-ChangeRecord "Disabled startup shortcut '$Name'"
-                Add-RollbackCommand "Rename-Item -Path '$dis' -NewName '$($Name).lnk' -Force -ErrorAction SilentlyContinue" "Re-enable '$Name'"
+                Add-RollbackCommand ("Rename-Item -Path $qDisLnk -NewName $qLnkName -Force -ErrorAction SilentlyContinue") "Re-enable '$Name'"
             }
         }
         Save-RollbackArtifacts
@@ -803,7 +1000,7 @@ function Invoke-DfirTriage {
                 }
             }
         }
-        $adminMembers = $adminMembers | Where-Object { $_ } | Select-Object -Unique
+        $adminMembers = @($adminMembers | Where-Object { $_ } | Select-Object -Unique)
         # Known/expected: current user, built-in Administrator, Domain Admins
         $expectedPatterns = @('*\Administrator', 'Administrator', "*\$env:USERNAME", $env:USERNAME, '*\Domain Admins', '*\Enterprise Admins')
         $unexpected = @()
@@ -812,6 +1009,7 @@ function Invoke-DfirTriage {
             foreach ($pat in $expectedPatterns) { if ($m -like $pat) { $isExpected=$true; break } }
             if (-not $isExpected) { $unexpected += $m }
         }
+        $unexpected = @($unexpected)
         $evidence = ($adminMembers -join "`n")
         if ($unexpected.Count -gt 0) {
             & $add (New-DfirFinding -Id 'DFIR-ADMIN' -Category 'Accounts & Access' -Title 'Extra accounts in the Administrators group' -Severity 'High' -Status 'Review' `
@@ -827,40 +1025,49 @@ function Invoke-DfirTriage {
 
     # ---------- 2. Enabled local user accounts + hidden ($-suffixed) ----------
     try {
-        $users = Get-LocalUser -ErrorAction Stop
-        $enabled = $users | Where-Object { $_.Enabled }
-        $hidden  = $users | Where-Object { $_.Name -like '*$' }   # trailing-$ hides from logon UI
-        $lines = $enabled | ForEach-Object { "  {0}{1}  (last logon: {2})" -f $_.Name, $(if($_.Name -like '*$'){' [HIDDEN]'}else{''}), $(if($_.LastLogon){$_.LastLogon}else{'never'}) }
+        $users = @(Get-LocalUser -ErrorAction Stop)
+        $enabled = @($users | Where-Object { $_.Enabled })
+        $hidden  = @($users | Where-Object { $_.Name -like '*$' })   # trailing-$ hides from logon UI
+        $lines = @($enabled | ForEach-Object { "  {0}{1}  (last logon: {2})" -f $_.Name, $(if($_.Name -like '*$'){' [HIDDEN]'}else{''}), $(if($_.LastLogon){$_.LastLogon}else{'never'}) })
         if ($hidden.Count -gt 0) {
             & $add (New-DfirFinding -Id 'DFIR-HIDDENUSER' -Category 'Accounts & Access' -Title 'Hidden user account(s) detected' -Severity 'High' -Status 'Alert' `
-                -What ("Account name(s) ending in '$' are hidden from the sign-in screen:`n  " + (($hidden|ForEach-Object{$_.Name}) -join "`n  ")) `
+                -What ("Account name(s) ending in '$' are hidden from the sign-in screen:`n  " + (@($hidden|ForEach-Object{$_.Name}) -join "`n  ")) `
                 -Why 'A trailing "$" hides an account from the normal logon screen. Legitimate for some service accounts, but also a classic backdoor trick.' `
-                -WhatToDo 'If you did not create these, treat as suspicious. Check whether they are in the Administrators group above and investigate.' -Evidence (($hidden|ForEach-Object{$_.Name}) -join "`n"))
+                -WhatToDo 'If you did not create these, treat as suspicious. Check whether they are in the Administrators group above and investigate.' -Evidence (@($hidden|ForEach-Object{$_.Name}) -join "`n"))
         }
         & $add (New-DfirFinding -Id 'DFIR-USERS' -Category 'Accounts & Access' -Title ("Enabled local accounts: {0}" -f $enabled.Count) -Severity 'Info' -Status 'Info' `
             -What ("Currently enabled local accounts:`n" + ($lines -join "`n")) -Why 'Disabled or unknown accounts that are enabled can be a sign of tampering.' -WhatToDo 'Disable any local account you do not use: Disable-LocalUser -Name "<name>".' -Evidence ($lines -join "`n"))
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-USERS-ERR' -Category 'Accounts & Access' -Title 'Could not read local accounts' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---------- 3. Startup persistence: Run keys ----------
     try {
-        $startup = Get-StartupItems
-        $suspicious = $startup | Where-Object {
-            $_.ExePath -and ($_.ExePath -match '\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\') -or (-not $_.Signed -and $_.ExePath)
-        }
-        if ($suspicious) {
-            $ev = ($suspicious | ForEach-Object { "  [{0}] {1} -> {2}  (signed: {3})" -f $_.Type, $_.Name, $_.Command, $_.Signed }) -join "`n"
-            & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title ("Suspicious startup entries: {0}" -f @($suspicious).Count) -Severity 'High' -Status 'Review' `
-                -What ("These programs run at startup and are either unsigned or launch from a temporary/user folder:`n" + $ev) `
-                -Why 'Malware persists by auto-starting. Legit software is normally signed and lives in Program Files, not Temp/AppData/Downloads.' `
-                -WhatToDo 'Review each in the Startup tab. If you do not recognise it, disable it (reversible) and scan the file with Defender.' -Evidence $ev)
+        $startup = @(Get-StartupItems)
+        # High-confidence: unsigned AND launching from a user/temp folder, or from
+        # an outright suspicious location (Temp/Downloads/Public). An unsigned app
+        # in a normal install path (Program Files) is NOT flagged here to avoid
+        # drowning the user in false positives (many legit apps are unsigned).
+        $tempRe = '\\Temp\\|\\Downloads\\|\\Users\\Public\\|\\\$Recycle'
+        $userRe = '\\AppData\\|\\ProgramData\\'
+        $suspicious = @($startup | Where-Object {
+            $_.ExePath -and (
+                ($_.ExePath -match $tempRe) -or
+                (($_.ExePath -match $userRe) -and (-not $_.Signed))
+            )
+        })
+        if ($suspicious.Count -gt 0) {
+            $ev = (@($suspicious | ForEach-Object { "  [{0}] {1} -> {2}  (signed: {3})" -f $_.Type, $_.Name, $_.Command, $_.Signed })) -join "`n"
+            & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title ("Startup entries worth reviewing: {0}" -f $suspicious.Count) -Severity 'Medium' -Status 'Review' `
+                -What ("These programs run at startup from a temporary/user folder (unsigned ones in AppData are included):`n" + $ev) `
+                -Why 'Malware persists by auto-starting from Temp/AppData. Note that some legitimate apps (OneDrive, Teams, Zoom, Discord) also start from AppData - so this is a review list, not a verdict.' `
+                -WhatToDo 'Recognise each one? Then it is fine. If you do not, disable it in the Startup tab (reversible) and scan the file with Defender.' -Evidence $ev)
         } else {
-            & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title 'No obviously suspicious startup entries' -Severity 'Info' -Status 'Clean' -What 'All startup entries are signed and/or run from standard locations.' -Why '' -WhatToDo 'No action needed. See the Startup tab for the full list.' -Evidence '')
+            & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title 'No obviously suspicious startup entries' -Severity 'Info' -Status 'Clean' -What 'No startup entries run unsigned from temp/user folders.' -Why '' -WhatToDo 'No action needed. See the Startup tab for the full list.' -Evidence '')
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-STARTUP-ERR' -Category 'Startup Persistence' -Title 'Startup check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Note it as a tool issue if it persists.' -Evidence '') }
 
     # ---------- 4. Scheduled tasks running from odd locations ----------
     try {
-        $tasks = Get-ScheduledTask -ErrorAction Stop
+        $tasks = @(Get-ScheduledTask -ErrorAction Stop)
         $flagged = New-Object System.Collections.ArrayList
         foreach ($t in $tasks) {
             foreach ($act in @($t.Actions)) {
@@ -871,8 +1078,9 @@ function Invoke-DfirTriage {
                 }
             }
         }
+        $flagged = @($flagged)
         if ($flagged.Count -gt 0) {
-            $ev = ($flagged.ToArray() -join "`n")
+            $ev = ($flagged -join "`n")
             & $add (New-DfirFinding -Id 'DFIR-TASKS' -Category 'Startup Persistence' -Title ("Scheduled tasks worth reviewing: {0}" -f $flagged.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("These scheduled tasks launch scripts/interpreters or run from user/temp folders:`n" + $ev) `
                 -Why 'Scheduled tasks are a common persistence method. Tasks that run PowerShell/mshta/rundll32 or execute from Temp/AppData deserve a look.' `
@@ -880,11 +1088,11 @@ function Invoke-DfirTriage {
         } else {
             & $add (New-DfirFinding -Id 'DFIR-TASKS' -Category 'Startup Persistence' -Title 'No scheduled tasks flagged' -Severity 'Info' -Status 'Clean' -What 'No scheduled tasks matched suspicious patterns.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-TASKS-ERR' -Category 'Startup Persistence' -Title 'Scheduled-task check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---------- 5. Non-Microsoft running services with unsigned/odd binaries ----------
     try {
-        $svcs = Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName }
+        $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName })
         $flagged = New-Object System.Collections.ArrayList
         foreach ($s in $svcs) {
             $exe = ConvertTo-CommandPath -Command ($s.PathName -replace '^"','' )
@@ -892,8 +1100,9 @@ function Invoke-DfirTriage {
                 [void]$flagged.Add(("  {0}  ->  {1}" -f $s.Name, $s.PathName))
             }
         }
+        $flagged = @($flagged)
         if ($flagged.Count -gt 0) {
-            $ev = ($flagged.ToArray() -join "`n")
+            $ev = ($flagged -join "`n")
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title ("Services running from user/temp folders: {0}" -f $flagged.Count) -Severity 'High' -Status 'Review' `
                 -What ("Running services whose program lives in a temporary/user folder:`n" + $ev) `
                 -Why 'Legitimate services run from Program Files or System32. A service pointing into Temp/AppData is a strong malware indicator.' `
@@ -901,7 +1110,7 @@ function Invoke-DfirTriage {
         } else {
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title 'No services from suspicious paths' -Severity 'Info' -Status 'Clean' -What 'All running services launch from standard locations.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-SVC-ERR' -Category 'Startup Persistence' -Title 'Service check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---------- 6. Remote access exposure: RDP ----------
     try {
@@ -915,61 +1124,71 @@ function Invoke-DfirTriage {
         } else {
             & $add (New-DfirFinding -Id 'DFIR-RDP' -Category 'Remote Access' -Title 'Remote Desktop is disabled' -Severity 'Info' -Status 'Clean' -What 'RDP listener is off.' -Why '' -WhatToDo 'No action needed.' -Evidence "fDenyTSConnections=$deny")
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-RDP-ERR' -Category 'Remote Access' -Title 'RDP check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Note it as a tool issue if it persists.' -Evidence '') }
 
     # ---------- 7. Listening TCP ports (exposure surface) ----------
+    # 135 (RPC) and 445 (SMB) listen on essentially every Windows PC, so they are
+    # NOT treated as notable on their own - only genuinely remote-access-y ports
+    # (RDP/VNC/Telnet/FTP/WinRM) are surfaced as review items.
     try {
-        $listen = Get-NetTCPConnection -State Listen -ErrorAction Stop
+        $listen = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
         $rows = New-Object System.Collections.ArrayList
-        $riskyPorts = @{ 3389='RDP'; 5900='VNC'; 23='Telnet'; 21='FTP'; 445='SMB'; 135='RPC'; 5985='WinRM-HTTP'; 5986='WinRM-HTTPS' }
+        $notableRows = New-Object System.Collections.ArrayList
+        $riskyPorts   = @{ 3389='RDP'; 5900='VNC'; 23='Telnet'; 21='FTP'; 5985='WinRM-HTTP'; 5986='WinRM-HTTPS' }
+        $expectedPorts = @{ 445='SMB (normal on Windows)'; 135='RPC (normal on Windows)' }
         foreach ($conn in $listen) {
             $proc = $null; try { $proc = (Get-Process -Id $conn.OwningProcess -ErrorAction Stop).ProcessName } catch { }
-            $port = $conn.LocalPort
-            $tag = if ($riskyPorts.ContainsKey([int]$port)) { " <- $($riskyPorts[[int]$port])" } else { '' }
-            # Only surface non-loopback listeners (actually reachable)
+            $port = [int]$conn.LocalPort
+            # Only surface listeners reachable from off-box (not loopback).
             if ($conn.LocalAddress -notmatch '^(127\.|::1$)') {
-                [void]$rows.Add(("  {0}:{1}  ({2}){3}" -f $conn.LocalAddress, $port, $(if($proc){$proc}else{"PID $($conn.OwningProcess)"}), $tag))
+                $label = if ($riskyPorts.ContainsKey($port)) { " <- $($riskyPorts[$port])" }
+                         elseif ($expectedPorts.ContainsKey($port)) { " ($($expectedPorts[$port]))" } else { '' }
+                $line = "  {0}:{1}  ({2}){3}" -f $conn.LocalAddress, $port, $(if($proc){$proc}else{"PID $($conn.OwningProcess)"}), $label
+                [void]$rows.Add($line)
+                if ($riskyPorts.ContainsKey($port)) { [void]$notableRows.Add($line) }
             }
         }
-        $uniq = $rows.ToArray() | Select-Object -Unique
-        $risky = $uniq | Where-Object { $_ -match '<-' }
-        if ($risky) {
-            & $add (New-DfirFinding -Id 'DFIR-PORTS' -Category 'Network Exposure' -Title ("Notable listening ports: {0}" -f @($risky).Count) -Severity 'Medium' -Status 'Review' `
-                -What ("These network ports are open to other machines:`n" + ($uniq -join "`n")) `
-                -Why 'Open remote-access ports (RDP/VNC/Telnet/SMB/WinRM) expand your attack surface. Unexpected ones can indicate a backdoor.' `
-                -WhatToDo 'Identify the program behind each risky port. Close/firewall anything you do not need listening to the network.' -Evidence ($uniq -join "`n"))
+        $uniq = @($rows.ToArray() | Select-Object -Unique)
+        $risky = @($notableRows.ToArray() | Select-Object -Unique)
+        if ($risky.Count -gt 0) {
+            & $add (New-DfirFinding -Id 'DFIR-PORTS' -Category 'Network Exposure' -Title ("Remote-access ports listening: {0}" -f $risky.Count) -Severity 'Medium' -Status 'Review' `
+                -What ("These remote-access ports are open to other machines:`n" + ($risky -join "`n") + "`n`nAll network-facing listeners:`n" + ($uniq -join "`n")) `
+                -Why 'Remote-access ports (RDP/VNC/Telnet/FTP/WinRM) expand your attack surface. (Ports 135/445 always listen on Windows and are not flagged.)' `
+                -WhatToDo 'Identify the program behind each remote-access port. Close/firewall anything you do not need listening to the network.' -Evidence ($uniq -join "`n"))
         } else {
-            & $add (New-DfirFinding -Id 'DFIR-PORTS' -Category 'Network Exposure' -Title 'No high-risk ports exposed to the network' -Severity 'Info' -Status 'Clean' -What (("Network-facing listeners:`n" + ($uniq -join "`n")).Trim()) -Why '' -WhatToDo 'No action needed.' -Evidence ($uniq -join "`n"))
+            & $add (New-DfirFinding -Id 'DFIR-PORTS' -Category 'Network Exposure' -Title 'No high-risk remote-access ports exposed' -Severity 'Info' -Status 'Clean' -What (("Network-facing listeners (135/445 are normal on Windows):`n" + ($uniq -join "`n")).Trim()) -Why '' -WhatToDo 'No action needed.' -Evidence ($uniq -join "`n"))
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-PORTS-ERR' -Category 'Network Exposure' -Title 'Port check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Note it as a tool issue if it persists.' -Evidence '') }
 
     # ---------- 8. Non-default SMB shares ----------
     try {
-        $shares = Get-SmbShare -ErrorAction Stop
-        $default = @('ADMIN$','C$','D$','E$','IPC$','print$')
-        $custom = $shares | Where-Object { $default -notcontains $_.Name }
-        if ($custom) {
-            $ev = ($custom | ForEach-Object { "  {0}  ->  {1}" -f $_.Name, $_.Path }) -join "`n"
-            & $add (New-DfirFinding -Id 'DFIR-SMB' -Category 'Network Exposure' -Title ("Custom file shares: {0}" -f @($custom).Count) -Severity 'Medium' -Status 'Review' `
+        $shares = @(Get-SmbShare -ErrorAction Stop)
+        $default = @('ADMIN$','C$','D$','E$','F$','IPC$','print$')
+        $custom = @($shares | Where-Object { $default -notcontains $_.Name })
+        if ($custom.Count -gt 0) {
+            $ev = (@($custom | ForEach-Object { "  {0}  ->  {1}" -f $_.Name, $_.Path })) -join "`n"
+            & $add (New-DfirFinding -Id 'DFIR-SMB' -Category 'Network Exposure' -Title ("Custom file shares: {0}" -f $custom.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("Folders shared on the network:`n" + $ev) `
                 -Why 'Shared folders let other machines read/write files. A share you did not create can mean data exposure or an attacker foothold.' `
                 -WhatToDo 'Remove shares you do not recognise: Remove-SmbShare -Name "<name>". Confirm first.' -Evidence $ev)
         } else {
             & $add (New-DfirFinding -Id 'DFIR-SMB' -Category 'Network Exposure' -Title 'Only default administrative shares present' -Severity 'Info' -Status 'Clean' -What 'No custom network shares found.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-SMB-ERR' -Category 'Network Exposure' -Title 'Share check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---------- 9. Defender exclusions (classic attacker move) ----------
     try {
         $pref = Get-MpPreference -ErrorAction Stop
-        $exPath = @($pref.ExclusionPath); $exProc = @($pref.ExclusionProcess); $exExt = @($pref.ExclusionExtension)
-        $total = ($exPath + $exProc + $exExt | Where-Object { $_ }).Count
+        $exPath = @($pref.ExclusionPath | Where-Object { $_ })
+        $exProc = @($pref.ExclusionProcess | Where-Object { $_ })
+        $exExt  = @($pref.ExclusionExtension | Where-Object { $_ })
+        $total = $exPath.Count + $exProc.Count + $exExt.Count
         if ($total -gt 0) {
-            $ev = @()
-            if ($exPath -and $exPath[0]) { $ev += ('Paths:`n  ' + ($exPath -join "`n  ")) }
-            if ($exProc -and $exProc[0]) { $ev += ('Processes:`n  ' + ($exProc -join "`n  ")) }
-            if ($exExt  -and $exExt[0])  { $ev += ('Extensions:`n  ' + ($exExt -join "`n  ")) }
-            $evStr = ($ev -join "`n") -replace '`n', "`n"
+            $parts = @()
+            if ($exPath.Count) { $parts += ("Paths:`n  "      + ($exPath -join "`n  ")) }
+            if ($exProc.Count) { $parts += ("Processes:`n  "  + ($exProc -join "`n  ")) }
+            if ($exExt.Count)  { $parts += ("Extensions:`n  " + ($exExt  -join "`n  ")) }
+            $evStr = ($parts -join "`n")
             & $add (New-DfirFinding -Id 'DFIR-DEFEXCL' -Category 'Tampering Indicators' -Title ("Microsoft Defender has {0} exclusion(s)" -f $total) -Severity 'High' -Status 'Review' `
                 -What ("Defender is told to SKIP scanning these:`n" + $evStr) `
                 -Why 'Attackers add Defender exclusions so their malware is never scanned. Exclusions you did not set are a red flag.' `
@@ -978,31 +1197,38 @@ function Invoke-DfirTriage {
             & $add (New-DfirFinding -Id 'DFIR-DEFEXCL' -Category 'Tampering Indicators' -Title 'No Defender exclusions set' -Severity 'Info' -Status 'Clean' -What 'Defender is scanning everything (no exclusions).' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
     } catch {
-        & $add (New-DfirFinding -Id 'DFIR-DEFEXCL' -Category 'Tampering Indicators' -Title 'Could not read Defender exclusions' -Severity 'Info' -Status 'Info' -What $_.Exception.Message -Why '' -WhatToDo 'Run as Administrator for this check.' -Evidence '')
+        & $add (New-DfirFinding -Id 'DFIR-DEFEXCL' -Category 'Tampering Indicators' -Title 'Could not read Defender exclusions' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'Reading Defender preferences can require elevation or Defender may be managed by third-party AV.' -WhatToDo 'Run as Administrator for this check.' -Evidence '')
     }
 
     # ---------- 10. Hosts file tampering ----------
     try {
         $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
         if (Test-Path $hostsPath) {
-            $lines = Get-Content $hostsPath -ErrorAction Stop
-            $entries = $lines | Where-Object { $_ -and ($_ -notmatch '^\s*#') -and ($_ -match '\S') }
-            # Flag redirects of known security/update domains or unusual volume
-            $sketchy = $entries | Where-Object { $_ -match 'microsoft|windowsupdate|defender|google|bank|antivirus|mcafee|norton|update' }
-            if ($sketchy) {
+            $lines = @(Get-Content $hostsPath -ErrorAction Stop)
+            $entries = @($lines | Where-Object { $_ -and ($_ -notmatch '^\s*#') -and ($_ -match '\S') })
+            # A redirect is only sketchy if it points a sensitive domain to a NON-blackhole
+            # IP. Blocklists that send domains to 0.0.0.0 / 127.0.0.1 are benign (ad/
+            # telemetry blockers) and must not raise an Alert.
+            $sketchy = @($entries | Where-Object {
+                ($_ -match 'microsoft|windowsupdate|defender|google|bank|antivirus|mcafee|norton|update') -and
+                ($_ -notmatch '^\s*(0\.0\.0\.0|127\.0\.0\.1|::1)\s')
+            })
+            $blackholed = @($entries | Where-Object { $_ -match '^\s*(0\.0\.0\.0|127\.0\.0\.1|::1)\s' })
+            if ($sketchy.Count -gt 0) {
                 $ev = ($sketchy -join "`n")
                 & $add (New-DfirFinding -Id 'DFIR-HOSTS' -Category 'Tampering Indicators' -Title 'Hosts file redirects security/update domains' -Severity 'High' -Status 'Alert' `
-                    -What ("The hosts file contains entries that redirect well-known domains:`n" + $ev) `
-                    -Why 'Malware edits the hosts file to block antivirus/Windows Update or redirect banking/search sites to fake servers.' `
-                    -WhatToDo 'Review these lines. Unless you added them deliberately, remove them (edit as admin). The file is at ' + $hostsPath + '.' -Evidence $ev)
-            } elseif (@($entries).Count -gt 0) {
-                & $add (New-DfirFinding -Id 'DFIR-HOSTS' -Category 'Tampering Indicators' -Title ("Hosts file has {0} custom entr(y/ies)" -f @($entries).Count) -Severity 'Low' -Status 'Review' `
-                    -What ("Active hosts-file entries:`n  " + ($entries -join "`n  ")) -Why 'Custom hosts entries can be legitimate (dev work) or malicious.' -WhatToDo 'Confirm you recognise these mappings.' -Evidence ($entries -join "`n"))
+                    -What ("The hosts file redirects well-known domains to a specific server (not a blackhole):`n" + $ev) `
+                    -Why 'Malware edits the hosts file to redirect banking/search/update sites to fake servers. (Entries that merely block domains via 0.0.0.0/127.0.0.1 are treated as benign ad-blockers.)' `
+                    -WhatToDo ("Review these lines. Unless you added them deliberately, remove them (edit as admin). The file is at " + $hostsPath + ".") -Evidence $ev)
+            } elseif ($entries.Count -gt 0) {
+                $note = if ($blackholed.Count -gt 0) { " ($($blackholed.Count) look like ad/telemetry blocking via 0.0.0.0/127.0.0.1 - usually benign)" } else { '' }
+                & $add (New-DfirFinding -Id 'DFIR-HOSTS' -Category 'Tampering Indicators' -Title ("Hosts file has {0} custom entr(y/ies){1}" -f $entries.Count, $note) -Severity 'Low' -Status 'Review' `
+                    -What ("Active hosts-file entries:`n  " + ($entries -join "`n  ")) -Why 'Custom hosts entries can be legitimate (dev work, ad-blocking) or malicious.' -WhatToDo 'Confirm you recognise these mappings.' -Evidence ($entries -join "`n"))
             } else {
                 & $add (New-DfirFinding -Id 'DFIR-HOSTS' -Category 'Tampering Indicators' -Title 'Hosts file is clean' -Severity 'Info' -Status 'Clean' -What 'No custom hosts entries.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
             }
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'DFIR-HOSTS-ERR' -Category 'Tampering Indicators' -Title 'Hosts-file check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Note it as a tool issue if it persists.' -Evidence '') }
 
     Write-CoreLog -Message ("DFIR triage complete: {0} finding(s)." -f $f.Count) -Level INFO
     return $f.ToArray()
@@ -1164,12 +1390,16 @@ function Invoke-ProcessThreatScan {
             switch -regex ($cmd) {
                 '(?i)vssadmin.*delete\s+shadows'               { $hit = 'deleting Volume Shadow Copies (classic RANSOMWARE behavior!)'; $hitSev='Alert'; break }
                 '(?i)\bwbadmin\b.*delete'                      { $hit = 'deleting Windows backups (classic RANSOMWARE behavior!)'; $hitSev='Alert'; break }
+                '(?i)\bwmic\b.*shadowcopy\s+delete'            { $hit = 'deleting shadow copies via WMIC (classic RANSOMWARE behavior!)'; $hitSev='Alert'; break }
                 '(?i)(IEX|Invoke-Expression)\b.*(DownloadString|DownloadData|Net\.WebClient|Invoke-WebRequest|iwr|curl|wget)' { $hit = 'download-and-execute cradle (fileless malware pattern)'; $hitSev='Alert'; break }
+                '(?i)(DownloadString|DownloadData|Net\.WebClient|Invoke-WebRequest|iwr|curl|wget).*\|\s*(IEX|Invoke-Expression|iex)' { $hit = 'download piped into execution (fileless malware pattern)'; $hitSev='Alert'; break }
                 '(?i)\b(mshta|regsvr32|rundll32)\b.*(http|\\\\|scrobj|javascript:)' { $hit = 'system tool loading remote/script content (LOLBin abuse)'; $hitSev='Alert'; break }
                 '(?i)\b(certutil)\b.*(-urlcache|-decode|-f\s)'  { $hit = 'certutil used to download/decode a file (common malware trick)'; $hitSev='Review'; break }
                 '(?i)\b(bitsadmin)\b.*(/transfer|/create)'      { $hit = 'bitsadmin used to fetch files from the internet'; $hitSev='Review'; break }
                 '(?i)FromBase64String'                        { $hit = 'base64-decoded payload in the command line'; $hitSev='Review'; break }
-                '(?i)-enc(odedcommand)?\s+[A-Za-z0-9+/=]{24,}' { $hit = 'encoded PowerShell command (-EncodedCommand) - note: also used by many LEGITIMATE management tools'; $hitSev='Review'; break }
+                # PowerShell -EncodedCommand and its short forms (-e, -en, -ec, -enc...).
+                # -e/-ec also need to not match -ExecutionPolicy/-Command, so require base64-ish tail.
+                '(?i)(?:^|\s)-e(?:c|n|nc|nco|ncod|ncode|ncoded|ncodedc|ncodedco|ncodedcom|ncodedcomm|ncodedcomma|ncodedcomman|ncodedcommand)?\s+[A-Za-z0-9+/=]{24,}' { $hit = 'encoded PowerShell command (-EncodedCommand / -e / -ec / -en) - note: also used by some LEGITIMATE management tools'; $hitSev='Review'; break }
                 '(?i)-w(indowstyle)?\s+hidden'                { $hit = 'runs with a hidden window (used by malware, but also by some legit launchers)'; $hitSev='Review'; break }
                 default { $hit = $null }
             }
@@ -1243,82 +1473,92 @@ function Invoke-EventLogTriage {
     $add = { param($x) [void]$f.Add($x) }
     $after = (Get-Date).AddDays(-$Days)
 
+    # Always returns an ARRAY (never $null/single) so .Count is safe under StrictMode.
+    # $script:_lastQueryDenied is set when the failure looks like an access-denied,
+    # so callers can distinguish "no events" from "could not read".
+    $script:_lastQueryError = $null
     $queryEvents = {
         param($LogName, $Ids, $MaxEvents = 400)
+        $script:_lastQueryError = $null
         try {
-            return Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$Ids; StartTime=$after } -MaxEvents $MaxEvents -ErrorAction Stop
-        } catch { return $null }
+            return @(Get-WinEvent -FilterHashtable @{ LogName=$LogName; Id=$Ids; StartTime=$after } -MaxEvents $MaxEvents -ErrorAction Stop)
+        } catch {
+            # "No events were found" is a normal empty result, not an error.
+            if ($_.Exception.Message -notmatch 'No events were found') { $script:_lastQueryError = $_.Exception.Message }
+            return @()
+        }
     }
 
     $secDenied = $false
 
     # ---- Audit log cleared (very strong tamper signal) ----
     try {
-        $cleared = & $queryEvents 'Security' 1102 50
-        if ($cleared -eq $null) {
-            # distinguish "no events" from "access denied" by probing
-            try { Get-WinEvent -LogName Security -MaxEvents 1 -ErrorAction Stop | Out-Null } catch { $secDenied = $true }
+        $cleared = @(& $queryEvents 'Security' 1102 50)
+        if ($cleared.Count -eq 0 -and $script:_lastQueryError) {
+            # could not read Security log -> treat as access denied
+            $secDenied = $true
         }
-        if ($cleared) {
+        if ($cleared.Count -gt 0) {
             $ev = ($cleared | ForEach-Object { "  {0} - security log cleared" -f $_.TimeCreated }) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-CLEARED-SEC' -Category 'Event Log' -Title 'Security log was cleared' -Severity 'Critical' -Status 'Alert' `
                 -What ("The Windows Security audit log was wiped:`n" + $ev) `
                 -Why 'Clearing the security log is a deliberate act to destroy evidence. Windows does not do this on its own. This strongly suggests someone is covering their tracks.' `
                 -WhatToDo 'If you did not clear it yourself, treat this PC as potentially compromised. Preserve the machine and seek expert help if it holds important data.' -Evidence $ev)
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-CLEARED-SEC-ERR' -Category 'Event Log' -Title 'Security-log check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported here rather than silently skipped, so you know it did not run.' -WhatToDo 'Re-run as Administrator; if it keeps failing, note it as a tool issue.' -Evidence '') }
 
     # ---- System log cleared ----
     try {
-        $sysClear = & $queryEvents 'System' 104 50
-        if ($sysClear) {
-            $ev = ($sysClear | ForEach-Object { "  {0} - {1}" -f $_.TimeCreated, ($_.Message -split "`n")[0] }) -join "`n"
+        $sysClear = @(& $queryEvents 'System' 104 50)
+        if ($sysClear.Count -gt 0) {
+            $ev = ($sysClear | ForEach-Object { "  {0} - {1}" -f $_.TimeCreated, (($_.Message -split "`n")[0]) }) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-CLEARED-SYS' -Category 'Event Log' -Title 'System log was cleared' -Severity 'High' -Status 'Review' `
                 -What ("The System event log was cleared:`n" + $ev) -Why 'Can be routine maintenance, but is also used to hide driver/service tampering.' -WhatToDo 'Confirm whether you or an admin tool cleared it. If not, investigate alongside the other findings.' -Evidence $ev)
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-CLEARED-SYS-ERR' -Category 'Event Log' -Title 'System-log check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---- New service installed (persistence) ----
+    # Defender's own anti-malware kernel-mode drivers (WdFilter/MpKslDrv) install
+    # with random-looking names constantly; filter them out to avoid noise.
     try {
-        $svc = @()
-        $svc += (& $queryEvents 'System' 7045 200)
-        $svc = $svc | Where-Object { $_ }
+        $svc = @(& $queryEvents 'System' 7045 200) | Where-Object {
+            $_ -and ($_.Message -notmatch 'MpKsl|Windows Defender|WdNisDrv|WdFilter')
+        }
+        $svc = @($svc)
         if ($svc.Count -gt 0) {
             $ev = ($svc | ForEach-Object {
                 $m = $_.Message -replace "`r?`n", ' '
                 "  {0}: {1}" -f $_.TimeCreated, ($m.Substring(0,[Math]::Min(160,$m.Length)))
             }) -join "`n"
-            $sev = if ($svc.Count -ge 1) { 'Medium' } else { 'Info' }
-            & $add (New-DfirFinding -Id 'EVT-NEWSVC' -Category 'Event Log' -Title ("New service(s) installed recently: {0}" -f $svc.Count) -Severity $sev -Status 'Review' `
-                -What ("These Windows services were installed in the last $Days days:`n" + $ev) `
+            & $add (New-DfirFinding -Id 'EVT-NEWSVC' -Category 'Event Log' -Title ("New service(s) installed recently: {0}" -f $svc.Count) -Severity 'Medium' -Status 'Review' `
+                -What ("These Windows services were installed in the last $Days days (Defender's own driver installs are filtered out):`n" + $ev) `
                 -Why 'Installing a service is a common way malware stays running after reboot. Many are legitimate (apps, updates, drivers) - but attackers hide here too.' `
                 -WhatToDo 'Recognise your recent installs? Then fine. An unfamiliar service - especially one running from Temp/AppData or with a random name - should be investigated.' -Evidence $ev)
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-NEWSVC-ERR' -Category 'Event Log' -Title 'New-service check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---- Account created / added to admins ----
     try {
         $acct = New-Object System.Collections.ArrayList
-        foreach ($e in @(& $queryEvents 'Security' @(4720) 200)) { if ($e) { [void]$acct.Add("  {0} - new local user account created" -f $e.TimeCreated) } }
+        foreach ($e in @(& $queryEvents 'Security' @(4720) 200)) { if ($e) { [void]$acct.Add(("  {0} - new local user account created" -f $e.TimeCreated)) } }
         foreach ($e in @(& $queryEvents 'Security' @(4732,4728) 200)) {
             if ($e) {
-                $m = ($e.Message -split "`n" | Where-Object { $_ -match 'Group Name|Member|Account Name' } | Select-Object -First 3) -join '; '
+                $m = (@($e.Message -split "`n" | Where-Object { $_ -match 'Group Name|Member|Account Name' } | Select-Object -First 3)) -join '; '
                 [void]$acct.Add(("  {0} - account added to a group  {1}" -f $e.TimeCreated, $m.Trim()))
             }
         }
-        if ($acct.Count -gt 0) {
-            $ev = ($acct.ToArray()) -join "`n"
-            & $add (New-DfirFinding -Id 'EVT-ACCT' -Category 'Event Log' -Title ("Account changes in the last $Days days: {0}" -f $acct.Count) -Severity 'High' -Status 'Review' `
+        if (@($acct).Count -gt 0) {
+            $ev = (@($acct.ToArray())) -join "`n"
+            & $add (New-DfirFinding -Id 'EVT-ACCT' -Category 'Event Log' -Title ("Account changes in the last $Days days: {0}" -f @($acct).Count) -Severity 'High' -Status 'Review' `
                 -What ("New accounts and/or privilege-group changes:`n" + $ev) `
                 -Why 'Attackers create accounts or add themselves to Administrators to keep access. If you did not make these changes, it is a red flag.' `
                 -WhatToDo 'Cross-check with the "Investigate" account findings. Remove or disable any account you did not create.' -Evidence $ev)
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-ACCT-ERR' -Category 'Event Log' -Title 'Account-change check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator (needs the Security log).' -Evidence '') }
 
     # ---- Brute force: many failed logons ----
     try {
         $failed = @(& $queryEvents 'Security' 4625 1000)
-        $failed = $failed | Where-Object { $_ }
         if ($failed.Count -ge 10) {
             $sev = if ($failed.Count -ge 50) { 'High' } else { 'Medium' }
             & $add (New-DfirFinding -Id 'EVT-BRUTE' -Category 'Event Log' -Title ("Many failed sign-in attempts: {0}" -f $failed.Count) -Severity $sev -Status 'Review' `
@@ -1326,27 +1566,25 @@ function Invoke-EventLogTriage {
                 -Why 'A burst of failed logons can mean someone (or a bot) is trying to guess a password - common when RDP or an account is exposed to the internet.' `
                 -WhatToDo 'If this PC exposes Remote Desktop, consider disabling it (Security tab) or ensure strong passwords + account lockout. A few failures from your own typos are normal.' -Evidence ("Failed logon events: {0}" -f $failed.Count))
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-BRUTE-ERR' -Category 'Event Log' -Title 'Failed-logon check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator (needs the Security log).' -Evidence '') }
 
     # ---- Account lockouts ----
     try {
-        $lock = @(& $queryEvents 'Security' 4740 100) | Where-Object { $_ }
+        $lock = @(& $queryEvents 'Security' 4740 100)
         if ($lock.Count -gt 0) {
             & $add (New-DfirFinding -Id 'EVT-LOCKOUT' -Category 'Event Log' -Title ("Account lockout(s): {0}" -f $lock.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("An account was locked out {0} time(s) recently." -f $lock.Count) -Why 'Lockouts often accompany password-guessing attacks.' -WhatToDo 'If unexpected, review which account and whether RDP/network access is exposed.' -Evidence ("Lockout events: {0}" -f $lock.Count))
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-LOCKOUT-ERR' -Category 'Event Log' -Title 'Lockout check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
     # ---- Defender detections ----
     try {
-        $det = @()
-        $det += (& $queryEvents 'Microsoft-Windows-Windows Defender/Operational' @(1116,1117) 200)
-        $det = $det | Where-Object { $_ }
+        $det = @(& $queryEvents 'Microsoft-Windows-Windows Defender/Operational' @(1116,1117) 200)
         if ($det.Count -gt 0) {
-            $ev = ($det | Select-Object -First 15 | ForEach-Object {
-                $threat = ($_.Message -split "`n" | Where-Object { $_ -match 'Name:|Threat' } | Select-Object -First 1)
-                "  {0} - {1}" -f $_.TimeCreated, ($threat -replace '\s+',' ').Trim()
-            }) -join "`n"
+            $ev = (@($det | Select-Object -First 15 | ForEach-Object {
+                $threat = (@($_.Message -split "`n" | Where-Object { $_ -match 'Name:|Threat' } | Select-Object -First 1))
+                "  {0} - {1}" -f $_.TimeCreated, (($threat -join ' ') -replace '\s+',' ').Trim()
+            })) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-DEFENDER' -Category 'Event Log' -Title ("Microsoft Defender detected threats: {0}" -f $det.Count) -Severity 'High' -Status 'Review' `
                 -What ("Defender logged {0} detection event(s) in the last {1} days:`n{2}" -f $det.Count, $Days, $ev) `
                 -Why 'Defender already caught something. Usually it also blocked/quarantined it, but repeated detections can mean something keeps trying to run.' `
@@ -1354,28 +1592,35 @@ function Invoke-EventLogTriage {
         } else {
             & $add (New-DfirFinding -Id 'EVT-DEFENDER' -Category 'Event Log' -Title 'No Defender detections recently' -Severity 'Info' -Status 'Clean' -What ("No Defender threat detections in the last $Days days.") -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-DEFENDER-ERR' -Category 'Event Log' -Title 'Defender-log check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Confirm the Defender operational log is available.' -Evidence '') }
 
     # ---- Scheduled task created ----
     try {
-        $task = @(& $queryEvents 'Security' 4698 100) | Where-Object { $_ }
+        $task = @(& $queryEvents 'Security' 4698 100)
         if ($task.Count -gt 0) {
-            $ev = ($task | ForEach-Object { $tn = ($_.Message -split "`n" | Where-Object { $_ -match 'Task Name' } | Select-Object -First 1); "  {0} - {1}" -f $_.TimeCreated, ($tn -replace '\s+',' ').Trim() }) -join "`n"
+            $ev = (@($task | ForEach-Object { $tn = (@($_.Message -split "`n" | Where-Object { $_ -match 'Task Name' } | Select-Object -First 1)); "  {0} - {1}" -f $_.TimeCreated, (($tn -join ' ') -replace '\s+',' ').Trim() })) -join "`n"
             & $add (New-DfirFinding -Id 'EVT-TASK' -Category 'Event Log' -Title ("Scheduled task(s) created: {0}" -f $task.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("New scheduled tasks in the last $Days days:`n" + $ev) -Why 'Scheduled tasks are a favourite persistence trick. Legit apps make them too.' -WhatToDo 'Match against software you installed. Investigate unfamiliar ones in Task Scheduler.' -Evidence $ev)
         }
-    } catch { }
+        # Note: event 4698 requires "Audit Other Object Access Events" which is OFF by
+        # default, so absence of this card does NOT prove no tasks were created. The
+        # native scheduled-task check in Invoke-DfirTriage covers current tasks.
+    } catch { & $add (New-DfirFinding -Id 'EVT-TASK-ERR' -Category 'Event Log' -Title 'Scheduled-task-event check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator.' -Evidence '') }
 
-    # ---- RDP interactive logons (type 10) ----
+    # ---- RDP interactive logons (Logon Type 10) ----
+    # Match on the numeric field across locales rather than the English label.
     try {
-        $rdp = @(& $queryEvents 'Security' 4624 1000) | Where-Object { $_ -and ($_.Message -match 'Logon Type:\s*10') }
+        $rdp = @(& $queryEvents 'Security' 4624 1000) | Where-Object {
+            $_ -and ($_.Properties -and @($_.Properties).Count -ge 9 -and "$($_.Properties[8].Value)" -eq '10')
+        }
+        $rdp = @($rdp)
         if ($rdp.Count -gt 0) {
             & $add (New-DfirFinding -Id 'EVT-RDPLOGON' -Category 'Event Log' -Title ("Remote Desktop logons: {0}" -f $rdp.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("There were {0} successful Remote Desktop sign-ins in the last {1} days." -f $rdp.Count, $Days) `
                 -Why 'If you use RDP yourself this is expected. If you do NOT remote into this PC, someone else did.' `
                 -WhatToDo 'If these are not you, disable RDP (Security tab) and change passwords immediately.' -Evidence ("RDP logon events: {0}" -f $rdp.Count))
         }
-    } catch { }
+    } catch { & $add (New-DfirFinding -Id 'EVT-RDPLOGON-ERR' -Category 'Event Log' -Title 'RDP-logon check failed' -Severity 'Info' -Status 'Info' -What ("This check could not run: {0}" -f $_.Exception.Message) -Why 'A failed check is reported rather than silently skipped.' -WhatToDo 'Re-run as Administrator (needs the Security log).' -Evidence '') }
 
     if ($secDenied) {
         & $add (New-DfirFinding -Id 'EVT-DENIED' -Category 'Event Log' -Title 'Security log needs Administrator to read' -Severity 'Info' -Status 'Info' `
@@ -1483,9 +1728,68 @@ function Get-SystemArch {
 }
 
 function Get-ExternalToolsRoot {
-    $root = Join-Path $script:Core.DataPath 'tools'
-    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
-    return $root
+    <#
+      External tools run ELEVATED, so they must live where a NON-admin process
+      cannot replace the binary between download and run. %LOCALAPPDATA% is
+      user-writable and therefore unsafe for that. Use a dir under %ProgramData%
+      and lock its ACL to Administrators/SYSTEM (full) + Users (read/execute only).
+      Falls back to the per-user location only if ProgramData cannot be secured
+      (and callers refuse to run from an unsecured location while elevated).
+    #>
+    $root = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools'
+    try {
+        if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+        if (Test-IsAdmin) { Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer') }
+        return $root
+    } catch {
+        Write-CoreLog -Message ("ProgramData tools root unavailable ({0}); falling back to LOCALAPPDATA." -f $_.Exception.Message) -Level WARN
+        $fallback = Join-Path $script:Core.DataPath 'tools'
+        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        return $fallback
+    }
+}
+
+function Test-ToolsRootSecure {
+    <# True only when the tools root is under ProgramData AND locked so standard
+       Users cannot write to it. Used to refuse running an elevated tool from a
+       user-writable location (which a non-admin process could have tampered with). #>
+    $secureBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools'
+    $root = Get-ExternalToolsRoot
+    if ($root -ne $secureBase) { return $false }
+    try {
+        $acl = Get-Acl -Path $root
+        foreach ($ace in $acl.Access) {
+            $id = "$($ace.IdentityReference)"
+            if ($id -match 'Users|Everyone|Authenticated Users' -and $ace.AccessControlType -eq 'Allow') {
+                $rights = $ace.FileSystemRights.ToString()
+                if ($rights -match 'Write|Modify|FullControl|CreateFiles|CreateDirectories') { return $false }
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Set-ToolsFolderAcl {
+    <# Lock the tools folder: Administrators + SYSTEM full control; Users read &
+       execute only; disable inheritance so a user-writable parent cannot loosen it. #>
+    param([string]$Path)
+    try {
+        if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)   # disable inheritance, drop inherited
+        $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+        $system = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-18'
+        $users  = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-545'
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+        $prop = [System.Security.AccessControl.PropagationFlags]::None
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($admins,'FullControl',$inherit,$prop,'Allow')))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system,'FullControl',$inherit,$prop,'Allow')))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($users,'ReadAndExecute',$inherit,$prop,'Allow')))
+        $acl.SetOwner($admins)
+        Set-Acl -Path $Path -AclObject $acl
+    } catch {
+        Write-CoreLog -Message ("Could not lock tools folder ACL: {0}" -f $_.Exception.Message) -Level WARN
+    }
 }
 
 function Resolve-ExternalToolRelease {
@@ -1514,6 +1818,13 @@ function Resolve-ExternalToolRelease {
         throw "Could not find a Windows ($arch) asset for $($tool.Name) in release $($rel.tag_name). Assets were: $names"
     }
 
+    # GitHub populates a 'digest' field like 'sha256:abc...' on current releases.
+    # Capture it so the download can be cryptographically verified before use.
+    $digest = $null
+    try { if ($asset.PSObject.Properties.Name -contains 'digest' -and $asset.digest) { $digest = [string]$asset.digest } } catch { }
+    $sha256Expected = $null
+    if ($digest -and $digest -match '^sha256:([0-9a-fA-F]{64})$') { $sha256Expected = $Matches[1].ToUpper() }
+
     [pscustomobject]@{
         Key          = $Key
         Name         = $tool.Name
@@ -1529,6 +1840,7 @@ function Resolve-ExternalToolRelease {
         Arch         = $arch
         NeedsAdmin   = $tool.NeedsAdmin
         Published    = $rel.published_at
+        Sha256Expected = $sha256Expected   # may be $null on very old releases
     }
 }
 
@@ -1583,10 +1895,20 @@ function Install-ExternalTool {
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { return [pscustomobject]@{ Success=$false; Message="Unknown tool '$Key'."; ExePath=$null; Version=$null; Sha256=$null } }
 
+    # These tools run ELEVATED, so refuse to install anywhere a non-admin process
+    # could tamper with the binary before it runs.
+    if (-not (Test-IsAdmin)) {
+        return [pscustomobject]@{ Success=$false; Message='Administrator rights are required to install external tools to a protected location.'; ExePath=$null; Version=$null; Sha256=$null }
+    }
+
     try {
         if (-not $Resolution) { $Resolution = Resolve-ExternalToolRelease -Key $Key }
 
-        # Already installed?
+        if (-not (Test-ToolsRootSecure)) {
+            throw 'The tools folder is not in a protected (admin-only) location, so an elevated download would be unsafe. Aborting.'
+        }
+
+        # Already installed AND hash still matches a locked copy? Reuse it.
         $existing = Test-ExternalToolInstalled -Key $Key -Version $Resolution.Version
         if ($existing) {
             & $report ("{0} {1} already present - reusing." -f $tool.Name, $Resolution.Version)
@@ -1626,12 +1948,29 @@ function Install-ExternalTool {
             [void]$fs.Read($sig, 0, 4)
         } finally { $fs.Close() }
         if (-not ($sig[0] -eq 0x50 -and $sig[1] -eq 0x4B)) {
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
             throw 'Downloaded file is not a valid ZIP archive (unexpected content). Aborting for safety.'
         }
 
-        # SHA-256 for the record / user display.
-        $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+        # Compute the SHA-256 and VERIFY it against the digest GitHub advertised for
+        # this exact asset. This is the real integrity gate - if it does not match,
+        # the file is deleted and nothing is extracted or executed.
+        $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToUpper()
         & $report ("SHA-256: {0}" -f $sha)
+        $expected = $null
+        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected } } catch { }
+        if ($expected) {
+            if ($sha -ne $expected.ToUpper()) {
+                Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                throw ("SHA-256 MISMATCH. Expected {0} but got {1}. The download was corrupted or tampered with; it has been deleted and NOT run." -f $expected.ToUpper(), $sha)
+            }
+            & $report 'SHA-256 verified against the official GitHub release digest.'
+            Write-CoreLog -Message ("{0} {1} SHA-256 verified: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+        } else {
+            # No digest advertised by the API: do not silently trust it.
+            & $report 'WARNING: no official digest was advertised for this asset; integrity could not be cryptographically verified.'
+            Write-CoreLog -Message 'No GitHub digest available to verify the download; proceeding on ZIP-structure + TLS trust only.' -Level WARN
+        }
 
         & $report 'Extracting...'
         Expand-Archive -Path $zipPath -DestinationPath $installPath -Force
@@ -1639,6 +1978,12 @@ function Install-ExternalTool {
 
         $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
         if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
+
+        # Re-assert the lock on the freshly-extracted files so the elevated binary
+        # cannot be swapped by a non-admin process before it is run.
+        if ((Get-ExternalToolsRoot) -eq (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')) {
+            Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer')
+        }
 
         # Verify the binary runs (sanity + anti-corruption check). Different tools
         # expose version differently (Hayabusa uses a 'help' subcommand, not
@@ -1653,10 +1998,10 @@ function Install-ExternalTool {
         if (-not $verText) { $verText = 'ran (version banner not detected)' }
         & $report ("Verified binary: {0}" -f $verText)
 
-        # Record install metadata.
+        # Record install metadata (incl. the verified hash) for later re-verification.
         $meta = [pscustomobject]@{
             Key=$Key; Name=$tool.Name; Version=$Resolution.Version; Vendor=$tool.Vendor; License=$tool.License
-            Source=$Resolution.DownloadUrl; Sha256=$sha; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
+            Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
         }
         try { $meta | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $installPath 'install.json') -Encoding UTF8 } catch { }
         Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $Resolution.DownloadUrl)
@@ -1872,6 +2217,37 @@ function Invoke-ExternalDfirScan {
     if (-not $tool) { throw "Unknown tool '$Key'." }
     if (-not $ExePath) { $ExePath = Test-ExternalToolInstalled -Key $Key }
     if (-not $ExePath) { throw "$($tool.Name) is not installed. Download it first." }
+
+    # Re-verify the binary's hash against the hash recorded at install time BEFORE
+    # running it elevated. If the on-disk exe (or its folder) was swapped by a
+    # non-admin process, this catches it and refuses to run.
+    try {
+        $installDir = Split-Path $ExePath -Parent
+        $metaPath = Join-Path $installDir 'install.json'
+        if (Test-Path $metaPath) {
+            $meta = Get-Content $metaPath -Raw | ConvertFrom-Json
+            # The recorded Sha256 is of the ZIP, not the exe, so we additionally
+            # pin the exe hash on first verified run and compare thereafter.
+            $exeHashPath = Join-Path $installDir 'exe.sha256'
+            $curExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToUpper()
+            if (Test-Path $exeHashPath) {
+                $pinned = (Get-Content $exeHashPath -Raw).Trim().ToUpper()
+                if ($pinned -and $pinned -ne $curExeHash) {
+                    throw "The $($tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
+                }
+            } else {
+                # First run after install: pin the current hash (folder is admin-locked).
+                Set-Content -Path $exeHashPath -Value $curExeHash -Encoding ASCII
+            }
+        }
+        # Also refuse if the tools root is not admin-locked (user-writable = unsafe to run elevated).
+        if (-not (Test-ToolsRootSecure)) {
+            throw "$($tool.Name) lives in a non-protected folder; refusing to run it elevated. Re-download via Pro Tools (as admin)."
+        }
+    } catch {
+        if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { } }
+        throw
+    }
 
     switch ($tool.OutputKind) {
         'HayabusaCsv' {
