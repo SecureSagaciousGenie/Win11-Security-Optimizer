@@ -47,7 +47,37 @@ jobs:
           $bytes = [System.IO.File]::ReadAllBytes($out)
           'Bytes: {0} | first 8: {1}' -f $bytes.Length, (($bytes | Select-Object -First 8) -join ',')
           New-Item -ItemType Directory -Path fixtures-out -Force | Out-Null
-          Copy-Item -LiteralPath $out -Destination 'fixtures-out\autoruns.csv'
+          Copy-Item -LiteralPath $out -Destination 'fixtures-out\autoruns-full.csv'
+
+          # Trimmed fixture: the real header plus up to 3 real rows per
+          # category and signer class, written back as UTF-16 LE with BOM like
+          # the original. Printed gzip+base64 so it can be read from the log.
+          $lines = @([System.IO.File]::ReadAllText($out, [System.Text.Encoding]::Unicode) -split "`r?`n")
+          $header = $lines[0]
+          'Rows (parsed): {0} | lines: {1}' -f @(ConvertFrom-Csv -InputObject @($lines | Where-Object { $_ })).Count, $lines.Count
+          $keep = New-Object System.Collections.Generic.List[string]
+          $keep.Add($header)
+          $seen = @{}
+          for ($i = 1; $i -lt $lines.Count; $i++) {
+            $l = $lines[$i]
+            if (-not $l) { continue }
+            $r = @(ConvertFrom-Csv -InputObject @($header, $l))[0]
+            $cls = if (-not $r.Entry) { 'location' } elseif ($r.Signer -like '(Verified) Microsoft*') { 'ms' } elseif ($r.Signer -like '(Verified)*') { 'verified' } else { 'other' }
+            $k = '{0}|{1}' -f $r.Category, $cls
+            if (-not $seen.ContainsKey($k)) { $seen[$k] = 0 }
+            if ($seen[$k] -lt 3) { $seen[$k]++; $keep.Add($l) }
+          }
+          $fixture = 'fixtures-out\autoruns.csv'
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $fixture), (($keep -join "`r`n") + "`r`n"), [System.Text.Encoding]::Unicode)
+          $seen.Keys | Sort-Object | ForEach-Object { 'class {0} = {1}' -f $_, $seen[$_] }
+          $raw = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) $fixture))
+          $ms = New-Object System.IO.MemoryStream
+          $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+          $gz.Write($raw, 0, $raw.Length); $gz.Dispose()
+          $b64 = [Convert]::ToBase64String($ms.ToArray())
+          'FIXTURE-BEGIN bytes={0} sha256={1}' -f $raw.Length, (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
+          for ($o = 0; $o -lt $b64.Length; $o += 120) { 'B64:' + $b64.Substring($o, [Math]::Min(120, $b64.Length - $o)) }
+          'FIXTURE-END'
 
       - uses: actions/upload-artifact@v4
         with:
