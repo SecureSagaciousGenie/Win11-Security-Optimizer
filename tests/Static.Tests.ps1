@@ -64,6 +64,14 @@ Describe 'Static checks' {
             $parsed = Get-ScriptAst -Path $Path
             @(Get-ScriptScopeInClosureViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
         }
+        It '<Name> has no -OnDone or -Next block that reads a local of its caller' -ForEach $script:SrcFiles {
+            $parsed = Get-ScriptAst -Path $Path
+            @(Get-DeferredBlockLocalViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
+        }
+        It '<Name> has no UI event handler that reads a local of the function that wired it' -ForEach $script:SrcFiles {
+            $parsed = Get-ScriptAst -Path $Path
+            @(Get-HandlerLocalViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
+        }
     }
 
     Context 'Background jobs' {

@@ -1077,7 +1077,9 @@ function Set-DfirList {
 function Update-DfirFilter {
     $filter = [string]$script:State.CardFilter
     $all = @($script:State.Cards)
-    $shown = if ($filter -and $filter -ne 'All') { @($all | Where-Object { $_.Status -eq $filter }) } else { $all }
+    # Wrapped in @(): an if statement unrolls its output, so one match would be a
+    # scalar and none would be $null, and .Count below throws under StrictMode.
+    $shown = @(if ($filter -and $filter -ne 'All') { $all | Where-Object { $_.Status -eq $filter } } else { $all })
     $script:UIRef.UI.DfirList.ItemsSource = @($shown)
     if ($shown.Count -gt 0) {
         $script:UIRef.UI.DfirEmpty.Visibility = 'Collapsed'
@@ -1289,40 +1291,51 @@ function Start-ProScan {
     # stays responsive. Consent has already been captured on the UI thread; the
     # resolution object is passed in via -Vars. Progress flows through $Report
     # (injected into the runspace) -> $SharedState.Status -> the status bar.
-    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Control $script:UIRef.UI.BtnProScan -Vars @{ ProKey = $Key; ProResolution = $resolution; ProMinLevel = $MinLevel } -Work {
-        # Install if not present (consent already given on UI thread when ProResolution is set).
-        $exe = Test-ExternalToolInstalled -Key $ProKey
-        if (-not $exe) {
-            $inst = Install-ExternalTool -Key $ProKey -ConsentAccepted -Resolution $ProResolution -Progress $Report
-            if (-not $inst.Success) { return [pscustomobject]@{ Error = $inst.Message; Findings=@() } }
-            $exe = $inst.ExePath
-        }
+    # OnDone runs later from the dispatcher timer, after this function has
+    # returned, so it cannot see $tool or $Key. Everything it needs travels in
+    # the result object (Key, ToolName). Reading $tool there threw under
+    # StrictMode: every Pro Tools run ended in "Error" and no cards appeared.
+    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Control $script:UIRef.UI.BtnProScan -Vars @{ ProKey = $Key; ProName = [string]$tool.Name; ProResolution = $resolution; ProMinLevel = $MinLevel } -Work {
         try {
+            # Install if not present (consent already given on UI thread when ProResolution is set).
+            $exe = Test-ExternalToolInstalled -Key $ProKey
+            if (-not $exe) {
+                $inst = Install-ExternalTool -Key $ProKey -ConsentAccepted -Resolution $ProResolution -Progress $Report
+                if (-not $inst.Success) { return [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $inst.Message; Findings = @(); Signer = '' } }
+                $exe = $inst.ExePath
+            }
             $findings = @(Invoke-ExternalDfirScan -Key $ProKey -ExePath $exe -MinLevel $ProMinLevel -Progress $Report)
+            $signer = ''
+            $tool = Get-ExternalTool -Key $ProKey
+            if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
+                try { $signer = [string](Get-AuthenticodeSignature -LiteralPath $exe).SignerCertificate.Subject } catch { $signer = '' }
+            }
+            [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $null; Findings = $findings; Signer = $signer }
         } catch {
-            return [pscustomobject]@{ Error = $_.Exception.Message; Findings=@() }
+            [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $_.Exception.Message; Findings = @(); Signer = '' }
         }
-        $signer = ''
-        $tool = Get-ExternalTool -Key $ProKey
-        if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
-            try { $signer = [string](Get-AuthenticodeSignature -LiteralPath $exe).SignerCertificate.Subject } catch { $signer = '' }
-        }
-        [pscustomobject]@{ Error=$null; Findings=$findings; Signer=$signer }
     } -OnDone {
         param($res)
         $res = @($res) | Select-Object -First 1
+        if (-not $res) { throw 'The Pro Tools job returned nothing.' }
+        $toolName = [string]$res.ToolName
         if ($res.Error) {
-            [System.Windows.MessageBox]::Show("$($tool.Name) could not complete:`n$($res.Error)", 'Pro tool failed', 'OK', 'Error') | Out-Null
+            Write-CoreLog -Message ("{0} could not complete: {1}" -f $toolName, $res.Error) -Level ERROR
+            $script:UIRef.UI.StatusText.Text = "$toolName could not complete."
+            if (-not $script:State.SelfTest) { [System.Windows.MessageBox]::Show("$toolName could not complete:`n$($res.Error)", 'Pro tool failed', 'OK', 'Error') | Out-Null }
             return
         }
         # Merge into the Investigate list, replacing this tool's earlier cards.
         $cards = @($res.Findings)
-        $prefix = switch ($Key) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '' } }
+        $prefix = switch ([string]$res.Key) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '' } }
         Add-DfirCard -Cards $cards -ReplacePrefix $prefix
         $sigNote = ''
-        if (($res.PSObject.Properties.Name -contains 'Signer') -and $res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
-        $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s).$sigNote"
-        $script:UIRef.UI.StatusText.Text = "$($tool.Name) scan complete."
+        if ($res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
+        $script:UIRef.UI.DfirSummary.Text = "$toolName added $(@($cards).Count) result card(s).$sigNote"
+        $script:UIRef.UI.StatusText.Text = "$toolName scan complete."
+        # Make the new cards visible: reset the filter chip to All.
+        if ($script:State.CardFilter -ne 'All') { $script:UIRef.UI.FilterAll.IsChecked = $true }
+        Show-Page 'Investigate'
         try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
     }
 }
@@ -1587,7 +1600,8 @@ function Register-Handlers {
     $u.NavRestore.Add_Click({ Show-Page 'Restore' })
 
     $u.BtnRefresh.Add_Click({
-        $title = $u.PageTitle.Text
+        # $u is gone by the time this fires (Register-Handlers has returned).
+        $title = $script:UIRef.UI.PageTitle.Text
         switch ($title) {
             'Security'      { Start-SecurityScan }
             'Debloat'       { Start-BloatScan }
@@ -1700,7 +1714,10 @@ function Test-SelfTestFullScan {
         }
         if (-not $done -and (Get-Date) -lt $script:SelfTestDeadline) { return }
         $script:SelfTestTimer.Stop()
-        Test-SelfTestResult -FullScan $fs -Done $done
+        $passed = Test-SelfTestResult -FullScan $fs -Done $done
+        if ($passed -and $env:W11SO_SELFTEST_PROTOOL) {
+            if (Start-SelfTestProTool) { return }   # its timer closes the window
+        }
     } catch {
         try { $script:SelfTestTimer.Stop() } catch { Write-CoreLog -Message 'SelfTest: timer stop failed.' -Level WARN }
         Write-SelfTestLine ("SELFTEST_FAIL self-test tick: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
@@ -1725,13 +1742,122 @@ function Test-SelfTestResult {
     if ($startup -lt 0) { $problems += 'the startup list was never filled' }
     if ($script:State.Busy) { $problems += 'the busy flag is still set' }
     if ($fs) { foreach ($e in @($fs.Errors)) { $problems += [string]$e } }
-    if ($problems.Count -eq 0) { Write-SelfTestLine $script:SelfTestLine }
-    else { Write-SelfTestLine ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')) }
+    if ($problems.Count -gt 0) { Write-SelfTestLine ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')); return $false }
+
+    # Click every filter chip with no cards, exactly one Alert card and the
+    # real cards. One card or none is what crashed the Alert chip in v1.2.0.
+    $uiProblems = @(Test-SelfTestUi)
+    if ($uiProblems.Count -gt 0) { Write-SelfTestLine ("SELFTEST_FAIL ui: {0}" -f ($uiProblems -join '; ')); return $false }
+    Write-SelfTestLine 'SELFTEST_UI ok'
+    # With W11SO_SELFTEST_PROTOOL set, a Pro Tool run follows and prints the
+    # final OK line; otherwise this is the end.
+    if (-not $env:W11SO_SELFTEST_PROTOOL) { Write-SelfTestLine $script:SelfTestLine }
+    return $true
+}
+
+function Start-SelfTestProTool {
+    <# SelfTest: runs one already-installed Pro Tool through the real GUI path
+       (Start-ProScan, background job, OnDone, cards). Returns $true when a
+       timer now owns the rest of the test and will close the window. #>
+    $key = [string]$env:W11SO_SELFTEST_PROTOOL
+    if (-not (Test-ExternalToolInstalled -Key $key)) { Write-SelfTestLine ("SELFTEST_FAIL pro tool {0} is not installed; install it before the self-test" -f $key); return $false }
+    $script:SelfTestProKey = $key
+    $script:SelfTestProDeadline = (Get-Date).AddMinutes(12)
+    Start-ProScan -Key $key -MinLevel 'medium'
+    if (-not $script:State.Busy) { Write-SelfTestLine ("SELFTEST_FAIL pro tool {0} did not start: {1}" -f $key, $script:UIRef.UI.StatusText.Text); return $false }
+    $script:SelfTestProTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:SelfTestProTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:SelfTestProTimer.Add_Tick({ Test-SelfTestProTool })
+    $script:SelfTestProTimer.Start()
+    return $true
+}
+
+function Test-SelfTestProTool {
+    <# SelfTest timer tick for the Pro Tool run. #>
+    try {
+        if ($script:State.Busy -and (Get-Date) -lt $script:SelfTestProDeadline) { return }
+        $script:SelfTestProTimer.Stop()
+        $prefix = switch ($script:SelfTestProKey) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '?' } }
+        $mine = @($script:State.Cards | Where-Object { ([string]$_.Id).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) })
+        $status = [string]$script:UIRef.UI.StatusText.Text
+        Write-SelfTestLine ("SELFTEST_PROTOOL key={0} busy={1} cards={2} uiErrors={3} status={4}" -f $script:SelfTestProKey, $script:State.Busy, $mine.Count, $script:State.UiErrors, $status)
+        if ($script:State.Busy) { Write-SelfTestLine 'SELFTEST_FAIL pro tool: still running after 12 minutes' }
+        elseif ($mine.Count -lt 1) { Write-SelfTestLine ("SELFTEST_FAIL pro tool: no {0} cards were added ({1})" -f $prefix, $status) }
+        elseif ($status -notmatch 'scan complete') { Write-SelfTestLine ("SELFTEST_FAIL pro tool: status is '{0}'" -f $status) }
+        elseif ($script:State.UiErrors -gt 0) { Write-SelfTestLine 'SELFTEST_FAIL pro tool: unhandled UI errors' }
+        else { Write-SelfTestLine 'SELFTEST_PROTOOL ok'; Write-SelfTestLine $script:SelfTestLine }
+    } catch {
+        Write-SelfTestLine ("SELFTEST_FAIL pro tool tick: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
+    }
+    Close-SelfTestWindow
+}
+
+function Test-SelfTestUi {
+    <# SelfTest: drives the controls a user clicks after a scan. Returns problems. #>
+    $u = $script:UIRef.UI
+    $problems = @()
+    $real = @($script:State.Cards)
+    $oneAlert = ConvertTo-DfirCard (New-DfirFinding -Id 'SELFTEST-ALERT' -Category 'Self-test' -Title 'Self-test alert card' -Severity 'High' -Status 'Alert' -What 'x' -Why 'x' -WhatToDo 'x' -Evidence 'x')
+    $sets = @(
+        @{ Name = 'no cards';       Cards = @() },
+        @{ Name = 'one Alert card'; Cards = @($oneAlert) },
+        @{ Name = 'real cards';     Cards = $real }
+    )
+    $chips = @('FilterAlert', 'FilterReview', 'FilterInfo', 'FilterClean', 'FilterAll')
+    foreach ($set in $sets) {
+        try { $null = Set-DfirList -Cards @($set.Cards) } catch { $problems += ("Set-DfirList with {0}: {1}" -f $set.Name, $_.Exception.Message); continue }
+        foreach ($chip in $chips) {
+            $before = $script:State.UiErrors
+            try {
+                $u[$chip].IsChecked = $true
+                $shown = Get-SelfTestItemCount $u.DfirList.ItemsSource
+                Write-CoreLog -Message ("SelfTest: {0} with {1} shows {2} card(s)." -f $chip, $set.Name, $shown) -Level INFO
+            } catch { $problems += ("{0} with {1}: {2}" -f $chip, $set.Name, $_.Exception.Message) }
+            if ($script:State.UiErrors -ne $before) { $problems += ("{0} with {1} raised a UI error" -f $chip, $set.Name) }
+        }
+    }
+    try { $null = Set-DfirList -Cards $real } catch { $problems += ("restoring cards: {0}" -f $_.Exception.Message) }
+    # Refresh on the Restore & Logs page runs synchronously (Update-LogView).
+    try {
+        $null = Show-Page 'Restore'
+        $before = $script:State.UiErrors
+        $u.BtnRefresh.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        if ($script:State.UiErrors -ne $before) { $problems += 'Refresh raised a UI error' }
+        $null = Show-Page 'Investigate'
+    } catch { $problems += ("Refresh: {0}" -f $_.Exception.Message) }
+    if ($script:State.UiErrors -gt 0) { $problems += ("{0} unhandled UI error(s) during the self-test" -f $script:State.UiErrors) }
+    return $problems
 }
 
 # ============================================================================
 #  MAIN
 # ============================================================================
+function Register-CrashGuard {
+    <# Last line of defence: an exception thrown inside any button, chip or timer
+       handler bubbles up through the WPF dispatcher and, unhandled, ends
+       ShowDialog and closes the app. Catch it on the dispatcher, write the full
+       PowerShell error to the session log, tell the user and keep running. #>
+    $script:UIRef.Window.Dispatcher.Add_UnhandledException({
+        param($snd, $e)
+        $ex = $e.Exception
+        while ($ex.InnerException -and ($ex -is [System.Management.Automation.MethodInvocationException] -or $ex -is [System.Reflection.TargetInvocationException])) { $ex = $ex.InnerException }
+        $where = ''
+        try { if ($ex.ErrorRecord -and $ex.ErrorRecord.InvocationInfo) { $where = $ex.ErrorRecord.InvocationInfo.PositionMessage } } catch { }
+        try { Write-CoreLog -Message ("Unhandled UI error: {0}`n{1}`n{2}" -f $ex.Message, $where, $ex.StackTrace) -Level ERROR } catch { }
+        try { $script:State.UiErrors++ } catch { }
+        $e.Handled = $true
+        if ($script:State.SelfTest) { try { Write-SelfTestLine ("SELFTEST_UIERROR {0} | {1}" -f $ex.Message, ($where -replace '\r?\n', ' ')) } catch { }; return }
+        try {
+            $script:UIRef.UI.Busy.Visibility = 'Collapsed'
+            $script:UIRef.UI.StatusText.Text = 'Something went wrong. The details are in Restore & Logs.'
+        } catch { }
+        try {
+            [System.Windows.MessageBox]::Show(("That action failed, but the app is still running.`n`n{0}`n`nThe full error is in the Restore & Logs tab." -f $ex.Message), 'Action failed', 'OK', 'Warning') | Out-Null
+        } catch { }
+        $e.Handled = $true
+    })
+}
+
 function Start-Optimizer {
     param([switch]$SelfTest)
 
@@ -1739,7 +1865,7 @@ function Start-Optimizer {
     $info = Get-CoreSystemInfo
 
     $script:UIRef = New-OptimizerWindow
-    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; FullScan=$null; IsAdmin=[bool]$info.Admin }
+    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; FullScan=$null; IsAdmin=[bool]$info.Admin; UiErrors=0; SelfTest=[bool]$SelfTest }
 
     # header / admin badge
     $script:UIRef.UI.VersionText.Text = "v$($script:Core.Version)  -  Build $($info.Build)"
@@ -1765,6 +1891,7 @@ function Start-Optimizer {
     }
 
     Register-Handlers
+    Register-CrashGuard
     Show-Page 'Dashboard'
     try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
 
