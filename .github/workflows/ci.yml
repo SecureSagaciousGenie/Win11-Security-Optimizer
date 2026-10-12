@@ -1,0 +1,50 @@
+# CI: Pester 5 and PSScriptAnalyzer on Windows PowerShell 5.1.
+# Author: Ahmad Shaukat
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Windows PowerShell 5.1
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show engine
+        run: $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Output
+
+      - name: Install Pester 5 and PSScriptAnalyzer
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Get-Module -ListAvailable Pester, PSScriptAnalyzer | Select-Object Name, Version | Format-Table | Out-String | Write-Output
+
+      - name: Pester
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          Invoke-Pester -Path .\tests -CI -Output Detailed
+
+      - name: PSScriptAnalyzer
+        if: always()
+        run: .\tests\Invoke-Analyzer.ps1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: testResults.xml
+          if-no-files-found: ignore
