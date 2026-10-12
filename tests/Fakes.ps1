@@ -114,6 +114,7 @@ $stubs = [ordered]@{
     'Get-NetUDPEndpoint'      = '[CmdletBinding()] param()'
     'Get-LocalGroup'          = '[CmdletBinding()] param([string[]]$Name, [object[]]$SID)'
     'Get-Service'             = '[CmdletBinding()] param([Parameter(Position=0)][string[]]$Name)'
+    'Get-AppxPackage'         = '[CmdletBinding()] param([string]$Name, [switch]$AllUsers)'
 }
 foreach ($name in $stubs.Keys) {
     if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {

@@ -138,7 +138,7 @@ $ps2exeArgs = @{
     title       = 'Windows 11 Security Optimizer'
     product     = 'Windows 11 Security Optimizer'
     description = 'Audit, harden, debloat and investigate Windows 11 security.'
-    version     = '1.0.0.0'
+    version     = '1.2.0.0'
     STA         = $true
 }
 if ($RequireAdmin) { $ps2exeArgs['requireAdmin'] = $true }

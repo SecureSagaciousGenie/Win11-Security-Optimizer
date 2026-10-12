@@ -1,0 +1,104 @@
+# Release: on a v* tag, run the tests, zip the repository, write
+# SHA256SUMS.txt and attach both to the GitHub release. Any other run is a dry
+# run that keeps both as a workflow artifact only.
+# Author: Ahmad Shaukat
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+    # Branch pushes run a dry run only when this workflow changes. Path
+    # filters do not apply to tag pushes.
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    name: Package
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the version and release notes
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          core=$(grep -m1 -oP "^\s*Version\s*=\s*'\K[0-9]+\.[0-9]+\.[0-9]+(?=')" src/SecurityCore.ps1 || true)
+          if [ -z "$core" ]; then echo "::error::Could not read the version from src/SecurityCore.ps1"; exit 1; fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" != "v$core" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the tool version $core"; exit 1
+            fi
+            label="$GITHUB_REF_NAME"
+          else
+            label="v$core-dryrun-${GITHUB_SHA::7}"
+          fi
+          awk -v v="$core" 'index($0, "## [" v "]") == 1 { f = 1; next } /^## \[/ { f = 0 } f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ ! -s "$RUNNER_TEMP/notes.md" ]; then echo "::error::CHANGELOG.md has no section for $core"; exit 1; fi
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "zip=Win11-Security-Optimizer-$label.zip" >> "$GITHUB_OUTPUT"
+          echo "Version $core, release label $label"
+
+      - name: Zip the repository and write SHA256SUMS.txt
+        shell: bash
+        env:
+          ZIP: ${{ steps.ver.outputs.zip }}
+          LABEL: ${{ steps.ver.outputs.label }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=zip --prefix="Win11-Security-Optimizer-$LABEL/" -o "dist/$ZIP" HEAD
+          cd dist
+          sha256sum "$ZIP" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          listing=$(unzip -Z1 "$ZIP")
+          for f in Start.bat LICENSE README.md THIRD-PARTY-NOTICES.md CHANGELOG.md SECURITY.md \
+                   src/Optimizer.ps1 src/SecurityCore.ps1 src/Scan.ps1 config/sysmon/sysmonconfig.xml; do
+            if ! grep -qxF "Win11-Security-Optimizer-$LABEL/$f" <<< "$listing"; then echo "::error::$f is missing from the zip"; exit 1; fi
+          done
+          # Third-party programs are downloaded at runtime, never shipped.
+          if grep -iE '\.(exe|dll|sys|msi)$' <<< "$listing"; then echo "::error::The zip contains a binary"; exit 1; fi
+          # The bundled Sysmon config must keep the exact bytes its pin expects.
+          pin=$(grep -m1 -oP "SysmonConfigSha256\s*=\s*'\K[0-9A-Fa-f]{64}" ../src/features/Sysmon.ps1)
+          got=$(unzip -p "$ZIP" "Win11-Security-Optimizer-$LABEL/config/sysmon/sysmonconfig.xml" | sha256sum | cut -d' ' -f1)
+          if [ "${got,,}" != "${pin,,}" ]; then echo "::error::sysmonconfig.xml in the zip does not match its pinned SHA-256"; exit 1; fi
+          echo "Files in the zip: $(wc -l <<< "$listing")"
+
+      - name: Keep the zip and checksums as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.ver.outputs.label }}
+          path: |
+            dist/${{ steps.ver.outputs.zip }}
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ZIP: ${{ steps.ver.outputs.zip }}
+        run: |
+          set -euo pipefail
+          # A new release starts as a draft so the maintainer publishes it.
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release upload "$TAG" "dist/$ZIP" dist/SHA256SUMS.txt --clobber

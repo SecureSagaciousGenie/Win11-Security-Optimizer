@@ -51,6 +51,8 @@ namespace W11SO {
     public string Description {get;set;}
     public string AppxName {get;set;}
     public string ReinstallNote {get;set;}
+    public string Impact {get;set;}
+    public string Risk {get;set;}
   }
   public class StartupRow : NotifyBase {
     private bool _en;
@@ -332,7 +334,8 @@ $script:Xaml = @'
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnBloatScan" Style="{StaticResource Primary}" Content="Scan Installed Apps"/>
-            <Button x:Name="BtnBloatSelectRec" Style="{StaticResource Ghost}" Content="Select Recommended" Margin="10,0,0,0"/>
+            <Button x:Name="BtnBloatSelectRec" Style="{StaticResource Ghost}" Content="Preset: Recommended" Margin="10,0,0,0"/>
+            <Button x:Name="BtnBloatSelectMin" Style="{StaticResource Ghost}" Content="Preset: Minimal" Margin="10,0,0,0"/>
             <Button x:Name="BtnBloatClear" Style="{StaticResource Ghost}" Content="Clear" Margin="10,0,0,0"/>
           </StackPanel>
           <ListView x:Name="BloatList" Grid.Row="1">
@@ -343,7 +346,11 @@ $script:Xaml = @'
                 </GridViewColumn>
                 <GridViewColumn Header="App" Width="220" DisplayMemberBinding="{Binding Name}"/>
                 <GridViewColumn Header="Category" Width="110" DisplayMemberBinding="{Binding Category}"/>
-                <GridViewColumn Header="What it is / why remove it" Width="430" >
+                <GridViewColumn Header="Impact" Width="70" DisplayMemberBinding="{Binding Impact}"/>
+                <GridViewColumn Header="If removed" Width="230">
+                  <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Risk}" TextWrapping="Wrap"/></DataTemplate></GridViewColumn.CellTemplate>
+                </GridViewColumn>
+                <GridViewColumn Header="What it is / why remove it" Width="330" >
                   <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Description}" TextWrapping="Wrap" Foreground="#8B949E"/></DataTemplate></GridViewColumn.CellTemplate>
                 </GridViewColumn>
               </GridView>
@@ -493,7 +500,7 @@ function New-OptimizerWindow {
         'PageDashboard','PageSecurity','PageDebloat','PageInvestigate','PageStartup','PageRestore',
         'CardScore','CardGrade','CardIssues','CardDfir','CardBloat','BtnFullScan',
         'BtnSecScan','BtnSecFixSafe','ChkHighRisk','SecList',
-        'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
+        'BtnBloatScan','BtnBloatSelectRec','BtnBloatSelectMin','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
         'FilterAll','FilterAlert','FilterReview','FilterInfo','FilterClean','DfirEmpty','BtnSaveReport','BtnEvidencePack',
         'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText','ChipSysmon','ChipSysmonText',
@@ -788,6 +795,7 @@ function Start-BloatScan {
             $row.Selected=$false; $row.Name=$a.Name; $row.Publisher=$a.Publisher; $row.Category=$a.Category
             $row.Version=$a.Version; $row.Description=$a.Description; $row.AppxName=$a.PackageFullName
             $row.ReinstallNote=$a.ReinstallNote
+            $row.Impact=[string]$a.Impact; $row.Risk=[string]$a.Risk
             # keep the wildcard for removal + a 'Recommended' hint
             $row | Add-Member -NotePropertyName Wildcard -NotePropertyValue (Get-DebloatWildcard $a.Key) -Force
             $row | Add-Member -NotePropertyName Recommended -NotePropertyValue $a.Recommended -Force
@@ -817,8 +825,9 @@ function Invoke-BloatRemove {
         [System.Windows.MessageBox]::Show("Removing apps needs administrator rights. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
         return
     }
-    $list = ($selected | ForEach-Object { " - $($_.Name)" }) -join "`n"
-    $r = [System.Windows.MessageBox]::Show("Remove these $($selected.Count) app(s)?`n`n$list`n`nAll are reinstallable from the Microsoft Store. A restore point is created first and the removal is logged.", 'Confirm removal', 'YesNo', 'Question')
+    # One line per app keeps the buttons on screen even with every app ticked.
+    $list = ($selected | ForEach-Object { " - {0} ({1} impact). {2}" -f $_.Name, $_.Impact, $_.ReinstallNote }) -join "`n"
+    $r = [System.Windows.MessageBox]::Show("Remove these $($selected.Count) app(s)?`n`n$list`n`nA restore point is created first and every removal is logged. See docs\REINSTALL.md for more ways to reinstall.", 'Confirm removal', 'YesNo', 'Question', 'No')
     if ($r -ne 'Yes') { return }
 
     Set-Busy -Text 'Removing selected apps...'
@@ -1553,7 +1562,8 @@ function Register-Handlers {
     )
 
     $u.BtnBloatScan.Add_Click({ Start-BloatScan })
-    $u.BtnBloatSelectRec.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = [bool]$r.Recommended } } })
+    $u.BtnBloatSelectRec.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = (Test-DebloatPreset -Entry $r -Preset 'Recommended') } } })
+    $u.BtnBloatSelectMin.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = (Test-DebloatPreset -Entry $r -Preset 'Minimal') } } })
     $u.BtnBloatClear.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = $false } } })
     $u.BtnBloatRemove.Add_Click({ Invoke-BloatRemove })
 
