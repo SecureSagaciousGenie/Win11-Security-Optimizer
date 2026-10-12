@@ -17,7 +17,7 @@ Describe 'Reporting and responder actions' {
             $script:Html = New-HtmlReport -SecurityFindings @(
                 (New-Finding -Id 'WDIGEST' -Category 'c' -Name 'WDigest <b>bold</b>' -Severity 'High' -Status 'Fail' -Observed '1' -Expected '0' -Advice 'Fix it & go')
             ) -Score ([pscustomobject]@{ Score = 82; Grade = 'B' }) -DfirCards @(
-                (New-DfirFinding -Id 'DFIR-X' -Category 'c' -Title '<script>alert(1)</script>' -Severity 'High' -Status 'Alert' -What 'C:\Users\bob\evil.exe "x"' -Why 'why' -WhatToDo 'do' -Paths @('C:\Users\bob\evil.exe')),
+                (New-DfirFinding -Id 'DFIR-X' -Category 'c' -Title '<script>alert(1)</script>' -Severity 'High' -Status 'Alert' -What 'C:\Users\bob\evil.exe "x"' -Why 'why' -WhatToDo "do this`nSearch for: thing" -Evidence 'Threat: <b onmouseover=alert(2)>x</b>' -Paths @('C:\Users\bob\evil.exe')),
                 (New-DfirFinding -Id 'DRIFT-LOCALADMINS-HIGH' -Category 'c' -Title 'New since 2026-10-01: 1 local administrators' -Severity 'High' -Status 'Alert'),
                 (New-DfirFinding -Id 'AUTORUNS-SERVICES' -Category 'c' -Title 'Services: 2 entries to review' -Severity 'Medium' -Status 'Review')
             ) -Changes @([pscustomobject]@{ Time = '2026-10-12T10:00:00'; Change = 'Set HKLM:\x = <1>' }) -RollbackPath 'C:\ProgramData\Win11SecurityOptimizer\backups\Rollback_1.ps1' `
@@ -26,6 +26,11 @@ Describe 'Reporting and responder actions' {
         It 'HTML-encodes a finding title containing a script tag' {
             $script:Html | Should -Match ([regex]::Escape('&lt;script&gt;alert(1)&lt;/script&gt;'))
             $script:Html | Should -Not -Match '<script'
+        }
+        It 'shows card evidence, encoded, and keeps the line breaks of the next steps' {
+            $script:Html | Should -Match ([regex]::Escape('Threat: &lt;b onmouseover=alert(2)&gt;x&lt;/b&gt;'))
+            $script:Html | Should -Not -Match '<b onmouseover'
+            $script:Html | Should -Match ([regex]::Escape('do this<br>Search for: thing'))
         }
         It 'encodes every other dynamic value' {
             $script:Html | Should -Match ([regex]::Escape('WDigest &lt;b&gt;bold&lt;/b&gt;'))

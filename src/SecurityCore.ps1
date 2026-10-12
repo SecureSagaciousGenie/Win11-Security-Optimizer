@@ -2915,7 +2915,8 @@ function ConvertFrom-HayabusaCsv {
         return $f.ToArray()
     }
     $rows = @()
-    try { $rows = Import-Csv -Path $CsvPath -ErrorAction Stop } catch { }
+    # Hayabusa writes UTF-8; Windows PowerShell would otherwise read the ANSI code page.
+    try { $rows = Import-Csv -LiteralPath $CsvPath -Encoding UTF8 -ErrorAction Stop } catch { Write-CoreLog -Message ("Hayabusa CSV could not be read: {0}" -f $_.Exception.Message) -Level WARN }
     if (@($rows).Count -eq 0) {
         [void]$f.Add((New-DfirFinding -Id 'HAYA-CLEAN' -Category 'Hayabusa (event-log hunt)' -Title 'Hayabusa found no detections' -Severity 'Info' -Status 'Clean' -What 'Hayabusa scanned the event logs and did not flag anything at the chosen level.' -Why '' -WhatToDo 'No action needed.' -Evidence ''))
         return $f.ToArray()
@@ -2929,6 +2930,9 @@ function ConvertFrom-HayabusaCsv {
     $colChan  = ($cols | Where-Object { $_ -match '(Channel)' } | Select-Object -First 1)
     $colEid   = ($cols | Where-Object { $_ -match '(EventID|EvtID|Event ID)' } | Select-Object -First 1)
     $colComp  = ($cols | Where-Object { $_ -match '(Computer)' } | Select-Object -First 1)
+    $colDet   = ($cols | Where-Object { $_ -match '^Details$' } | Select-Object -First 1)
+    $colExtra = ($cols | Where-Object { $_ -match '^ExtraFieldInfo$' } | Select-Object -First 1)
+    $colRule  = ($cols | Where-Object { $_ -match '^(RuleID|RuleFile)$' } | Select-Object -First 1)
     if (-not $colTitle) { $colTitle = $cols | Select-Object -First 1 }
 
     # Summary card
@@ -2952,17 +2956,37 @@ function ConvertFrom-HayabusaCsv {
     foreach ($r in $ranked) {
         if ($shown -ge $MaxCards) { break }
         $shown++
-        $samples = $r.Group.Group | Select-Object -First 3 | ForEach-Object {
-            $t = if ($colTime) { $_.$colTime } else { '' }
-            $ch = if ($colChan) { $_.$colChan } else { '' }
-            $eid = if ($colEid) { $_.$colEid } else { '' }
-            ("  {0}  channel={1} eventID={2}" -f $t, $ch, $eid)
+        # The event behind the rule, its details (threat, file, account, program)
+        # and concrete search terms, so the card can be acted on as it stands.
+        $first = @($r.Group.Group)[0]
+        $chan = if ($colChan) { [string]$first.$colChan } else { '' }
+        $eid = if ($colEid) { [string]$first.$colEid } else { '' }
+        $guide = Get-EventGuidance -Channel $chan -EventId $eid
+        $lines = New-Object System.Collections.ArrayList
+        $allDetail = New-Object System.Collections.ArrayList
+        $paths = New-Object System.Collections.ArrayList
+        foreach ($row in @($r.Group.Group | Select-Object -First 3)) {
+            $t = if ($colTime) { [string]$row.$colTime } else { '' }
+            $comp = if ($colComp) { [string]$row.$colComp } else { '' }
+            $rc = Resolve-EventChannel -Channel $(if ($colChan) { [string]$row.$colChan } else { '' })
+            $re = if ($colEid) { [string]$row.$colEid } else { '' }
+            [void]$lines.Add(("{0} | {1} | {2} event {3}" -f $t, $comp, $rc, $re))
+            $det = if ($colDet) { [string]$row.$colDet } else { '' }
+            if ($det -and $det -ne '-') {
+                [void]$lines.Add(('    ' + (Limit-Text -Text $det -Max 400)))
+                [void]$allDetail.Add($det)
+                foreach ($p in @(Get-EventFilePath -Text $det -Fields (ConvertFrom-HayabusaDetail -Text $det))) { if (-not ($paths -contains $p)) { [void]$paths.Add($p) } }
+            }
+            $extra = if ($colExtra) { [string]$row.$colExtra } else { '' }
+            if ($extra -and $extra -ne '-') { [void]$lines.Add(('    ' + (Limit-Text -Text $extra -Max 200))) }
         }
-        $ev = ($samples -join "`n")
+        if ($colRule -and [string]$first.$colRule) { [void]$lines.Add(("Rule: {0}" -f [string]$first.$colRule)) }
+        $search = @(Get-DetectionSearchTerm -RuleTitle $r.Title -Channel $chan -EventId $eid -DetailText ($allDetail -join "`n") -Path @($paths))
         [void]$f.Add((New-DfirFinding -Id ("HAYA-{0}" -f $shown) -Category 'Hayabusa (event-log hunt)' -Title ("[{0}] {1}" -f $r.LevelRaw, $r.Title) -Severity $r.Sev -Status $r.Status `
-            -What ("Hayabusa matched this detection {0} time(s) in your event logs." -f $r.Count) `
-            -Why 'This rule corresponds to a known attacker technique or suspicious activity recorded by Windows.' `
-            -WhatToDo 'Look at the sample events below. If this is not activity you recognise, investigate the affected account/time. Full details are in the Hayabusa CSV (Restore & Logs tab).' -Evidence $ev))
+            -What (Format-MatchSummary -Tool 'Hayabusa' -Count $r.Count -Guidance $guide) `
+            -Why 'Hayabusa flags patterns attackers use; legitimate software can match too. The events below show which program, file or account was involved.' `
+            -WhatToDo (Format-DetectionGuidance -Guidance $guide -SearchTerm $search -FullReport $CsvPath) -Evidence ($lines -join "`n") `
+            -Paths @(Get-ExistingFilePath -Path @($paths))))
     }
     if (@($ranked).Count -gt $shown) {
         [void]$f.Add((New-DfirFinding -Id 'HAYA-MORE' -Category 'Hayabusa (event-log hunt)' -Title ("+ {0} more rule(s) in the full report" -f (@($ranked).Count - $shown)) -Severity 'Info' -Status 'Info' -What 'Additional lower-priority detections were truncated here.' -Why '' -WhatToDo ("Open the full CSV: {0}" -f $CsvPath) -Evidence ''))
@@ -2997,7 +3021,9 @@ function ConvertFrom-ChainsawJson {
         try { if ($d.PSObject.Properties.Name -contains 'level') { $level = $d.level } } catch { }
         try { if ($d.PSObject.Properties.Name -contains 'timestamp') { $ts = $d.timestamp } } catch { }
         if (-not $name) { $name = 'Detection' }
-        [pscustomobject]@{ Name=$name; Level=$level; Ts=$ts }
+        $info = $null
+        try { $info = Get-ChainsawEventInfo -Detection $d } catch { Write-CoreLog -Message ("Chainsaw detection details could not be read: {0}" -f $_.Exception.Message) -Level DEBUG }
+        [pscustomobject]@{ Name=$name; Level=$level; Ts=$ts; Info=$info }
     }
     $minRank = Get-ExternalLevelRank -Level $MinLevel
     $norm = @($norm | Where-Object { (Get-ExternalLevelRank -Level ([string]$_.Level)) -ge $minRank })
@@ -3025,11 +3051,30 @@ function ConvertFrom-ChainsawJson {
     foreach ($r in $ranked) {
         if ($shown -ge $MaxCards) { break }
         $shown++
-        $samples = $r.Group.Group | Select-Object -First 3 | ForEach-Object { "  {0}" -f $_.Ts }
+        # The event behind the rule, its fields and concrete search terms.
+        $first = @($r.Group.Group)[0]
+        $chan = if ($first.Info) { [string]$first.Info.Channel } else { '' }
+        $eid = if ($first.Info) { [string]$first.Info.EventId } else { '' }
+        $guide = Get-EventGuidance -Channel $chan -EventId $eid
+        $lines = New-Object System.Collections.ArrayList
+        $allDetail = New-Object System.Collections.ArrayList
+        $paths = New-Object System.Collections.ArrayList
+        foreach ($s in @($r.Group.Group | Select-Object -First 3)) {
+            if (-not $s.Info) { [void]$lines.Add([string]$s.Ts); continue }
+            [void]$lines.Add(("{0} | {1} | {2} event {3}" -f $s.Ts, $s.Info.Computer, $s.Info.Channel, $s.Info.EventId))
+            $fieldText = Format-EventField -Fields $s.Info.Fields
+            if ($fieldText) {
+                [void]$lines.Add(('    ' + $fieldText))
+                [void]$allDetail.Add($fieldText)
+                foreach ($p in @(Get-EventFilePath -Text $fieldText -Fields $s.Info.Fields)) { if (-not ($paths -contains $p)) { [void]$paths.Add($p) } }
+            }
+        }
+        $search = @(Get-DetectionSearchTerm -RuleTitle $r.Title -Channel $chan -EventId $eid -DetailText ($allDetail -join "`n") -Path @($paths))
         [void]$f.Add((New-DfirFinding -Id ("CHAIN-{0}" -f $shown) -Category 'Chainsaw (event-log hunt)' -Title ("[{0}] {1}" -f $r.LevelRaw, $r.Title) -Severity $r.Sev -Status $r.Status `
-            -What ("Chainsaw matched this rule {0} time(s) in your event logs." -f $r.Count) `
-            -Why 'This Sigma rule corresponds to a known attacker technique recorded by Windows.' `
-            -WhatToDo 'Review the sample timestamps below. If unexpected, investigate. Full details are in the Chainsaw JSON (Restore & Logs tab).' -Evidence (($samples) -join "`n")))
+            -What (Format-MatchSummary -Tool 'Chainsaw' -Count $r.Count -Guidance $guide) `
+            -Why 'Chainsaw flags patterns from Sigma rules that attackers use; legitimate software can match too. The events below show which program, file or account was involved.' `
+            -WhatToDo (Format-DetectionGuidance -Guidance $guide -SearchTerm $search -FullReport $JsonPath) -Evidence ($lines -join "`n") `
+            -Paths @(Get-ExistingFilePath -Path @($paths))))
     }
     if (@($ranked).Count -gt $shown) {
         [void]$f.Add((New-DfirFinding -Id 'CHAIN-MORE' -Category 'Chainsaw (event-log hunt)' -Title ("+ {0} more rule(s) in the full report" -f (@($ranked).Count - $shown)) -Severity 'Info' -Status 'Info' -What 'Additional lower-priority detections were truncated here.' -Why '' -WhatToDo ("Open the full JSON: {0}" -f $JsonPath) -Evidence ''))
@@ -3085,7 +3130,7 @@ function Invoke-ExternalDfirScan {
 #  and a stray .ps1 dropped into the folder is never run. Build-Exe.ps1 inlines
 #  the same list in the same order and drops this block.
 # ----------------------------------------------------------------------------
-$script:FeatureFiles = @('Common.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
+$script:FeatureFiles = @('Common.ps1', 'EventGuidance.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
 foreach ($featureFile in $script:FeatureFiles) {
     . (Join-Path (Join-Path $PSScriptRoot 'features') $featureFile)
 }

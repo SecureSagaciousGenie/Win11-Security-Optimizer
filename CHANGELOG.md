@@ -73,6 +73,12 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
   showed no cards. Chainsaw also refused its own verified install, and its
   stderr output aborted the hunt.
 - The Refresh button failed on every page.
+- Hayabusa and Chainsaw cards said only "look at the sample events" and showed
+  none. They now say which Windows event matched and what it means, show the
+  real events (computer, threat name, file, account, program), give a next
+  step and concrete search terms, and offer Open location and Scan with
+  Defender for files that still exist. Every card shows its evidence, and Copy
+  details and the HTML report include it.
 - An error inside any button or timer now shows a message and is logged; the
   app stays open.
 - The CI self-test clicks Run Full Scan, every filter chip, Refresh, Deep Scan,

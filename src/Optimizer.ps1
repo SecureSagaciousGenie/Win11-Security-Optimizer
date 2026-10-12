@@ -405,6 +405,12 @@ $script:Xaml = @'
                           <TextBlock Text="{Binding WhatToDo}" TextWrapping="Wrap" Margin="0,4,0,0" Foreground="{StaticResource Text}"/>
                         </StackPanel>
                       </Border>
+                      <Border Background="#10151D" CornerRadius="6" Padding="10" Margin="0,10,0,0" Visibility="{Binding EvidenceVis}">
+                        <StackPanel>
+                          <TextBlock Text="Evidence" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="12"/>
+                          <TextBox Text="{Binding Evidence, Mode=OneWay}" IsReadOnly="True" TextWrapping="Wrap" BorderThickness="0" Background="Transparent" Foreground="{StaticResource Muted}" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0"/>
+                        </StackPanel>
+                      </Border>
                       <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                         <Button Style="{StaticResource Ghost}" Content="Scan with Defender" Tag="{Binding}" Visibility="{Binding ScanVis}" Margin="0,0,8,0"/>
                         <Button Style="{StaticResource Ghost}" Content="Open location" Tag="{Binding}" Visibility="{Binding OpenVis}" Margin="0,0,8,0"/>
@@ -731,6 +737,8 @@ function ConvertTo-DfirCard {
     $f | Add-Member -NotePropertyName AccentBrush -NotePropertyValue (Get-Brush $hex) -Force
     $f | Add-Member -NotePropertyName WhyVis -NotePropertyValue $(if ($f.Why) { 'Visible' } else { 'Collapsed' }) -Force
     $f | Add-Member -NotePropertyName DoVis  -NotePropertyValue $(if ($f.WhatToDo) { 'Visible' } else { 'Collapsed' }) -Force
+    $hasEvidence = ($f.PSObject.Properties.Name -contains 'Evidence') -and [string]$f.Evidence
+    $f | Add-Member -NotePropertyName EvidenceVis -NotePropertyValue $(if ($hasEvidence) { 'Visible' } else { 'Collapsed' }) -Force
     $paths = @()
     if ($f.PSObject.Properties.Name -contains 'Paths') { $paths = @($f.Paths | Where-Object { $_ }) }
     $f | Add-Member -NotePropertyName ScanVis -NotePropertyValue $(if ($paths.Count -gt 0 -and $script:State.IsAdmin) { 'Visible' } else { 'Collapsed' }) -Force
@@ -1147,6 +1155,7 @@ function Format-CardText {
     $lines = @($Card.Title, ('Severity: {0} | Status: {1}' -f $Card.Severity, $Card.Status), '', [string]$Card.What)
     if ($Card.Why) { $lines += @('', 'Why it matters: ' + $Card.Why) }
     if ($Card.WhatToDo) { $lines += @('', 'What to do: ' + $Card.WhatToDo) }
+    if (($Card.PSObject.Properties.Name -contains 'Evidence') -and $Card.Evidence) { $lines += @('', 'Evidence:', [string]$Card.Evidence) }
     if (($Card.PSObject.Properties.Name -contains 'Paths') -and @($Card.Paths).Count -gt 0) { $lines += @('', 'Files:') + @($Card.Paths | ForEach-Object { '  ' + $_ }) }
     return ($lines -join "`r`n")
 }
@@ -1849,14 +1858,22 @@ function Get-SelfTestStep {
         } })
     [void]$steps.Add(@{ Name = 'Card: Copy details'; Minutes = 1
         Start = {
-            $card = @($script:State.Cards) | Select-Object -First 1
+            $card = @(@($script:State.Cards | Where-Object { $_.Evidence }) + @($script:State.Cards)) | Select-Object -First 1
             if (-not $card) { return 'SKIP: no card to copy' }
+            $script:SelfTestCopied = $card
             # A routed Click from a card button, as the card template raises it.
             $btn = New-Object System.Windows.Controls.Button
             $btn.Content = 'Copy details'; $btn.Tag = $card
             $script:UIRef.UI.DfirList.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent), $btn))
         }
-        Check = { if ($script:UIRef.UI.StatusText.Text -ne 'Card details copied to the clipboard.') { "status is '{0}'" -f $script:UIRef.UI.StatusText.Text } } })
+        Check = {
+            $p = @()
+            if ($script:UIRef.UI.StatusText.Text -ne 'Card details copied to the clipboard.') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
+            $clip = [string](Get-Clipboard -Raw)
+            if ($clip -notmatch [regex]::Escape([string]$script:SelfTestCopied.Title)) { $p += 'the clipboard does not hold the card title' }
+            if ($script:SelfTestCopied.Evidence -and $clip -notmatch 'Evidence:') { $p += 'the copied text has no evidence' }
+            $p
+        } })
     [void]$steps.Add(@{ Name = 'Save report'; Minutes = 2
         Start = { $script:SelfTestLastSave = $null; Show-Page 'Restore'; Invoke-SelfTestClick $script:UIRef.UI.BtnSaveReport }
         Check = {
@@ -1897,6 +1914,13 @@ function Get-SelfTestStep {
                 $p = @()
                 $mine = @($script:State.Cards | Where-Object { ([string]$_.Id).StartsWith($step.Prefix, [System.StringComparison]::OrdinalIgnoreCase) })
                 if ($mine.Count -lt 1) { $p += ("no {0} cards were added" -f $step.Prefix) }
+                # Rule cards must carry the real events and something to search for.
+                $rules = @($mine | Where-Object { ([string]$_.Id) -match '^(HAYA|CHAIN)-\d+$' })
+                foreach ($c in @($rules | Select-Object -First 3)) {
+                    Write-SelfTestLine (("SELFTEST_CARD {0} | {1} | What: {2} | Do: {3} | Evidence: {4}" -f $c.Id, $c.Title, $c.What, $c.WhatToDo, $c.Evidence) -replace '\r?\n', ' / ')
+                    if ([string]$c.Evidence -notmatch ' event \d+') { $p += ("{0} has no event lines in its evidence" -f $c.Id) }
+                    if ([string]$c.WhatToDo -notmatch 'Search for: ') { $p += ("{0} has no search terms" -f $c.Id) }
+                }
                 if ($script:UIRef.UI.StatusText.Text -notmatch 'scan complete') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
                 $p
             } })

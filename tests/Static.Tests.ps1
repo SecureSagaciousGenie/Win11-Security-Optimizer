@@ -168,6 +168,11 @@ Describe 'Static checks' {
             $defined = @([regex]::Matches($main, 'x:Name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
             @($wanted | Where-Object { $defined -notcontains $_ }) | Should -BeNullOrEmpty
         }
+        It 'shows each Investigate card''s evidence, read-only and selectable' {
+            $main = @(Get-XamlStringFromScript -Path (Join-Path (Get-RepoRoot) 'src\Optimizer.ps1') | Where-Object { $_.Name -eq 'script:Xaml' })[0].Xaml
+            $main | Should -Match ([regex]::Escape('Visibility="{Binding EvidenceVis}"'))
+            $main | Should -Match ([regex]::Escape('<TextBox Text="{Binding Evidence, Mode=OneWay}" IsReadOnly="True"'))
+        }
         It '<Name> (line <Line>) loads with XamlReader' -ForEach $script:XamlCases -Skip:(-not $script:OnWindows) {
             Invoke-XamlLoad -Xaml $Xaml | Should -Not -BeNullOrEmpty
         }

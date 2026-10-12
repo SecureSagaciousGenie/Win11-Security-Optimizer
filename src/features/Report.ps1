@@ -80,7 +80,8 @@ function New-HtmlReport {
             [void]$x.AppendLine(('<div class="card {0}"><div class="card-head"><span class="badge {0}">{1}</span> <span class="status">{2}</span> <strong>{3}</strong></div>' -f $cls, (& $h $c.Severity), (& $h $c.Status), (& $h $c.Title)))
             if ($c.What) { [void]$x.AppendLine(('<pre>{0}</pre>' -f (& $h $c.What))) }
             if ($c.Why) { [void]$x.AppendLine(('<p><em>Why it matters:</em> {0}</p>' -f (& $h $c.Why))) }
-            if ($c.WhatToDo) { [void]$x.AppendLine(('<p><em>What to do:</em> {0}</p>' -f (& $h $c.WhatToDo))) }
+            if ($c.WhatToDo) { [void]$x.AppendLine(('<p><em>What to do:</em> {0}</p>' -f ((& $h $c.WhatToDo) -replace '\r?\n', '<br>'))) }
+            if (($c.PSObject.Properties.Name -contains 'Evidence') -and $c.Evidence) { [void]$x.AppendLine(('<pre class="muted">{0}</pre>' -f (& $h $c.Evidence))) }
             $paths = @()
             if ($c.PSObject.Properties.Name -contains 'Paths') { $paths = @($c.Paths | Where-Object { $_ }) }
             if ($paths.Count -gt 0) { [void]$x.AppendLine(('<p class="muted">Files: {0}</p>' -f ((@($paths | ForEach-Object { & $h $_ })) -join '; '))) }

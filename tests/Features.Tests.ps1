@@ -53,7 +53,7 @@ Describe 'Features' {
         It 'lists every feature file explicitly and in a fixed order' {
             $parsed = Get-ScriptAst -Path (Join-Path $script:RepoRoot 'src\SecurityCore.ps1')
             $listed = @(Get-FeatureFileList -Ast $parsed.Ast)
-            $listed | Should -Be @('Common.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
+            $listed | Should -Be @('Common.ps1', 'EventGuidance.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
             $onDisk = @(Get-ChildItem -LiteralPath (Join-Path $script:RepoRoot 'src\features') -Filter *.ps1 | ForEach-Object { $_.Name } | Sort-Object)
             $onDisk | Should -Be @($listed | Sort-Object)
         }
