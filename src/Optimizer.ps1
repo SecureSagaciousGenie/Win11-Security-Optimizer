@@ -535,7 +535,10 @@ function Invoke-Background {
         [Parameter(Mandatory)]$OnDone,
         [string]$Status = 'Working...',
         [hashtable]$Vars = @{},
-        $Control = $null
+        $Control = $null,
+        # Runs after this job ends and the busy flag is cleared, so it can start
+        # the next job of a chain. Gets the error text, or '' on success.
+        [scriptblock]$Next = $null
     )
     # One background job at a time. A second click while busy is ignored with a
     # status message instead of starting overlapping scans.
@@ -590,19 +593,25 @@ function Invoke-Background {
             try { $result = $ps.EndInvoke($handle) } catch { $err = $_ }
             try { $ps.Dispose() } catch { }
             try { $rs.Close(); $rs.Dispose() } catch { }
+            $failure = ''
             try {
                 $ui.Busy.Visibility = 'Collapsed'
                 $ui.StatusText.Text = 'Ready.'
                 if ($err) {
-                    $ui.StatusText.Text = "Error: $($err.Exception.Message)"
+                    $failure = [string]$err.Exception.Message
+                    $ui.StatusText.Text = "Error: $failure"
                 } else {
                     & $OnDone $result
                 }
             } catch {
-                try { $ui.StatusText.Text = "Error: $($_.Exception.Message)" } catch { }
+                $failure = [string]$_.Exception.Message
+                try { $ui.StatusText.Text = "Error: $failure" } catch { }
             } finally {
                 $state.Busy = $false
                 if ($Control) { try { $Control.IsEnabled = $true } catch { } }
+            }
+            if ($Next) {
+                try { & $Next $failure } catch { try { $ui.StatusText.Text = "Error: $($_.Exception.Message)" } catch { } }
             }
         }
     }.GetNewClosure())
@@ -681,7 +690,8 @@ function Update-LogView {
 #  ACTIONS: SECURITY
 # ============================================================================
 function Start-SecurityScan {
-    Invoke-Background -Status 'Scanning security settings...' -Work {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Scanning security settings...' -Next $Next -Work {
         $f = Invoke-SecurityScan
         [pscustomobject]@{ Findings=$f; Score=(Get-SecurityScore $f) }
     } -OnDone {
@@ -787,7 +797,8 @@ function Find-VisualChildren {
 #  ACTIONS: DEBLOAT
 # ============================================================================
 function Start-BloatScan {
-    Invoke-Background -Status 'Scanning installed apps...' -Work { Get-DebloatInventory } -OnDone {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Scanning installed apps...' -Next $Next -Work { Get-DebloatInventory } -OnDone {
         param($inv)
         $rows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         foreach ($a in @($inv)) {
@@ -848,9 +859,9 @@ function Invoke-BloatRemove {
 #  ACTIONS: DFIR
 # ============================================================================
 function Start-DfirScan {
-    param([switch]$Deep)
+    param([switch]$Deep, [scriptblock]$Next = $null)
     $statusMsg = if ($Deep) { 'Running deep scan (processes + event logs)...' } else { 'Investigating this PC...' }
-    Invoke-Background -Status $statusMsg -Vars @{ DeepFlag = [bool]$Deep } -Work {
+    Invoke-Background -Status $statusMsg -Next $Next -Vars @{ DeepFlag = [bool]$Deep } -Work {
         $f = @(Invoke-DfirTriage)
         $f += @(Get-SysmonDfirFinding)
         if ($DeepFlag) {
@@ -1447,7 +1458,8 @@ function Show-ProToolMenu {
 }
 # ============================================================================
 function Start-StartupScan {
-    Invoke-Background -Status 'Listing startup apps...' -Work { Get-StartupItems } -OnDone {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Listing startup apps...' -Next $Next -Work { Get-StartupItems } -OnDone {
         param($items)
         $rows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         foreach ($i in @($items)) {
@@ -1493,10 +1505,41 @@ function Invoke-StartupToggle {
 #  ACTIONS: FULL SCAN (dashboard)
 # ============================================================================
 function Start-FullScan {
-    Start-SecurityScan
-    Start-BloatScan
-    Start-DfirScan
-    Start-StartupScan
+    <# Security, apps, investigation and startup scans, one after another:
+       only one background job runs at a time, so each scan starts the next
+       when it ends. A failed scan does not stop the rest; failures are
+       listed in the final status and the log. #>
+    $script:State.FullScan = @{ Done = $false; Errors = (New-Object System.Collections.ArrayList) }
+    Start-SecurityScan -Next {
+        param($failure)
+        if ($failure) { [void]$script:State.FullScan.Errors.Add("Security: $failure") }
+        Start-BloatScan -Next {
+            param($failure)
+            if ($failure) { [void]$script:State.FullScan.Errors.Add("Apps: $failure") }
+            Start-DfirScan -Next {
+                param($failure)
+                if ($failure) { [void]$script:State.FullScan.Errors.Add("Investigate: $failure") }
+                Start-StartupScan -Next {
+                    param($failure)
+                    if ($failure) { [void]$script:State.FullScan.Errors.Add("Startup: $failure") }
+                    Complete-FullScan
+                }
+            }
+        }
+    }
+}
+
+function Complete-FullScan {
+    $fs = $script:State.FullScan
+    $errs = @($fs.Errors)
+    if ($errs.Count -eq 0) {
+        $script:UIRef.UI.StatusText.Text = ("Full scan complete: security score {0}/100, {1} removable app(s), {2} investigation card(s)." -f $script:UIRef.UI.CardScore.Text, $script:UIRef.UI.CardBloat.Text, @($script:State.Cards).Count)
+    } else {
+        $text = ("Full scan finished with {0} error(s): {1}" -f $errs.Count, ($errs -join ' | '))
+        $script:UIRef.UI.StatusText.Text = $text
+        Write-CoreLog -Message $text -Level WARN
+    }
+    $fs.Done = $true
 }
 
 # ============================================================================
@@ -1611,6 +1654,49 @@ function Register-Handlers {
 }
 
 # ============================================================================
+#  SELF-TEST HELPERS
+# ============================================================================
+function Get-SelfTestItemCount {
+    <# -1 when a list was never filled, otherwise its item count. #>
+    param($Items)
+    if ($null -eq $Items) { return -1 }
+    return @($Items).Count
+}
+
+function Close-SelfTestWindow {
+    $script:CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:CloseTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:CloseTimer.Add_Tick({ $script:CloseTimer.Stop(); $script:UIRef.Window.Close() })
+    $script:CloseTimer.Start()
+}
+
+function Test-SelfTestFullScan {
+    <# SelfTest timer tick: waits for the Full Scan chain, checks that every
+       scan filled its list and none failed, prints the result and closes. #>
+    $fs = $script:State.FullScan
+    $done = ($null -ne $fs) -and [bool]$fs.Done
+    if (-not $done -and (Get-Date) -lt $script:SelfTestDeadline) { return }
+    $script:SelfTestTimer.Stop()
+    $u = $script:UIRef.UI
+    $security = Get-SelfTestItemCount $u.SecList.ItemsSource
+    $apps = Get-SelfTestItemCount $u.BloatList.ItemsSource
+    $startup = Get-SelfTestItemCount $u.StartupListView.ItemsSource
+    $cards = @($script:State.Cards).Count
+    Write-Host ("SELFTEST_FULLSCAN done={0} security={1} apps={2} cards={3} startup={4} busy={5} status={6}" -f $done, $security, $apps, $cards, $startup, $script:State.Busy, $u.StatusText.Text)
+    $problems = @()
+    if (-not $done) { $problems += 'the full scan did not finish within 10 minutes' }
+    if ($security -lt 1) { $problems += 'no security findings were listed' }
+    if ($apps -lt 0) { $problems += 'the app list was never filled' }
+    if ($cards -lt 1) { $problems += 'no investigation cards were listed' }
+    if ($startup -lt 0) { $problems += 'the startup list was never filled' }
+    if ($script:State.Busy) { $problems += 'the busy flag is still set' }
+    if ($fs) { foreach ($e in @($fs.Errors)) { $problems += [string]$e } }
+    if ($problems.Count -eq 0) { Write-Host $script:SelfTestLine }
+    else { Write-Host ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')) }
+    Close-SelfTestWindow
+}
+
+# ============================================================================
 #  MAIN
 # ============================================================================
 function Start-Optimizer {
@@ -1620,7 +1706,7 @@ function Start-Optimizer {
     $info = Get-CoreSystemInfo
 
     $script:UIRef = New-OptimizerWindow
-    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; IsAdmin=[bool]$info.Admin }
+    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; FullScan=$null; IsAdmin=[bool]$info.Admin }
 
     # header / admin badge
     $script:UIRef.UI.VersionText.Text = "v$($script:Core.Version)  -  Build $($info.Build)"
@@ -1663,9 +1749,11 @@ function Start-Optimizer {
     }
 
     if ($SelfTest) {
-        # Build + render the window, run read-only scans synchronously, then auto-close.
+        # Render the window and run the read-only engines synchronously, then
+        # click Run Full Scan for real and wait for the whole chain to finish.
         Write-CoreLog -Message 'SelfTest: window constructed OK.' -Level OK
         $script:UIRef.Window.Add_ContentRendered({
+            $driving = $false
             try {
                 Write-CoreLog -Message 'SelfTest: content rendered.' -Level OK
                 $sec = Invoke-SecurityScan;  Write-CoreLog -Message ("SelfTest: security findings = {0}" -f @($sec).Count) -Level INFO
@@ -1680,17 +1768,24 @@ function Start-Optimizer {
                     try { $cr = New-Object System.Xml.XmlNodeReader ([xml](Get-Variable -Name $xv -Scope Script -ValueOnly)); [void][Windows.Markup.XamlReader]::Load($cr) }
                     catch { $consentOk = $false; Write-CoreLog -Message ("SelfTest: {0} FAILED: {1}" -f $xv, $_.Exception.Message) -Level ERROR }
                 }
-                Write-Host "SELFTEST_OK findings=$(@($sec).Count) apps=$(@($inv).Count) dfir=$(@($df).Count) startup=$(@($st).Count) deep=$(@($deep).Count) extTools=$(@($reg).Count) consentXaml=$consentOk"
+                $script:SelfTestLine = "SELFTEST_OK findings=$(@($sec).Count) apps=$(@($inv).Count) dfir=$(@($df).Count) startup=$(@($st).Count) deep=$(@($deep).Count) extTools=$(@($reg).Count) consentXaml=$consentOk"
+                # The path a user takes: background jobs, the busy guard, the
+                # OnDone handlers and the scan chain, run by a real click.
+                $script:SelfTestDeadline = (Get-Date).AddMinutes(10)
+                $script:SelfTestTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $script:SelfTestTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+                $script:SelfTestTimer.Add_Tick({ Test-SelfTestFullScan })
+                $script:UIRef.UI.BtnFullScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+                $script:SelfTestTimer.Start()
+                $driving = $true
             } catch {
                 Write-Host "SELFTEST_FAIL $($_.Exception.Message)"
             } finally {
-                $script:CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $script:CloseTimer.Interval = [TimeSpan]::FromMilliseconds(400)
-                $script:CloseTimer.Add_Tick({ $script:CloseTimer.Stop(); $script:UIRef.Window.Close() })
-                $script:CloseTimer.Start()
+                if (-not $driving) { Close-SelfTestWindow }
             }
         })
-        [void]$script:UIRef.Window.ShowDialog()
+        try { [void]$script:UIRef.Window.ShowDialog() }
+        catch { Write-Host "SELFTEST_FAIL the window stopped with an error: $($_.Exception.Message)" }
         return
     }
 

@@ -66,6 +66,35 @@ Describe 'Static checks' {
         }
     }
 
+    Context 'Background jobs' {
+        BeforeAll {
+            $script:OptAst = (Get-ScriptAst -Path (Join-Path (Get-RepoRoot) 'src\Optimizer.ps1')).Ast
+            function Get-OptFunction {
+                param([string]$Name)
+                return $script:OptAst.Find({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and $n.Name -eq $Name }, $true)
+            }
+        }
+        # Only one background job runs at a time, so a second Start-* call in a
+        # row is dropped by the busy guard. Full Scan must chain them instead.
+        It 'Start-FullScan starts one scan directly and chains the rest' {
+            $fn = Get-OptFunction 'Start-FullScan'
+            $starts = @($fn.Body.FindAll({ param($n) ($n -is [System.Management.Automation.Language.CommandAst]) -and ($n.GetCommandName() -match '^Start-.+Scan$') }, $true))
+            @($starts | ForEach-Object { $_.GetCommandName() }) | Should -Be @('Start-SecurityScan', 'Start-BloatScan', 'Start-DfirScan', 'Start-StartupScan')
+            $direct = @($starts | Where-Object {
+                $p = $_.Parent; $nested = $false
+                while ($p -and $p -ne $fn.Body) { if ($p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $nested = $true }; $p = $p.Parent }
+                -not $nested
+            })
+            $direct.Count | Should -Be 1
+        }
+        It '<_> forwards -Next to Invoke-Background' -ForEach @('Start-SecurityScan', 'Start-BloatScan', 'Start-DfirScan', 'Start-StartupScan') {
+            $fn = Get-OptFunction $_
+            @($fn.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Should -Contain 'Next'
+            $call = $fn.Body.Find({ param($n) ($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -eq 'Invoke-Background' }, $true)
+            $call.Extent.Text | Should -Match '-Next \$Next\b'
+        }
+    }
+
     Context 'XAML' {
         It 'finds the XAML strings in Optimizer.ps1' {
             @($script:XamlCases).Count | Should -BeGreaterThan 0

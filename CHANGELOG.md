@@ -58,9 +58,13 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
   `SHA256SUMS.txt`.
 
 ### Fixed
-- Click handlers built with `GetNewClosure()` could not see script state, so
-  the Pro Tools consent was never accepted and background results never
-  reached the window.
+- In 1.1.0 the window closed with "The property 'Visibility' cannot be found
+  on this object" as soon as a background scan finished, so Run Full Scan never
+  showed results. Handlers built with `GetNewClosure()` could not see script
+  state; the same flaw meant the Pro Tools consent was never accepted.
+- Run Full Scan runs the security, app, investigation and startup scans one
+  after another and reports any scan that failed. The CI self-test now clicks
+  it on a real Windows runner and waits for every scan.
 - Only one background job runs at a time, and the button that started it is
   disabled until it finishes.
 - Investigate cards sort by status, then severity.
