@@ -8,6 +8,7 @@
 Describe 'Sysmon' {
     BeforeAll {
         . (Join-Path $PSScriptRoot 'TestSetup.ps1')
+        $script:OnWindowsHost = ($PSVersionTable.PSEdition -eq 'Desktop') -or ((Test-Path variable:IsWindows) -and $IsWindows)
         $script:UnknownFeature = New-Object System.Runtime.InteropServices.COMException('Feature name Sysmon is unknown.', -2146498548)
         function Set-SysmonWorld {
             <# Service: $null, 'Sysmon64' or 'Sysmon'. Feature: Enabled, Disabled or Absent. #>
@@ -172,6 +173,16 @@ Describe 'Sysmon' {
         It 'refuses without admin' {
             Set-SysmonWorld -Service $null -Feature 'Disabled' -Admin $false
             { Enable-SysmonLogging } | Should -Throw '*administrator*'
+        }
+    }
+
+    Describe 'Invoke-NativeCommand' {
+        It 'returns stderr output and the exit code instead of throwing under ErrorActionPreference Stop' {
+            $ErrorActionPreference = 'Stop'
+            if ($script:OnWindowsHost) { $r = Invoke-NativeCommand -FilePath 'cmd.exe' -ArgumentList @('/c', 'echo usage text 1>&2 & exit /b 3') }
+            else { $r = Invoke-NativeCommand -FilePath 'sh' -ArgumentList @('-c', 'echo usage text 1>&2; exit 3') }
+            $r.ExitCode | Should -Be 3
+            $r.Output | Should -Match 'usage text'
         }
     }
 

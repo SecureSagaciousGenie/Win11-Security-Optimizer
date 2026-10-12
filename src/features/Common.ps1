@@ -50,6 +50,11 @@ function Invoke-NativeCommand {
        returns its combined output and exit code. One place to mock in tests;
        never builds a command string. #>
     param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @())
+    # Windows PowerShell 5.1 turns redirected stderr into a terminating error
+    # when the caller runs with ErrorActionPreference Stop (the GUI does). Many
+    # tools print usage text to stderr, so collect it as output instead; the
+    # exit code decides success.
+    $ErrorActionPreference = 'Continue'
     $out = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
 }
