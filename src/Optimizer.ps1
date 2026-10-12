@@ -204,6 +204,12 @@ $script:Xaml = @'
           <Border Height="1" Background="{StaticResource Stroke}" Margin="0,14,0,6"/>
         </StackPanel>
         <StackPanel DockPanel.Dock="Bottom" Margin="18,10,18,16">
+          <Border x:Name="ChipBaseline" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipBaselineText" Text="Baseline: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
+          <Border x:Name="ChipTools" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipToolsText" Text="Pro Tools: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
           <Border x:Name="AdminBadge" Background="#2A1E12" CornerRadius="6" Padding="10,7" Margin="0,0,0,8">
             <TextBlock x:Name="AdminText" Text="Not elevated" Foreground="{StaticResource Warn}" FontSize="11.5" TextWrapping="Wrap"/>
           </Border>
@@ -348,14 +354,19 @@ $script:Xaml = @'
 
         <!-- INVESTIGATE / DFIR -->
         <Grid x:Name="PageInvestigate" Visibility="Collapsed">
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnDfirScan" Style="{StaticResource Primary}" Content="Investigate This PC"/>
             <Button x:Name="BtnDeepScan" Style="{StaticResource Ghost}" Content="+ Deep Scan (processes &amp; logs)" Margin="10,0,0,0"/>
             <Button x:Name="BtnProScan" Style="{StaticResource Ghost}" Content="+ Pro Tools (Hayabusa / Chainsaw / Autoruns)" Margin="10,0,0,0"/>
             <TextBlock x:Name="DfirSummary" Text="Checks for hidden admins, backdoors, remote access, and tampering." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0"/>
           </StackPanel>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+          <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnBaselineSave" Style="{StaticResource Ghost}" Content="Save as baseline"/>
+            <Button x:Name="BtnBaselineCompare" Style="{StaticResource Ghost}" Content="Compare with baseline" Margin="10,0,0,0"/>
+            <TextBlock x:Name="BaselineStatus" Text="A baseline records how this PC looks now, so later checks show only what is new." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
             <ItemsControl x:Name="DfirList">
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
@@ -461,11 +472,15 @@ function New-OptimizerWindow {
         'BtnSecScan','BtnSecFixSafe','ChkHighRisk','SecList',
         'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
+        'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText',
         'BtnStartupScan','StartupListView',
         'BtnOpenData','BtnOpenRollback','BtnMakeRestore','BtnRemoveTools','LogView','LogScroller',
         'StatusText','Busy'
     )
-    foreach ($n in $names) { $ui[$n] = $win.FindName($n) }
+    foreach ($n in $names) {
+        $ui[$n] = $win.FindName($n)
+        if ($null -eq $ui[$n]) { throw ("The main window is missing the element {0}." -f $n) }
+    }
     return @{ Window=$win; UI=$ui }
 }
 
@@ -945,6 +960,92 @@ function Show-ConsentDialog {
     return $null
 }
 
+function Update-StatusChip {
+    <# Sidebar chips: baseline date and installed Pro Tools. Read-only. #>
+    $info = Get-BaselineInfo
+    if ($info) {
+        $script:UIRef.UI.ChipBaselineText.Text = ("Baseline: {0}" -f $info.CreatedUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
+    } else {
+        $script:UIRef.UI.ChipBaselineText.Text = 'Baseline: none saved'
+    }
+    $installed = @()
+    foreach ($t in @(Get-ExternalToolRegistry)) {
+        $exe = $null
+        try { $exe = Test-ExternalToolInstalled -Key $t.Key } catch { $exe = $null }
+        if ($exe) { $installed += $t.Name }
+    }
+    $script:UIRef.UI.ChipToolsText.Text = $(if ($installed.Count -gt 0) { 'Pro Tools: ' + ($installed -join ', ') } else { 'Pro Tools: none installed' })
+}
+
+function Get-SessionAutorunsCsv {
+    <# The newest Autoruns CSV written during this session, or $null. #>
+    $dir = Join-Path (Get-ExternalToolsRoot) 'autoruns\output'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $f = @(Get-ChildItem -LiteralPath $dir -Filter 'autoruns_*.csv' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $script:Core.StartTime } | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+    if ($f) { return $f.FullName }
+    return $null
+}
+
+function Add-DfirCard {
+    <# Merges cards into the Investigate list, replacing earlier cards whose Id
+       starts with $ReplacePrefix, then sorts by status and severity rank. #>
+    param([AllowEmptyCollection()][object[]]$Cards, [string]$ReplacePrefix)
+    $existing = @()
+    if ($script:UIRef.UI.DfirList.ItemsSource) { $existing = @($script:UIRef.UI.DfirList.ItemsSource) }
+    if ($ReplacePrefix) { $existing = @($existing | Where-Object { -not ([string]$_.Id).StartsWith($ReplacePrefix, [System.StringComparison]::OrdinalIgnoreCase) }) }
+    $new = @(@($Cards) | Where-Object { $_ } | ForEach-Object { ConvertTo-DfirCard $_ })
+    $script:UIRef.UI.DfirList.ItemsSource = @(Sort-DfirFinding -Findings (@($existing) + @($new)))
+    $all = @($script:UIRef.UI.DfirList.ItemsSource)
+    $script:UIRef.UI.CardDfir.Text = "$(@($all | Where-Object { $_.Status -eq 'Alert' -or $_.Status -eq 'Review' }).Count)"
+}
+
+function Invoke-BaselineSave {
+    <# Confirm, snapshot in the background, then write the baseline on the main thread. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    if (-not (Test-IsAdmin)) {
+        [System.Windows.MessageBox]::Show('Saving a baseline needs administrator rights so every check can be read. Relaunch via Start.bat.', 'Administrator required', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $msg = "Save how this PC looks right now as your baseline?`n`nDo this when you believe the PC is clean. Later, ""Compare with baseline"" shows only what is new or changed since now.`n`nThe previous baseline, if any, is kept as baseline.prev.json."
+    if ([System.Windows.MessageBox]::Show($msg, 'Save as baseline', 'YesNo', 'Question') -ne 'Yes') { return }
+    Invoke-Background -Status 'Taking a snapshot of this PC...' -Control $script:UIRef.UI.BtnBaselineSave -Vars @{ SnapAutoruns = (Get-SessionAutorunsCsv) } -Work {
+        Get-SystemSnapshot -AutorunsCsv $SnapAutoruns
+    } -OnDone {
+        param($res)
+        $snap = @($res) | Select-Object -First 1
+        try {
+            Set-Busy -Text 'Saving baseline...'
+            $path = Save-Baseline -Snapshot $snap
+            Set-Busy -On $false
+            $script:UIRef.UI.BaselineStatus.Text = "Baseline saved: $path"
+            Update-StatusChip
+        } catch {
+            Set-Busy -On $false
+            [System.Windows.MessageBox]::Show(("The baseline was not saved:`n{0}" -f $_.Exception.Message), 'Baseline not saved', 'OK', 'Warning') | Out-Null
+        }
+    }
+}
+
+function Start-BaselineCompare {
+    <# Snapshot now and compare with the saved baseline in the background. #>
+    Invoke-Background -Status 'Comparing this PC with the baseline...' -Control $script:UIRef.UI.BtnBaselineCompare -Vars @{ SnapAutoruns = (Get-SessionAutorunsCsv) } -Work {
+        try { @(Invoke-BaselineDrift -AutorunsCsv $SnapAutoruns) }
+        catch {
+            @(New-DfirFinding -Id 'DRIFT-ERROR' -Category 'Changes since baseline' -Title 'Could not compare with the baseline' -Severity 'Info' -Status 'Info' `
+                -What ("The comparison could not run: {0}" -f $_.Exception.Message) -Why 'A failed comparison is reported rather than shown as "no changes".' -WhatToDo 'Run as administrator. If the baseline came from another PC, save a new one here.' -Evidence '')
+        }
+    } -OnDone {
+        param($res)
+        $cards = @($res)
+        Add-DfirCard -Cards $cards -ReplacePrefix 'DRIFT-'
+        $alerts = @($cards | Where-Object { $_.Status -eq 'Alert' }).Count
+        $reviews = @($cards | Where-Object { $_.Status -eq 'Review' }).Count
+        $script:UIRef.UI.BaselineStatus.Text = ("Compared with the baseline: {0} alert(s), {1} to review." -f $alerts, $reviews)
+        $script:UIRef.UI.StatusText.Text = 'Baseline comparison complete.'
+    }
+}
+
 function Show-SecureSetupNotice {
     <# Shows the quarantine notice once, then clears it. #>
     if (-not $script:Core.SecureSetupNotice) { return }
@@ -1034,6 +1135,7 @@ function Start-ProScan {
         if (($res.PSObject.Properties.Name -contains 'Signer') -and $res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
         $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s).$sigNote"
         $script:UIRef.UI.StatusText.Text = "$($tool.Name) scan complete."
+        try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
     }
 }
 
@@ -1300,6 +1402,8 @@ function Register-Handlers {
     $u.BtnDfirScan.Add_Click({ Start-DfirScan })
     $u.BtnDeepScan.Add_Click({ Start-DfirScan -Deep })
     $u.BtnProScan.Add_Click({ Show-ProToolMenu })
+    $u.BtnBaselineSave.Add_Click({ Invoke-BaselineSave })
+    $u.BtnBaselineCompare.Add_Click({ Start-BaselineCompare })
     $u.BtnStartupScan.Add_Click({ Start-StartupScan })
 
     $u.BtnOpenData.Add_Click({ Open-DataFolder })
@@ -1352,6 +1456,7 @@ function Start-Optimizer {
 
     Register-Handlers
     Show-Page 'Dashboard'
+    try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
 
     # If we are elevated but could NOT secure the ProgramData data folder (e.g. a
     # standard user pre-created it and denied Administrators), Initialize-Core fell

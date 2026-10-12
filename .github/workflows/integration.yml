@@ -1,5 +1,5 @@
 # Integration run on a real Windows runner (elevated). Runs on demand and when
-# the workflow or the Autoruns feature changes.
+# the workflow or anything under src changes.
 # Author: Ahmad Shaukat
 # Captures raw tool output for test fixtures. Nothing from Sysinternals is
 # committed to the repo; only the CSV output is uploaded as an artifact.
@@ -10,7 +10,7 @@ on:
   push:
     paths:
       - '.github/workflows/integration.yml'
-      - 'src/features/Autoruns.ps1'
+      - 'src/**'
 
 permissions:
   contents: read
@@ -130,6 +130,9 @@ jobs:
           if (-not $refused) { throw 'A tampered exe was NOT refused.' }
 
       - name: Chainsaw pinned download and --level support
+        # Unauthenticated GitHub API calls from shared runner IPs are often rate
+        # limited (403), which says nothing about the tool, so this is advisory.
+        continue-on-error: true
         run: |
           $ErrorActionPreference = 'Stop'
           . .\src\SecurityCore.ps1
@@ -151,3 +154,29 @@ jobs:
           'Exit code: {0}' -f $p.ExitCode
           Get-Content selftest.out.txt -ErrorAction SilentlyContinue
           Get-Content selftest.err.txt -ErrorAction SilentlyContinue | Select-Object -First 30
+
+  baseline:
+    name: Baseline save and compare on real data
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Snapshot, save, compare
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2.0
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $snap = Get-SystemSnapshot
+          'Errors: [{0}]' -f (@($snap.Errors.Keys) -join ', ')
+          foreach ($k in @($snap.Collections.Keys)) { '  {0}: {1}' -f $k, $(if ($null -eq $snap.Collections[$k]) { 'ERROR' } else { @($snap.Collections[$k].Keys).Count }) }
+          $p = Save-Baseline -Snapshot $snap
+          'Saved {0} (owned by Administrators: {1})' -f $p, (Test-FolderOwnedBySystemOrAdmins $p)
+          'Chip: {0}' -f (Get-BaselineInfo).CreatedUtc.ToString('o')
+          $cards = @(Invoke-BaselineDrift)
+          foreach ($c in $cards) { '  [{0}/{1}] {2}' -f $c.Status, $c.Severity, $c.Title }
+          if (@($cards | Where-Object { $_.Status -eq 'Alert' }).Count -gt 0) { throw 'An immediate re-compare raised an Alert.' }
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))

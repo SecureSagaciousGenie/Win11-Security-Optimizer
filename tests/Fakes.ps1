@@ -110,6 +110,9 @@ $stubs = [ordered]@{
     'Start-BitsTransfer'      = '[CmdletBinding()] param([string[]]$Source, [string[]]$Destination)'
     'Start-MpScan'            = '[CmdletBinding()] param([string]$ScanType, [string]$ScanPath)'
     'Get-MpThreatDetection'   = '[CmdletBinding()] param()'
+    'Get-NetFirewallProfile'  = '[CmdletBinding()] param([string[]]$Name, [string[]]$Profile)'
+    'Get-NetUDPEndpoint'      = '[CmdletBinding()] param()'
+    'Get-LocalGroup'          = '[CmdletBinding()] param([string[]]$Name, [object[]]$SID)'
 }
 foreach ($name in $stubs.Keys) {
     if (-not (Get-Command -Name $name -ErrorAction SilentlyContinue)) {

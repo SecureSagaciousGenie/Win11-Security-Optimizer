@@ -73,6 +73,16 @@ Describe 'Static checks' {
         It '<Name> (line <Line>) is well-formed XML' -ForEach $script:XamlCases {
             { [xml]$Xaml } | Should -Not -Throw
         }
+        It 'every element New-OptimizerWindow looks up exists in the main window XAML' {
+            $parsed = Get-ScriptAst -Path (Join-Path (Get-RepoRoot) 'src\Optimizer.ps1')
+            $fn = $parsed.Ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-OptimizerWindow' }, $true)
+            $assign = $fn.Find({ param($n) ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) -and ($n.Left.Extent.Text -eq '$names') }, $true)
+            $wanted = @($assign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+            $wanted.Count | Should -BeGreaterThan 10
+            $main = @(Get-XamlStringFromScript -Path (Join-Path (Get-RepoRoot) 'src\Optimizer.ps1') | Where-Object { $_.Name -eq 'script:Xaml' })[0].Xaml
+            $defined = @([regex]::Matches($main, 'x:Name="([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+            @($wanted | Where-Object { $defined -notcontains $_ }) | Should -BeNullOrEmpty
+        }
         It '<Name> (line <Line>) loads with XamlReader' -ForEach $script:XamlCases -Skip:(-not $script:OnWindows) {
             Invoke-XamlLoad -Xaml $Xaml | Should -Not -BeNullOrEmpty
         }
