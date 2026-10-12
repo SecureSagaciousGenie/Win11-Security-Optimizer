@@ -1,4 +1,5 @@
-# Manual integration run on a real Windows runner (elevated).
+# Integration run on a real Windows runner (elevated). Runs on demand and when
+# the workflow or the Autoruns feature changes.
 # Author: Ahmad Shaukat
 # Captures raw tool output for test fixtures. Nothing from Sysinternals is
 # committed to the repo; only the CSV output is uploaded as an artifact.
@@ -6,6 +7,10 @@ name: Integration
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/integration.yml'
+      - 'src/features/Autoruns.ps1'
 
 permissions:
   contents: read
