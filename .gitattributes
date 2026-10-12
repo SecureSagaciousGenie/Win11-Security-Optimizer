@@ -1,2 +1,4 @@
 # Tool-output fixtures must keep their exact bytes (UTF-16 LE with BOM).
 tests/fixtures/** binary
+# Vendored configuration is pinned by SHA-256; keep its exact bytes.
+config/sysmon/*.xml -text

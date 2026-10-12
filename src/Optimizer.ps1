@@ -207,6 +207,9 @@ $script:Xaml = @'
           <Border x:Name="ChipBaseline" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
             <TextBlock x:Name="ChipBaselineText" Text="Baseline: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
           </Border>
+          <Border x:Name="ChipSysmon" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipSysmonText" Text="Sysmon: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
           <Border x:Name="ChipTools" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
             <TextBlock x:Name="ChipToolsText" Text="Pro Tools: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
           </Border>
@@ -472,7 +475,7 @@ function New-OptimizerWindow {
         'BtnSecScan','BtnSecFixSafe','ChkHighRisk','SecList',
         'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
-        'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText',
+        'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText','ChipSysmon','ChipSysmonText',
         'BtnStartupScan','StartupListView',
         'BtnOpenData','BtnOpenRollback','BtnMakeRestore','BtnRemoveTools','LogView','LogScroller',
         'StatusText','Busy'
@@ -667,6 +670,7 @@ function Invoke-SecFix {
     $finding = $script:State.Security | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
     if (-not $finding) { return }
     $msg = "Apply this fix?`n`n$($finding.Name)`n`nCurrent: $($finding.Observed)`nTarget: $($finding.Expected)"
+    if (($finding.PSObject.Properties.Name -contains 'ConfirmText') -and $finding.ConfirmText) { $msg += "`n`n$($finding.ConfirmText)" }
     if ($finding.RiskTier -eq 'HighRisk') { $msg += "`n`nWARNING: High-impact change. Make sure you understand the effect." }
     $msg += "`n`nA System Restore point is created before the first change, and this is reversible via the rollback script."
     $r = [System.Windows.MessageBox]::Show($msg, 'Confirm fix', 'YesNo', $(if($finding.RiskTier -eq 'HighRisk'){'Warning'}else{'Question'}))
@@ -681,6 +685,7 @@ function Invoke-SecFix {
     Set-Busy -On $false
     if ($res.Success) {
         $script:UIRef.UI.StatusText.Text = "Applied: $($finding.Name)."
+        try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
         Start-SecurityScan
     } else {
         [System.Windows.MessageBox]::Show("Could not apply fix:`n$($res.Message)", 'Fix failed', 'OK', 'Error') | Out-Null
@@ -693,9 +698,11 @@ function Invoke-SecApplyAllSafe {
         return
     }
     $incHigh = [bool]$script:UIRef.UI.ChkHighRisk.IsChecked
+    # Opt-in features (IndividualOnly) are never part of a bulk apply.
     $targets = $script:State.Security | Where-Object {
         $_.Fixable -and $_.Status -ne 'Pass' -and $_.RiskTier -ne 'AuditOnly' -and
-        ($_.RiskTier -ne 'HighRisk' -or $incHigh)
+        ($_.RiskTier -ne 'HighRisk' -or $incHigh) -and
+        -not (($_.PSObject.Properties.Name -contains 'IndividualOnly') -and $_.IndividualOnly)
     }
     if (-not $targets -or @($targets).Count -eq 0) {
         [System.Windows.MessageBox]::Show('Nothing to apply with the current options.', 'Nothing to do', 'OK', 'Information') | Out-Null
@@ -810,7 +817,8 @@ function Start-DfirScan {
     param([switch]$Deep)
     $statusMsg = if ($Deep) { 'Running deep scan (processes + event logs)...' } else { 'Investigating this PC...' }
     Invoke-Background -Status $statusMsg -Vars @{ DeepFlag = [bool]$Deep } -Work {
-        $f = Invoke-DfirTriage
+        $f = @(Invoke-DfirTriage)
+        $f += @(Get-SysmonDfirFinding)
         if ($DeepFlag) {
             foreach ($x in @(Invoke-DeepScan)) { $f += $x }
         }
@@ -975,6 +983,13 @@ function Update-StatusChip {
         if ($exe) { $installed += $t.Name }
     }
     $script:UIRef.UI.ChipToolsText.Text = $(if ($installed.Count -gt 0) { 'Pro Tools: ' + ($installed -join ', ') } else { 'Pro Tools: none installed' })
+    $sysmonText = 'Sysmon: off'
+    $svc = Get-SysmonServiceName
+    if ($svc) {
+        $log = Get-SysmonLogInfo
+        $sysmonText = if ($log -and $null -ne $log.DaysOfEvidence) { "Sysmon: on, $($log.DaysOfEvidence) day(s) of evidence" } else { 'Sysmon: on' }
+    }
+    $script:UIRef.UI.ChipSysmonText.Text = $sysmonText
 }
 
 function Get-SessionAutorunsCsv {
@@ -1412,7 +1427,13 @@ function Register-Handlers {
     $u.BtnRemoveTools.Add_Click({
         $r = [System.Windows.MessageBox]::Show('Delete all downloaded Pro Tools (Hayabusa, Chainsaw, Autoruns)? They can be re-downloaded later.', 'Remove downloaded tools', 'YesNo', 'Question')
         if ($r -eq 'Yes') {
-            try { $n = Remove-ExternalTools; [System.Windows.MessageBox]::Show("Removed $n downloaded tool folder(s).", 'Done', 'OK', 'Information') | Out-Null }
+            try {
+                $kept = Test-SysmonToolInUse
+                $n = Remove-ExternalTools
+                $note = if ($kept) { "`n`nThe downloaded Sysmon was kept because Sysmon is installed and needs it to uninstall. Run the rollback script first to remove Sysmon." } else { '' }
+                [System.Windows.MessageBox]::Show("Removed $n downloaded tool folder(s).$note", 'Done', 'OK', 'Information') | Out-Null
+                Update-StatusChip
+            }
             catch { [System.Windows.MessageBox]::Show("Could not remove tools: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null }
             Update-LogView
         }

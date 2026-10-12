@@ -44,3 +44,12 @@ function Test-UserWritablePath {
     $p = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
     return ($p -match '(?i)^([a-z]:)?\\(Users\\[^\\]+\\|ProgramData\\|Windows\\Temp\\|\$Recycle\.Bin\\)|\\AppData\\|\\Temp\\')
 }
+
+function Invoke-NativeCommand {
+    <# Runs an external program with arguments passed as separate tokens and
+       returns its combined output and exit code. One place to mock in tests;
+       never builds a command string. #>
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @())
+    $out = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { [string]$_ })
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($out -join "`n") }
+}

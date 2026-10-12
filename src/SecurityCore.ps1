@@ -2045,6 +2045,21 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^autorunsc(64a?)?\.exe$'
             OutputKind   = 'AutorunsCsv'
             NeedsAdmin   = $true
+        },
+        [pscustomobject]@{
+            Key          = 'sysmon'
+            Name         = 'Sysmon'
+            Vendor       = 'MS Sysinternals'
+            License      = 'Sysinternals Software License Terms: free to use, not redistributable, downloaded from MS at runtime'
+            HomeUrl      = 'https://learn.microsoft.com/sysinternals/downloads/sysmon'
+            Url          = 'https://download.sysinternals.com/files/Sysmon.zip'
+            Summary      = 'System Monitor: a driver and service that log process, network, driver and file activity to the event log. Used only when Windows has no built-in Sysmon.'
+            Verify       = 'Authenticode'
+            ExeByArch    = @{ 'AMD64' = 'Sysmon64.exe'; 'x86' = 'Sysmon.exe'; 'ARM64' = 'Sysmon64a.exe' }
+            ExtraFiles   = @('Eula.txt')
+            ExePattern   = '^Sysmon(64a?)?\.exe$'
+            OutputKind   = 'None'
+            NeedsAdmin   = $true
         }
     )
 }
@@ -2728,9 +2743,15 @@ function Install-ExternalTool {
 }
 
 function Remove-ExternalTools {
-    <# Deletes everything under the tools folder. Returns count removed. #>
+    <# Deletes everything under the tools folder. Returns count removed. Keeps
+       the downloaded Sysmon while Sysmon is installed: it is needed to
+       uninstall it. #>
     $root = Get-ExternalToolsRoot
-    $items = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue
+    $items = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue)
+    if (Test-SysmonToolInUse) {
+        $items = @($items | Where-Object { $_.Name -ne 'sysmon' })
+        Write-CoreLog -Message 'Kept the downloaded Sysmon: Sysmon is installed and needs it to uninstall.' -Level WARN
+    }
     $n = @($items).Count
     foreach ($d in $items) { Remove-Item $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     Write-CoreLog -Message ("Removed {0} downloaded tool folder(s)." -f $n) -Level INFO

@@ -11,6 +11,7 @@ on:
     paths:
       - '.github/workflows/integration.yml'
       - 'src/**'
+      - 'config/**'
 
 permissions:
   contents: read
@@ -218,3 +219,36 @@ jobs:
             '{0}: before {1}, after rollback {2}' -f $id, $before[$id], $after
             if ($after -ne $before[$id]) { throw "$id was not restored by the rollback script." }
           }
+
+  sysmon:
+    name: Sysmon enable and rollback on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable through the Security fix, check, roll back
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $s = Get-SysmonState
+          'Before: state {0}, service {1}, feature {2}' -f $s.State, $s.Service, $s.Feature
+          $f = Get-SysmonSecurityFinding
+          'Card: [{0}] {1} (fixable {2})' -f $f.Status, $f.Observed, $f.Fixable
+          $r = Invoke-SecurityFix -Id 'SYSMON'
+          'Fix: success {0}, verified {1} {2}' -f $r.Success, $r.Verified, $r.Message
+          if (-not $r.Success -or -not $r.Verified) { throw 'Sysmon was not enabled.' }
+          $s = Get-SysmonState
+          'After: state {0}, service {1}, log max {2} MB' -f $s.State, $s.Service, $(if ($s.Log) { $s.Log.MaxBytes / 1MB } else { 'no log' })
+          (Get-SysmonDfirFinding).Title
+          'Tools kept while installed: {0}' -f (Test-SysmonToolInUse)
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))
+          Get-Content -LiteralPath $script:Core.RollbackFile | Select-String -Pattern 'sysmon|wevtutil|Sysmon' | ForEach-Object { '  rollback: ' + $_.Line.Trim() }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:Core.RollbackFile
+          'Rollback exit code: {0}' -f $LASTEXITCODE
+          $s = Get-SysmonState
+          'After rollback: state {0}, service {1}' -f $s.State, $s.Service
+          if ($s.Installed) { throw 'Sysmon is still installed after the rollback.' }
