@@ -1,0 +1,50 @@
+# Manual integration run on a real Windows runner (elevated).
+# Author: Ahmad Shaukat
+# Captures raw tool output for test fixtures. Nothing from Sysinternals is
+# committed to the repo; only the CSV output is uploaded as an artifact.
+name: Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  autoruns-fixture:
+    name: Capture Autoruns CSV
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download, verify and run autorunsc
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          $work = Join-Path $env:RUNNER_TEMP 'autoruns'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $zip = Join-Path $work 'Autoruns.zip'
+          Invoke-WebRequest -Uri 'https://download.sysinternals.com/files/Autoruns.zip' -OutFile $zip -UseBasicParsing
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try { $z.Entries | ForEach-Object { '{0}  {1}' -f $_.FullName, $_.Length } } finally { $z.Dispose() }
+          Expand-Archive -Path $zip -DestinationPath $work -Force
+          $exe = Join-Path $work 'autorunsc64.exe'
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          'Signature: {0} | {1}' -f $sig.Status, $sig.SignerCertificate.Subject
+          if ($sig.Status -ne 'Valid') { throw 'autorunsc64.exe is not validly signed' }
+          $out = Join-Path $work 'autoruns.csv'
+          $p = Start-Process -FilePath $exe -ArgumentList '-accepteula', '-a', '*', '-c', '-h', '-s', '-t', '*' -RedirectStandardOutput $out -NoNewWindow -Wait -PassThru
+          'ExitCode: {0}' -f $p.ExitCode
+          $bytes = [System.IO.File]::ReadAllBytes($out)
+          'Bytes: {0} | first 8: {1}' -f $bytes.Length, (($bytes | Select-Object -First 8) -join ',')
+          New-Item -ItemType Directory -Path fixtures-out -Force | Out-Null
+          Copy-Item -LiteralPath $out -Destination 'fixtures-out\autoruns.csv'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: fixtures-out
