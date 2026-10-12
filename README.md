@@ -61,7 +61,7 @@ from GitHub. Nothing else leaves your PC.
 
 ---
 
-## Safety — how every change is protected
+## Safety: how every change is protected
 
 This tool is **defensive** and built for the owner of the machine. It is designed
 so you can trust it:
@@ -206,7 +206,7 @@ closer look. When in doubt, don't delete; investigate first.
 
 ---
 
-## Debloat — what can be removed
+## Debloat: what can be removed
 
 The catalog only ever shows apps that are **actually installed** on your PC. Each
 row explains what the app is and why people remove it. Removal uninstalls it for
@@ -256,11 +256,11 @@ It builds and renders the window, runs every read-only engine, prints
 **Will my antivirus flag this?** `Start.bat` uses the built-in PowerShell, so
 there's no unsigned binary to quarantine. You can read every line of the source.
 
-**I'm not an admin — can I still use it?** Yes, for scanning and investigation.
+**I'm not an admin, can I still use it?** Yes, for scanning and investigation.
 Applying fixes, removing apps, or toggling startup needs admin (relaunch via
 `Start.bat`).
 
-**Can I undo everything?** Yes — the rollback script, the per-change JSON backup,
+**Can I undo everything?** Yes, the rollback script, the per-change JSON backup,
 and the System Restore point all let you revert.
 
 **Is my data sent anywhere?** The tool itself does not upload your files or
