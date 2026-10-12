@@ -67,8 +67,18 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
   created it. That could corrupt state and close the window a few seconds into
   a scan. The work is now rebuilt inside the background runspace.
 - Run Full Scan runs the security, app, investigation and startup scans one
-  after another and reports any scan that failed. The CI self-test now clicks
-  it on a real Windows runner and waits for every scan.
+  after another and reports any scan that failed.
+- The Alert filter chip closed the app when one card or none matched.
+- Pro Tools runs ended in "The variable '$tool' cannot be retrieved" and
+  showed no cards. Chainsaw also refused its own verified install, and its
+  stderr output aborted the hunt.
+- The Refresh button failed on every page.
+- An error inside any button or timer now shows a message and is logged; the
+  app stays open.
+- The CI self-test clicks Run Full Scan, every filter chip, Refresh, Deep Scan,
+  the Debloat presets, the card actions, Save report, Baseline save and
+  compare, Evidence pack and all three Pro Tools (through the consent window
+  and the verified download) on an elevated Windows runner.
 - Only one background job runs at a time, and the button that started it is
   disabled until it finishes.
 - Investigate cards sort by status, then severity.
