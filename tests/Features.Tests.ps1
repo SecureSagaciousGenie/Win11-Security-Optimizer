@@ -69,8 +69,14 @@ Describe 'Features' {
     }
 
     Describe 'Phase 3: extension hooks' {
+        # Run against an empty registry: the real feature checks touch the live
+        # system (Windows Update COM, DISM, SMB) and must not run in unit tests.
+        BeforeEach {
+            $script:SavedChecks = $script:ExtraSecurityChecks
+            $script:ExtraSecurityChecks = [ordered]@{}
+        }
         AfterEach {
-            [void]$script:ExtraSecurityChecks.Remove('TEST-X')
+            $script:ExtraSecurityChecks = $script:SavedChecks
             [void]$script:ExtraFixActions.Remove('TEST-X')
             [void]$script:ExtraFixTests.Remove('TEST-X')
         }
