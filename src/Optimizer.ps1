@@ -352,7 +352,7 @@ $script:Xaml = @'
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnDfirScan" Style="{StaticResource Primary}" Content="Investigate This PC"/>
             <Button x:Name="BtnDeepScan" Style="{StaticResource Ghost}" Content="+ Deep Scan (processes &amp; logs)" Margin="10,0,0,0"/>
-            <Button x:Name="BtnProScan" Style="{StaticResource Ghost}" Content="+ Pro Tools (Hayabusa / Chainsaw)" Margin="10,0,0,0"/>
+            <Button x:Name="BtnProScan" Style="{StaticResource Ghost}" Content="+ Pro Tools (Hayabusa / Chainsaw / Autoruns)" Margin="10,0,0,0"/>
             <TextBlock x:Name="DfirSummary" Text="Checks for hidden admins, backdoors, remote access, and tampering." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0"/>
           </StackPanel>
           <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
@@ -488,10 +488,24 @@ function Invoke-Background {
         [Parameter(Mandatory)][scriptblock]$Work,
         [Parameter(Mandatory)]$OnDone,
         [string]$Status = 'Working...',
-        [hashtable]$Vars = @{}
+        [hashtable]$Vars = @{},
+        $Control = $null
     )
+    # One background job at a time. A second click while busy is ignored with a
+    # status message instead of starting overlapping scans.
+    if ($script:State.Busy) {
+        $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'
+        return
+    }
+    $script:State.Busy = $true
+    if ($Control) { try { $Control.IsEnabled = $false } catch { Write-CoreLog -Message 'Could not disable the control.' -Level DEBUG } }
     $script:UIRef.UI.StatusText.Text = $Status
     $script:UIRef.UI.Busy.Visibility = 'Visible'
+    # The timer handler below is a GetNewClosure() block. Inside it $script:
+    # points at the closure's own module, not this script, so everything it
+    # needs is captured as locals here.
+    $ui = $script:UIRef.UI
+    $state = $script:State
 
     # Thread-safe channel so the background work can push live status to the UI.
     $shared = [hashtable]::Synchronized(@{ Status = $Status })
@@ -523,19 +537,26 @@ function Invoke-Background {
     $timer.Interval = [TimeSpan]::FromMilliseconds(150)
     $timer.Add_Tick({
         # live progress
-        try { if ($shared.Status) { $script:UIRef.UI.StatusText.Text = $shared.Status } } catch { }
+        try { if ($shared.Status) { $ui.StatusText.Text = $shared.Status } } catch { }
         if ($handle.IsCompleted) {
             $timer.Stop()
             $result = $null; $err = $null
             try { $result = $ps.EndInvoke($handle) } catch { $err = $_ }
             try { $ps.Dispose() } catch { }
             try { $rs.Close(); $rs.Dispose() } catch { }
-            $script:UIRef.UI.Busy.Visibility = 'Collapsed'
-            $script:UIRef.UI.StatusText.Text = 'Ready.'
-            if ($err) {
-                $script:UIRef.UI.StatusText.Text = "Error: $($err.Exception.Message)"
-            } else {
-                & $OnDone $result
+            try {
+                $ui.Busy.Visibility = 'Collapsed'
+                $ui.StatusText.Text = 'Ready.'
+                if ($err) {
+                    $ui.StatusText.Text = "Error: $($err.Exception.Message)"
+                } else {
+                    & $OnDone $result
+                }
+            } catch {
+                try { $ui.StatusText.Text = "Error: $($_.Exception.Message)" } catch { }
+            } finally {
+                $state.Busy = $false
+                if ($Control) { try { $Control.IsEnabled = $true } catch { } }
             }
         }
     }.GetNewClosure())
@@ -835,9 +856,9 @@ $script:ConsentXaml = @'
           <StackPanel>
             <TextBlock Text="Please understand before continuing:" Foreground="#D29922" FontWeight="SemiBold" Margin="0,0,0,6"/>
             <TextBlock TextWrapping="Wrap" Foreground="#C9D1D9" LineHeight="19">
-              - This downloads a separate program from the internet (the official GitHub release above) and runs it on your PC to read your Windows event logs.<LineBreak/>
+              - This downloads a separate program from its official source (shown above) and runs it on your PC. It only reads: event logs or startup locations.<LineBreak/>
               - It is licensed under its own license (shown above), NOT the optimizer's MIT license. The optimizer only runs it; it does not include or redistribute it.<LineBreak/>
-              - It runs read-only against your logs. The optimizer refuses to install unless the download's SHA-256 matches a trusted hash (see "Integrity" above), but you are trusting the upstream project itself.<LineBreak/>
+              - It runs read-only. The optimizer refuses to install unless the download passes the check under "Integrity" above, and re-checks the program before every run, but you are trusting the upstream project itself.<LineBreak/>
               - Some antivirus/EDR products flag security tools like these (they are "hacktools" by category). That does not necessarily mean they are malicious, but you should be comfortable with that.
             </TextBlock>
           </StackPanel>
@@ -892,7 +913,12 @@ function Show-ConsentDialog {
     $src = ''; try { $src = [string]$res.Sha256Source } catch { }
     $hasHash = $false; try { $hasHash = [bool]$res.Sha256Expected } catch { }
     $cInteg = & $g 'CIntegrity'
-    if (-not $hasHash -or $src -eq 'none') {
+    if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
+        (& $g 'CVersion').Text = 'Latest from Sysinternals'
+        (& $g 'CSize').Text = $(if ($null -ne $res.SizeMB) { "{0} MB  ({1})" -f $res.SizeMB, $res.AssetName } else { "Unknown size  ({0})" -f $res.AssetName })
+        $cInteg.Text = 'MS publishes no hash for this file. After download the program must carry a valid MS signature (Authenticode); otherwise it is deleted and never run. Its hash is recorded and checked before every run.'
+        try { $cInteg.Foreground = '#3FB950' } catch { }
+    } elseif (-not $hasHash -or $src -eq 'none') {
         [System.Windows.MessageBox]::Show("$($tool.Name) cannot be installed: no trusted SHA-256 is available for this download (the project has no pinned hash for it and GitHub advertised no digest).`n`nBecause this tool runs with administrator rights, it will not be downloaded from an unverifiable source.", 'Download refused (no verifiable hash)', 'OK', 'Warning') | Out-Null
         return $null
     } elseif ($src -eq 'pinned') {
@@ -904,14 +930,18 @@ function Show-ConsentDialog {
     }
 
     $accept = & $g 'CAccept'; $ok = & $g 'COk'; $cancel = & $g 'CCancel'
-    $accept.Add_Checked({   $ok.IsEnabled = $true })
-    $accept.Add_Unchecked({ $ok.IsEnabled = $false })
-    $script:_consentResult = $false
-    $ok.Add_Click({ $script:_consentResult = $true; $dlg.Close() }.GetNewClosure())
-    $cancel.Add_Click({ $script:_consentResult = $false; $dlg.Close() }.GetNewClosure())
+    foreach ($el in @($accept, $ok, $cancel, $cInteg)) { if ($null -eq $el) { throw 'The consent window is missing a control.' } }
+    $accept.Add_Checked({   $ok.IsEnabled = $true }.GetNewClosure())
+    $accept.Add_Unchecked({ $ok.IsEnabled = $false }.GetNewClosure())
+    $cancel.IsCancel = $true
+    # A captured hashtable carries the answer out of the closures; $script: inside
+    # a GetNewClosure() block would write to the closure's own module instead.
+    $answer = @{ Accepted = $false }
+    $ok.Add_Click({ $answer.Accepted = $true; $dlg.Close() }.GetNewClosure())
+    $cancel.Add_Click({ $answer.Accepted = $false; $dlg.Close() }.GetNewClosure())
 
     [void]$dlg.ShowDialog()
-    if ($script:_consentResult) { return $res }
+    if ($answer.Accepted) { return $res }
     return $null
 }
 
@@ -928,7 +958,11 @@ function Show-SecureSetupNotice {
 }
 
 function Start-ProScan {
-    param([Parameter(Mandatory)][string]$Key)
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
     $tool = Get-ExternalTool -Key $Key
 
     if (-not (Test-IsAdmin)) {
@@ -960,7 +994,7 @@ function Start-ProScan {
     # stays responsive. Consent has already been captured on the UI thread; the
     # resolution object is passed in via -Vars. Progress flows through $Report
     # (injected into the runspace) -> $SharedState.Status -> the status bar.
-    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Vars @{ ProKey = $Key; ProResolution = $resolution } -Work {
+    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Control $script:UIRef.UI.BtnProScan -Vars @{ ProKey = $Key; ProResolution = $resolution; ProMinLevel = $MinLevel } -Work {
         # Install if not present (consent already given on UI thread when ProResolution is set).
         $exe = Test-ExternalToolInstalled -Key $ProKey
         if (-not $exe) {
@@ -968,10 +1002,20 @@ function Start-ProScan {
             if (-not $inst.Success) { return [pscustomobject]@{ Error = $inst.Message; Findings=@() } }
             $exe = $inst.ExePath
         }
-        $findings = Invoke-ExternalDfirScan -Key $ProKey -ExePath $exe -Progress $Report
-        [pscustomobject]@{ Error=$null; Findings=$findings }
+        try {
+            $findings = @(Invoke-ExternalDfirScan -Key $ProKey -ExePath $exe -MinLevel $ProMinLevel -Progress $Report)
+        } catch {
+            return [pscustomobject]@{ Error = $_.Exception.Message; Findings=@() }
+        }
+        $signer = ''
+        $tool = Get-ExternalTool -Key $ProKey
+        if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
+            try { $signer = [string](Get-AuthenticodeSignature -LiteralPath $exe).SignerCertificate.Subject } catch { $signer = '' }
+        }
+        [pscustomobject]@{ Error=$null; Findings=$findings; Signer=$signer }
     } -OnDone {
         param($res)
+        $res = @($res) | Select-Object -First 1
         if ($res.Error) {
             [System.Windows.MessageBox]::Show("$($tool.Name) could not complete:`n$($res.Error)", 'Pro tool failed', 'OK', 'Error') | Out-Null
             return
@@ -986,20 +1030,151 @@ function Start-ProScan {
         $alerts = @($combined | Where-Object { $_.Status -eq 'Alert' }).Count
         $reviews = @($combined | Where-Object { $_.Status -eq 'Review' }).Count
         $script:UIRef.UI.CardDfir.Text = "$($alerts + $reviews)"
-        $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s)."
+        $sigNote = ''
+        if (($res.PSObject.Properties.Name -contains 'Signer') -and $res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
+        $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s).$sigNote"
         $script:UIRef.UI.StatusText.Text = "$($tool.Name) scan complete."
     }
 }
 
+$script:ProToolsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Pro Tools" Height="640" Width="700"
+        WindowStartupLocation="CenterOwner" Background="#0E1117"
+        FontFamily="Segoe UI" FontSize="13" ResizeMode="NoResize" WindowStyle="SingleBorderWindow">
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Grid.Row="0" Background="#0B1B34" Padding="22,18">
+      <StackPanel>
+        <TextBlock Text="Pro Tools" FontSize="19" FontWeight="Bold" Foreground="#E6EDF3"/>
+        <TextBlock TextWrapping="Wrap" Foreground="#9FB3D1" Margin="0,3,0,0" Text="Optional scanners made by other projects. Each is downloaded from its official source the first time you run it, after a consent screen, and checked before every run. Results appear as cards on the Investigate page."/>
+      </StackPanel>
+    </Border>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="22,16">
+      <StackPanel>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="HayName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="HayPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="HayLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="HayInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <TextBlock Text="Minimum level" Foreground="#8B949E" FontSize="11"/>
+              <ComboBox x:Name="HayLevel" Margin="0,2,0,8" SelectedIndex="1">
+                <ComboBoxItem Content="low"/>
+                <ComboBoxItem Content="medium"/>
+                <ComboBoxItem Content="high"/>
+                <ComboBoxItem Content="critical"/>
+              </ComboBox>
+              <Button x:Name="HayRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="ChsName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="ChsPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="ChsLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="ChsInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <TextBlock Text="Minimum level" Foreground="#8B949E" FontSize="11"/>
+              <ComboBox x:Name="ChsLevel" Margin="0,2,0,8" SelectedIndex="1">
+                <ComboBoxItem Content="low"/>
+                <ComboBoxItem Content="medium"/>
+                <ComboBoxItem Content="high"/>
+                <ComboBoxItem Content="critical"/>
+              </ComboBox>
+              <Button x:Name="ChsRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="AutName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="AutPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="AutLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="AutInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <Button x:Name="AutRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+    <Border Grid.Row="2" Background="#0B0E14" BorderBrush="#2A3140" BorderThickness="0,1,0,0" Padding="22,14">
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="PClose" Content="Close" Width="110" Height="36" Background="#21262D" Foreground="#E6EDF3" BorderThickness="0" Cursor="Hand" IsDefault="True" IsCancel="True"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+function Get-ProToolInstalledText {
+    <# One line for the Pro Tools dialog: installed version, or not installed. #>
+    param([Parameter(Mandatory)][string]$Key)
+    $exe = $null
+    try { $exe = Test-ExternalToolInstalled -Key $Key } catch { $exe = $null }
+    if (-not $exe) { return 'Not installed. Run downloads it first, after a consent screen.' }
+    $ver = ''
+    $meta = Join-Path (Split-Path -Path $exe -Parent) 'install.json'
+    try {
+        if (Test-Path -LiteralPath $meta -PathType Leaf) {
+            $m = Get-Content -LiteralPath $meta -Raw | ConvertFrom-Json
+            if ($m.PSObject.Properties.Name -contains 'Version') { $ver = [string]$m.Version }
+            if (($m.PSObject.Properties.Name -contains 'VersionText') -and $m.VersionText -and $ver -eq 'latest') { $ver = [string]$m.VersionText }
+        }
+    } catch { Write-CoreLog -Message ("Could not read {0}: {1}" -f $meta, $_.Exception.Message) -Level WARN }
+    if (-not $ver) { $ver = 'unknown version' }
+    return ("Installed: {0}" -f $ver)
+}
+
 function Show-ProToolMenu {
-    # Simple chooser: which pro tool to run.
-    $msg = "Pro Tools run best-in-class open-source DFIR scanners against your event logs.`n`nThey are downloaded from their official GitHub release the first time (you'll see a consent screen with the license), then reused.`n`nChoose a tool:`n`n  YES  = Hayabusa (timeline threat hunter)`n  NO   = Chainsaw (Sigma rule hunter)`n  CANCEL = close"
-    $r = [System.Windows.MessageBox]::Show($msg, 'Pro Tools (external, opt-in)', 'YesNoCancel', 'Question')
-    switch ($r) {
-        'Yes' { Start-ProScan -Key 'hayabusa' }
-        'No'  { Start-ProScan -Key 'chainsaw' }
-        default { }
+    <# Pro Tools chooser: one row per tool with its purpose, license, installed
+       version and a Run button. Hayabusa and Chainsaw take a minimum level. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    $reader = New-Object System.Xml.XmlNodeReader ([xml]$script:ProToolsXaml)
+    $dlg = [Windows.Markup.XamlReader]::Load($reader)
+    $dlg.Owner = $script:UIRef.Window
+    $c = @{}
+    foreach ($n in @('PClose', 'HayName', 'HayPurpose', 'HayLicense', 'HayInstalled', 'HayLevel', 'HayRun',
+                     'ChsName', 'ChsPurpose', 'ChsLicense', 'ChsInstalled', 'ChsLevel', 'ChsRun',
+                     'AutName', 'AutPurpose', 'AutLicense', 'AutInstalled', 'AutRun')) {
+        $c[$n] = $dlg.FindName($n)
+        if ($null -eq $c[$n]) { throw ("The Pro Tools window is missing {0}." -f $n) }
     }
+    $rows = @(
+        @{ Key = 'hayabusa'; Prefix = 'Hay'; Purpose = 'Builds a timeline of attacker activity from your Windows event logs using thousands of Sigma and Hayabusa rules.' },
+        @{ Key = 'chainsaw'; Prefix = 'Chs'; Purpose = 'Searches your Windows event logs with Sigma rules and flags known attack techniques.' },
+        @{ Key = 'autoruns'; Prefix = 'Aut'; Purpose = 'Lists everything that starts automatically (services, drivers, tasks, Winlogon, WMI, hijacks) and checks every signature. Signed MS entries are hidden.' }
+    )
+    foreach ($r in $rows) {
+        $tool = Get-ExternalTool -Key $r.Key
+        $c[$r.Prefix + 'Name'].Text = ("{0}  |  {1}" -f $tool.Name, $tool.Vendor)
+        $c[$r.Prefix + 'Purpose'].Text = $r.Purpose
+        $c[$r.Prefix + 'License'].Text = ("License: {0}" -f $tool.License)
+        $c[$r.Prefix + 'Installed'].Text = (Get-ProToolInstalledText -Key $r.Key)
+        [System.Windows.Automation.AutomationProperties]::SetName($c[$r.Prefix + 'Run'], ("Run {0}" -f $tool.Name))
+    }
+    # Captured hashtable, not $script:, because the handlers are closures.
+    $choice = @{ Key = $null; MinLevel = 'medium' }
+    $hayLevel = $c.HayLevel; $chsLevel = $c.ChsLevel
+    $c.HayRun.Add_Click({ $choice.Key = 'hayabusa'; $choice.MinLevel = [string]$hayLevel.SelectedItem.Content; $dlg.Close() }.GetNewClosure())
+    $c.ChsRun.Add_Click({ $choice.Key = 'chainsaw'; $choice.MinLevel = [string]$chsLevel.SelectedItem.Content; $dlg.Close() }.GetNewClosure())
+    $c.AutRun.Add_Click({ $choice.Key = 'autoruns'; $dlg.Close() }.GetNewClosure())
+    $c.PClose.Add_Click({ $dlg.Close() }.GetNewClosure())
+    [void]$dlg.ShowDialog()
+    if ($choice.Key) { Start-ProScan -Key $choice.Key -MinLevel $choice.MinLevel }
 }
 # ============================================================================
 function Start-StartupScan {
@@ -1131,7 +1306,7 @@ function Register-Handlers {
     $u.BtnOpenRollback.Add_Click({ Open-RollbackScript })
     $u.BtnMakeRestore.Add_Click({ Invoke-MakeRestorePoint })
     $u.BtnRemoveTools.Add_Click({
-        $r = [System.Windows.MessageBox]::Show('Delete all downloaded Pro Tools (Hayabusa/Chainsaw)? They can be re-downloaded later.', 'Remove downloaded tools', 'YesNo', 'Question')
+        $r = [System.Windows.MessageBox]::Show('Delete all downloaded Pro Tools (Hayabusa, Chainsaw, Autoruns)? They can be re-downloaded later.', 'Remove downloaded tools', 'YesNo', 'Question')
         if ($r -eq 'Yes') {
             try { $n = Remove-ExternalTools; [System.Windows.MessageBox]::Show("Removed $n downloaded tool folder(s).", 'Done', 'OK', 'Information') | Out-Null }
             catch { [System.Windows.MessageBox]::Show("Could not remove tools: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null }
@@ -1150,7 +1325,7 @@ function Start-Optimizer {
     $info = Get-CoreSystemInfo
 
     $script:UIRef = New-OptimizerWindow
-    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false }
+    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false }
 
     # header / admin badge
     $script:UIRef.UI.VersionText.Text = "v$($script:Core.Version)  -  Build $($info.Build)"
@@ -1204,8 +1379,11 @@ function Start-Optimizer {
                 $deep = Invoke-DeepScan;     Write-CoreLog -Message ("SelfTest: deep-scan findings = {0}" -f @($deep).Count) -Level INFO
                 # External-tool plumbing (no download/run): registry + consent XAML parse.
                 $reg = Get-ExternalToolRegistry; Write-CoreLog -Message ("SelfTest: external tools registered = {0}" -f @($reg).Count) -Level INFO
-                $consentOk = $false
-                try { $cr = New-Object System.Xml.XmlNodeReader ([xml]$script:ConsentXaml); [void][Windows.Markup.XamlReader]::Load($cr); $consentOk = $true } catch { Write-CoreLog -Message ("SelfTest: consent XAML FAILED: {0}" -f $_.Exception.Message) -Level ERROR }
+                $consentOk = $true
+                foreach ($xv in @('ConsentXaml', 'ProToolsXaml')) {
+                    try { $cr = New-Object System.Xml.XmlNodeReader ([xml](Get-Variable -Name $xv -Scope Script -ValueOnly)); [void][Windows.Markup.XamlReader]::Load($cr) }
+                    catch { $consentOk = $false; Write-CoreLog -Message ("SelfTest: {0} FAILED: {1}" -f $xv, $_.Exception.Message) -Level ERROR }
+                }
                 Write-Host "SELFTEST_OK findings=$(@($sec).Count) apps=$(@($inv).Count) dfir=$(@($df).Count) startup=$(@($st).Count) deep=$(@($deep).Count) extTools=$(@($reg).Count) consentXaml=$consentOk"
             } catch {
                 Write-Host "SELFTEST_FAIL $($_.Exception.Message)"

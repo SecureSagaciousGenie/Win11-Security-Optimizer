@@ -223,6 +223,185 @@ Describe 'Features' {
         }
     }
 
+    Describe 'Phase 4: Autoruns CSV parser' {
+        BeforeAll {
+            $script:Fixture = Join-Path $PSScriptRoot 'fixtures\autoruns.csv'
+            function New-AutorunsCsvText {
+                param([object[]]$Rows)
+                $h = '"Time","Entry Location","Entry","Enabled","Category","Profile","Description","Signer","Company","Image Path","Version","Launch String","MD5","SHA-1","PESHA-1","PESHA-256","SHA-256","IMP"'
+                $lines = @($h)
+                foreach ($r in $Rows) {
+                    $lines += ('"{0}","{1}","{2}","{3}","{4}","System-wide","","{5}","{6}","{7}","","{8}","","","","","{9}",""' -f $r.Time, $r.Loc, $r.Entry, $r.Enabled, $r.Category, $r.Signer, $r.Company, $r.Image, $r.Launch, $r.Sha)
+                }
+                return ($lines -join "`r`n")
+            }
+            function New-AutorunsRow {
+                param([string]$Category = 'Services', [string]$Entry = 'x', [string]$Signer = '', [string]$Image = 'C:\Program Files\x\x.exe', [string]$Company = '', [string]$Enabled = 'enabled')
+                [pscustomobject]@{ Time = '20260101-000000'; Loc = 'HKLM\System\CurrentControlSet\Services'; Entry = $Entry; Enabled = $Enabled; Category = $Category; Signer = $Signer; Company = $Company; Image = $Image; Launch = $Image; Sha = ('AB' * 32) }
+            }
+        }
+        It 'reads the real autorunsc output (UTF-16 LE with BOM) by column name' {
+            $bytes = [System.IO.File]::ReadAllBytes($script:Fixture)
+            $bytes[0] | Should -Be 0xFF
+            $bytes[1] | Should -Be 0xFE
+            $rows = @(Read-AutorunsCsv -Path $script:Fixture)
+            $rows.Count | Should -Be 65
+            @($rows | Where-Object { -not $_.Entry }).Count | Should -Be 0
+            $chrome = @($rows | Where-Object { $_.Entry -eq 'Google Chrome' })[0]
+            $chrome.Category | Should -Be 'Logon'
+            $chrome.Signer | Should -Be '(Verified) Google LLC'
+            $chrome.ImagePath | Should -Match '^C:\\Program Files\\Google\\Chrome\\'
+            $chrome.Time | Should -Match '^\d{8}-\d{6}$'
+        }
+        It 'decodes UTF8 with BOM, Unicode without BOM and ANSI' {
+            $t = 'Time,Entry Location'
+            ConvertFrom-AutorunsText -Bytes ([byte[]](@(0xEF, 0xBB, 0xBF) + [System.Text.Encoding]::UTF8.GetBytes($t))) | Should -Be $t
+            ConvertFrom-AutorunsText -Bytes ([System.Text.Encoding]::Unicode.GetBytes($t)) | Should -Be $t
+            ConvertFrom-AutorunsText -Bytes ([System.Text.Encoding]::ASCII.GetBytes($t)) | Should -Be $t
+        }
+        It 'skips banner lines before the header' {
+            $p = Join-Path $TestDrive 'banner.csv'
+            $text = "Sysinternals Autoruns v14.3 - Autostart program viewer`r`nCopyright 2002-2026 Mark Russinovich`r`n`r`n" + (New-AutorunsCsvText -Rows @(New-AutorunsRow -Entry 'one'))
+            [System.IO.File]::WriteAllText($p, $text, [System.Text.Encoding]::Unicode)
+            $rows = @(Read-AutorunsCsv -Path $p)
+            $rows.Count | Should -Be 1
+            $rows[0].Entry | Should -Be 'one'
+        }
+        It 'fails clearly when there is no header' {
+            $p = Join-Path $TestDrive 'noheader.csv'
+            Set-Content -LiteralPath $p -Value 'nothing useful'
+            { Read-AutorunsCsv -Path $p } | Should -Throw '*Entry Location*'
+        }
+    }
+
+    Describe 'Phase 4: Autoruns classification and cards' {
+        BeforeAll {
+            $script:Fixture = Join-Path $PSScriptRoot 'fixtures\autoruns.csv'
+            function New-Row { param($Category, $Signer, $Image, $Launch = '') [pscustomobject]@{ Category = $Category; Signer = $Signer; ImagePath = $Image; LaunchString = $Launch } }
+        }
+        It 'classifies <Label> as <Class>' -ForEach @(
+            @{ Label = 'a verified MS entry';                Class = 'Hidden'; Row = @{ Category = 'Known DLLs';  Signer = '(Verified) Microsoft Windows'; Image = 'C:\Windows\System32\kernel32.dll' } }
+            @{ Label = 'a non-MS Known DLL';                 Class = 'High';   Row = @{ Category = 'Known DLLs';  Signer = '(Verified) Contoso Ltd'; Image = 'C:\Windows\System32\evil.dll' } }
+            @{ Label = 'an unsigned image hijack';           Class = 'High';   Row = @{ Category = 'Image Hijacks'; Signer = ''; Image = 'C:\Tools\dbg.exe' } }
+            @{ Label = 'a WMI consumer';                     Class = 'High';   Row = @{ Category = 'WMI'; Signer = '(Not verified) x'; Image = 'C:\Windows\x.exe' } }
+            @{ Label = 'an LSA provider';                    Class = 'High';   Row = @{ Category = 'LSA Providers'; Signer = '(Verified) Contoso'; Image = 'C:\Windows\System32\c.dll' } }
+            @{ Label = 'a missing Known DLL (clean Windows)'; Class = 'Medium'; Row = @{ Category = 'Known DLLs';  Signer = ''; Image = 'File not found: C:\Windows\Syswow64\wow64cpu.dll' } }
+            @{ Label = 'an unverified service';              Class = 'Medium'; Row = @{ Category = 'Services'; Signer = '(Not verified) (Not Verified) Docker Inc'; Image = 'C:\Windows\system32\dockerd.exe' } }
+            @{ Label = 'a verified task in ProgramData';     Class = 'Medium'; Row = @{ Category = 'Scheduled Tasks'; Signer = '(Verified) Contoso'; Image = 'C:\ProgramData\Contoso\agent.exe' } }
+            @{ Label = 'a verified non-MS logon entry';      Class = 'Low';    Row = @{ Category = 'Logon'; Signer = '(Verified) Google LLC'; Image = 'C:\Program Files\Google\Chrome\chrome.exe' } }
+        ) {
+            Get-AutorunsRowClass -Row (New-Row -Category $Row.Category -Signer $Row.Signer -Image $Row.Image) | Should -Be $Class
+        }
+        It 'turns the real fixture into review cards per category and one verified-publisher card' {
+            $cards = @(ConvertFrom-AutorunsCsv -CsvPath $script:Fixture)
+            @($cards | Where-Object { $_.Status -eq 'Alert' }).Count | Should -Be 0
+            $review = @($cards | Where-Object { $_.Status -eq 'Review' })
+            @($review | ForEach-Object { $_.Id } | Sort-Object) | Should -Be @('AUTORUNS-DRIVERS', 'AUTORUNS-EXPLORER', 'AUTORUNS-KNOWNDLLS', 'AUTORUNS-SCHEDULEDTASKS', 'AUTORUNS-SERVICES')
+            @($review | ForEach-Object { [int]($_.Title -replace '^.*: (\d+) entr.*$', '$1') } | Measure-Object -Sum).Sum | Should -Be 13
+            $low = @($cards | Where-Object { $_.Id -eq 'AUTORUNS-VERIFIED' })
+            $low.Count | Should -Be 1
+            $low[0].Title | Should -Match ': 7 entries'
+            foreach ($c in $cards) { @($c.PSObject.Properties.Name) | Should -Contain 'Paths' }
+        }
+        It 'caps evidence at 25 lines and points to the CSV for the rest' {
+            $rows = @(1..30 | ForEach-Object { [pscustomobject]@{ Time = ''; Loc = 'HKLM\x'; Entry = "svc$_"; Enabled = 'enabled'; Category = 'Services'; Signer = ''; Company = ''; Image = "C:\Program Files\s$_.exe"; Launch = ''; Sha = '' } })
+            $h = '"Time","Entry Location","Entry","Enabled","Category","Signer","Company","Image Path","Launch String","SHA-256"'
+            $lines = @($h) + @($rows | ForEach-Object { '"{0}","{1}","{2}","{3}","{4}","{5}","{6}","{7}","{8}","{9}"' -f $_.Time, $_.Loc, $_.Entry, $_.Enabled, $_.Category, $_.Signer, $_.Company, $_.Image, $_.Launch, $_.Sha })
+            $p = Join-Path $TestDrive 'many.csv'
+            [System.IO.File]::WriteAllText($p, ($lines -join "`r`n"), [System.Text.Encoding]::Unicode)
+            $card = @(ConvertFrom-AutorunsCsv -CsvPath $p | Where-Object { $_.Id -eq 'AUTORUNS-SERVICES' })[0]
+            $card.Title | Should -Match ': 30 entries'
+            @($card.Evidence -split "`n" | Where-Object { $_ -match '^\s+svc\d+' }).Count | Should -Be 25
+            $card.Evidence | Should -Match ([regex]::Escape("and 5 more. See the full list in $p"))
+        }
+        It 'raises a High alert for a non-MS LSA provider and fills Paths with existing files only' {
+            $dll = Join-Path $TestDrive 'evil.dll'; Set-Content -LiteralPath $dll -Value 'x'
+            $h = '"Time","Entry Location","Entry","Enabled","Category","Signer","Company","Image Path","Launch String","SHA-256"'
+            $lines = @($h, ('"","HKLM\System\CurrentControlSet\Control\Lsa\Security Packages","evil","enabled","LSA Providers","(Not verified) Evil","Evil","{0}","evil",""' -f $dll),
+                           '"","HKLM\System\CurrentControlSet\Control\Lsa\Security Packages","gone","enabled","LSA Providers","(Not verified) Evil","Evil","C:\nope\gone.dll","gone",""')
+            $p = Join-Path $TestDrive 'lsa.csv'
+            [System.IO.File]::WriteAllText($p, ($lines -join "`r`n"), [System.Text.Encoding]::Unicode)
+            $card = @(ConvertFrom-AutorunsCsv -CsvPath $p | Where-Object { $_.Id -eq 'AUTORUNS-LSAPROVIDERS' })[0]
+            $card.Status | Should -Be 'Alert'
+            $card.Severity | Should -Be 'High'
+            @($card.Paths) | Should -Be @($dll)
+        }
+        It 'New-DfirFinding defaults Paths to an empty array' {
+            $c = New-DfirFinding -Id 'x' -Severity 'Info' -Status 'Info'
+            @($c.Paths).Count | Should -Be 0
+        }
+    }
+
+    Describe 'Phase 4: running Autoruns' {
+        BeforeAll {
+            Mock Set-ItemOwnerAdministrators { }
+            Mock New-Item { } -ParameterFilter { $ItemType -eq 'Directory' }
+            Mock Test-Path { $true } -ParameterFilter { $PathType -eq 'Container' }
+        }
+        It 'runs autorunsc with the agreed arguments and never with -v, -vs, -vt or -m' {
+            Mock Start-Process { Set-Content -LiteralPath $RedirectStandardOutput -Value 'x'; [pscustomobject]@{ ExitCode = 0 } }
+            $outRoot = Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools\autoruns\output'
+            [System.IO.Directory]::CreateDirectory($outRoot) | Out-Null
+            $r = Invoke-AutorunsScan -ExePath 'C:\x\autorunsc64.exe'
+            $r.OutputPath.StartsWith((Get-ExternalToolsRoot), [System.StringComparison]::OrdinalIgnoreCase) | Should -BeTrue
+            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+                (($ArgumentList -join ' ') -eq '-accepteula -a * -c -h -s -t *') -and (@($ArgumentList | Where-Object { $_ -in @('-v', '-vs', '-vt', '-m') }).Count -eq 0)
+            }
+            Should -Invoke Set-ItemOwnerAdministrators -ParameterFilter { $Path -eq $r.OutputPath } -Times 1
+        }
+        It 'throws when autorunsc exits with an error' {
+            Mock Start-Process { [pscustomobject]@{ ExitCode = 5 } }
+            { Invoke-AutorunsScan -ExePath 'C:\x\autorunsc64.exe' } | Should -Throw '*code 5*'
+        }
+        It 'checks integrity before running and returns cards' {
+            Mock Assert-ExternalToolIntegrity { }
+            Mock Invoke-AutorunsScan { [pscustomobject]@{ OutputPath = (Join-Path $PSScriptRoot 'fixtures\autoruns.csv'); Kind = 'AutorunsCsv' } }
+            $cards = @(Invoke-ExternalDfirScan -Key 'autoruns' -ExePath 'C:\x\autorunsc64.exe')
+            $cards.Count | Should -BeGreaterThan 0
+            Should -Invoke Assert-ExternalToolIntegrity -Times 1 -Exactly
+        }
+        It 'registers Autoruns as an Authenticode tool with one console exe per architecture' {
+            $t = Get-ExternalTool -Key 'autoruns'
+            Get-ExternalToolVerifyMode -Tool $t | Should -Be 'Authenticode'
+            $t.Url | Should -Be 'https://download.sysinternals.com/files/Autoruns.zip'
+            $t.ExeByArch['AMD64'] | Should -Be 'autorunsc64.exe'
+            $t.ExeByArch['x86'] | Should -Be 'autorunsc.exe'
+            $t.ExeByArch['ARM64'] | Should -Be 'autorunsc64a.exe'
+        }
+    }
+
+    Describe 'Phase 4: level filters' {
+        It 'passes the chosen minimum level to Hayabusa' {
+            Mock Assert-ExternalToolIntegrity { }
+            Mock Invoke-HayabusaScan { [pscustomobject]@{ OutputPath = 'none.csv' } }
+            Mock ConvertFrom-HayabusaCsv { }
+            Invoke-ExternalDfirScan -Key 'hayabusa' -ExePath 'C:\x\hayabusa.exe' -MinLevel 'high' | Out-Null
+            Should -Invoke Invoke-HayabusaScan -ParameterFilter { $MinLevel -eq 'high' } -Times 1 -Exactly
+        }
+        It 'lists levels at or above the minimum' {
+            Get-ExternalLevelAtOrAbove -MinLevel 'high' | Should -Be @('high', 'critical')
+            Get-ExternalLevelAtOrAbove -MinLevel 'low' | Should -Be @('low', 'medium', 'high', 'critical')
+        }
+        It 'filters Chainsaw detections below the minimum level' {
+            $p = Join-Path $TestDrive 'cs.json'
+            $json = ConvertTo-Json -InputObject @(
+                [pscustomobject]@{ name = 'A'; level = 'critical'; timestamp = 't1' },
+                [pscustomobject]@{ name = 'B'; level = 'medium'; timestamp = 't2' },
+                [pscustomobject]@{ name = 'C'; level = 'low'; timestamp = 't3' }
+            ) -Depth 6
+            Set-Content -LiteralPath $p -Value $json
+            $cards = @(ConvertFrom-ChainsawJson -JsonPath $p -MinLevel 'high')
+            @($cards | Where-Object { $_.Id -like 'CHAIN-[0-9]*' }).Count | Should -Be 1
+            (@($cards | Where-Object { $_.Id -eq 'CHAIN-SUMMARY' })[0]).Title | Should -Match '1 detection'
+            @(ConvertFrom-ChainsawJson -JsonPath $p -MinLevel 'low' | Where-Object { $_.Id -like 'CHAIN-[0-9]*' }).Count | Should -Be 3
+        }
+        It 'reports clean when nothing reaches the minimum level' {
+            $p = Join-Path $TestDrive 'cs2.json'
+            Set-Content -LiteralPath $p -Value (ConvertTo-Json -InputObject @([pscustomobject]@{ name = 'B'; level = 'low' }) -Depth 6)
+            (@(ConvertFrom-ChainsawJson -JsonPath $p -MinLevel 'high')[0]).Id | Should -Be 'CHAIN-CLEAN'
+        }
+    }
+
     Describe 'Phase 3: Build-Exe merged text' {
         It 'inlines the feature files in order and the merged text parses' {
             $out = Join-Path $TestDrive 'dist'

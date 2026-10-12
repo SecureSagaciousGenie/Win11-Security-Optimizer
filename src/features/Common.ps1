@@ -33,3 +33,14 @@ function Register-SecurityCheck {
     if ($FixAction) { $script:ExtraFixActions[$Id] = $FixAction }
     if ($FixTest)   { $script:ExtraFixTests[$Id]   = $FixTest }
 }
+
+function Test-UserWritablePath {
+    <# True when a path sits in a folder standard users can normally write to:
+       a user profile (AppData, Downloads, Desktop), Public, a Temp folder,
+       ProgramData or the Recycle Bin. A string test only; it never touches the
+       file system, so it is safe on paths from untrusted data. #>
+    param([AllowEmptyString()][AllowNull()][string]$Path)
+    if (-not $Path) { return $false }
+    $p = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    return ($p -match '(?i)^([a-z]:)?\\(Users\\[^\\]+\\|ProgramData\\|Windows\\Temp\\|\$Recycle\.Bin\\)|\\AppData\\|\\Temp\\')
+}

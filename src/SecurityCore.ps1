@@ -1117,11 +1117,12 @@ function New-DfirFinding {
         [string]$Id, [string]$Category, [string]$Title,
         [ValidateSet('Critical','High','Medium','Low','Info')][string]$Severity,
         [ValidateSet('Alert','Review','Clean','Info')][string]$Status,
-        [string]$What, [string]$Why, [string]$WhatToDo, $Evidence
+        [string]$What, [string]$Why, [string]$WhatToDo, $Evidence,
+        [string[]]$Paths = @()
     )
     [pscustomobject]@{
         Id=$Id; Category=$Category; Title=$Title; Severity=$Severity; Status=$Status
-        What=$What; Why=$Why; WhatToDo=$WhatToDo; Evidence=$Evidence
+        What=$What; Why=$Why; WhatToDo=$WhatToDo; Evidence=$Evidence; Paths=@($Paths)
     }
 }
 
@@ -2028,6 +2029,22 @@ function Get-ExternalToolRegistry {
             PinnedSha256 = @{
                 'chainsaw_all_platforms+rules.zip' = 'FBD5E12FBD70395BC7FDFDF2D3903E8545F27CA2F35E23059DF6177641B76205'
             }
+        },
+        [pscustomobject]@{
+            Key          = 'autoruns'
+            Name         = 'Autoruns'
+            Vendor       = 'MS Sysinternals'
+            License      = 'Sysinternals Software License Terms: free to use, not redistributable, downloaded from MS at runtime'
+            HomeUrl      = 'https://learn.microsoft.com/sysinternals/downloads/autoruns'
+            Url          = 'https://download.sysinternals.com/files/Autoruns.zip'
+            Summary      = 'Lists everything set to start automatically (services, drivers, scheduled tasks, Winlogon, WMI, image hijacks, AppInit, KnownDLLs, LSA providers) and checks each signature. Maintained by MS.'
+            Verify       = 'Authenticode'
+            # Console builds in Autoruns.zip, by architecture.
+            ExeByArch    = @{ 'AMD64' = 'autorunsc64.exe'; 'x86' = 'autorunsc.exe'; 'ARM64' = 'autorunsc64a.exe' }
+            ExtraFiles   = @('Eula.txt')
+            ExePattern   = '^autorunsc(64a?)?\.exe$'
+            OutputKind   = 'AutorunsCsv'
+            NeedsAdmin   = $true
         }
     )
 }
@@ -2742,8 +2759,30 @@ function Invoke-HayabusaScan {
     return [pscustomobject]@{ OutputPath=$outCsv; StdOut=$stdout; Kind='HayabusaCsv' }
 }
 
+function Get-ExternalLevelAtOrAbove {
+    <# Rule levels at or above the minimum, lowest first. #>
+    param([ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium')
+    $all = @('low', 'medium', 'high', 'critical')
+    return @($all[([array]::IndexOf($all, $MinLevel))..($all.Count - 1)])
+}
+
+function Get-ExternalLevelRank {
+    <# 0 info, 1 low, 2 medium, 3 high, 4 critical. Unknown text ranks as info. #>
+    param([AllowEmptyString()][string]$Level)
+    switch -regex (([string]$Level).ToLowerInvariant()) {
+        '^crit' { return 4 }
+        '^high' { return 3 }
+        '^med'  { return 2 }
+        '^low'  { return 1 }
+        default { return 0 }
+    }
+}
+
 function Invoke-ChainsawScan {
-    param([Parameter(Mandatory)][string]$ExePath, [scriptblock]$Progress)
+    param(
+        [Parameter(Mandatory)][string]$ExePath, [scriptblock]$Progress,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
     $report = { param($m) if ($Progress) { try { & $Progress $m } catch { } }; Write-CoreLog -Message $m -Level INFO }
     $toolDir = Split-Path $ExePath -Parent
     $outJson = Join-Path $script:Core.DataPath ("logs\chainsaw_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -2757,6 +2796,13 @@ function Invoke-ChainsawScan {
     $csArgs = @('hunt', $logDir, '--json', '-o', $outJson, '--skip-errors')
     if ($sigmaDir -and $mappingFile) { $csArgs += @('-s', $sigmaDir.FullName, '--mapping', $mappingFile.FullName) }
     if ($rulesDir) { $csArgs += @('-r', $rulesDir.FullName) }
+    # Pass --level only when this build's hunt help lists it; the parser also
+    # filters by level, so older builds still honour the minimum.
+    $helpText = ''
+    try { $helpText = (& $ExePath 'hunt' '--help' 2>&1 | Out-String) } catch { Write-CoreLog -Message ("chainsaw hunt --help failed: {0}" -f $_.Exception.Message) -Level WARN }
+    if ($helpText -match '--level') {
+        foreach ($lv in @(Get-ExternalLevelAtOrAbove -MinLevel $MinLevel)) { $csArgs += @('--level', $lv) }
+    }
 
     & $report 'Running Chainsaw against the local event logs - this can take a few minutes...'
     $stdout = ''
@@ -2848,7 +2894,10 @@ function ConvertFrom-HayabusaCsv {
 
 function ConvertFrom-ChainsawJson {
     <# Aggregates Chainsaw's JSON hunt output into finding cards (one per rule). #>
-    param([Parameter(Mandatory)][string]$JsonPath, [int]$MaxCards = 40)
+    param(
+        [Parameter(Mandatory)][string]$JsonPath, [int]$MaxCards = 40,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'low'
+    )
     $f = New-Object System.Collections.ArrayList
     if (-not (Test-Path $JsonPath)) {
         [void]$f.Add((New-DfirFinding -Id 'CHAIN-NONE' -Category 'Chainsaw (event-log hunt)' -Title 'Chainsaw produced no output' -Severity 'Info' -Status 'Info' -What 'No results file was created. Either no detections, or the logs could not be read (admin needed).' -Why '' -WhatToDo 'Re-run elevated via Start.bat if you expected results.' -Evidence ''))
@@ -2871,6 +2920,13 @@ function ConvertFrom-ChainsawJson {
         try { if ($d.PSObject.Properties.Name -contains 'timestamp') { $ts = $d.timestamp } } catch { }
         if (-not $name) { $name = 'Detection' }
         [pscustomobject]@{ Name=$name; Level=$level; Ts=$ts }
+    }
+    $minRank = Get-ExternalLevelRank -Level $MinLevel
+    $norm = @($norm | Where-Object { (Get-ExternalLevelRank -Level ([string]$_.Level)) -ge $minRank })
+    $items = @($norm)
+    if ($items.Count -eq 0) {
+        [void]$f.Add((New-DfirFinding -Id 'CHAIN-CLEAN' -Category 'Chainsaw (event-log hunt)' -Title ("Chainsaw found no detections at level {0} or above" -f $MinLevel) -Severity 'Info' -Status 'Clean' -What 'Chainsaw scanned the event logs and did not flag anything at or above the level you chose.' -Why '' -WhatToDo 'No action needed. Choose a lower minimum level in Pro Tools to see more.' -Evidence ''))
+        return $f.ToArray()
     }
 
     $byLevel = $norm | Group-Object Level
@@ -2909,7 +2965,10 @@ function Invoke-ExternalDfirScan {
       run -> parse -> return finding cards. The GUI calls this after
       Install-ExternalTool has succeeded (which itself is consent-gated).
     #>
-    param([Parameter(Mandatory)][string]$Key, [string]$ExePath, [scriptblock]$Progress)
+    param(
+        [Parameter(Mandatory)][string]$Key, [string]$ExePath, [scriptblock]$Progress,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { throw "Unknown tool '$Key'." }
     if (-not $ExePath) { $ExePath = Test-ExternalToolInstalled -Key $Key }
@@ -2926,12 +2985,16 @@ function Invoke-ExternalDfirScan {
 
     switch ($tool.OutputKind) {
         'HayabusaCsv' {
-            $run = Invoke-HayabusaScan -ExePath $ExePath -Progress $Progress
+            $run = Invoke-HayabusaScan -ExePath $ExePath -MinLevel $MinLevel -Progress $Progress
             return (ConvertFrom-HayabusaCsv -CsvPath $run.OutputPath)
         }
         'ChainsawJson' {
-            $run = Invoke-ChainsawScan -ExePath $ExePath -Progress $Progress
-            return (ConvertFrom-ChainsawJson -JsonPath $run.OutputPath)
+            $run = Invoke-ChainsawScan -ExePath $ExePath -MinLevel $MinLevel -Progress $Progress
+            return (ConvertFrom-ChainsawJson -JsonPath $run.OutputPath -MinLevel $MinLevel)
+        }
+        'AutorunsCsv' {
+            $run = Invoke-AutorunsScan -ExePath $ExePath -Progress $Progress
+            return (ConvertFrom-AutorunsCsv -CsvPath $run.OutputPath)
         }
         default { throw "No parser for output kind '$($tool.OutputKind)'." }
     }

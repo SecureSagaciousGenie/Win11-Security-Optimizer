@@ -87,3 +87,22 @@ function Get-FeatureFileList {
     if (-not $assign) { return @() }
     return @($assign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
 }
+
+function Get-ScriptScopeInClosureViolation {
+    <# A scriptblock turned into a closure with .GetNewClosure() runs in its own
+       dynamic module, so $script: inside it reads $null and writes are lost.
+       Returns one line per $script: variable used inside such a block. #>
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
+    $out = New-Object System.Collections.ArrayList
+    $calls = @($Ast.FindAll({
+        param($n)
+        ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and
+        ($n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
+        ($n.Member.Value -eq 'GetNewClosure')
+    }, $true))
+    foreach ($c in $calls) {
+        $vars = @($c.Expression.FindAll({ param($n) ($n -is [System.Management.Automation.Language.VariableExpressionAst]) -and $n.VariablePath.IsScript }, $true))
+        foreach ($v in $vars) { [void]$out.Add(('{0}:{1} {2} inside a GetNewClosure block' -f $v.Extent.File, $v.Extent.StartLineNumber, $v.Extent.Text)) }
+    }
+    return @($out.ToArray())
+}

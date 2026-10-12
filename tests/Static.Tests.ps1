@@ -59,6 +59,13 @@ Describe 'Static checks' {
         }
     }
 
+    Context 'Closures' {
+        It '<Name> uses no $script: variable inside a GetNewClosure block' -ForEach $script:SrcFiles {
+            $parsed = Get-ScriptAst -Path $Path
+            @(Get-ScriptScopeInClosureViolation -Ast $parsed.Ast) | Should -BeNullOrEmpty
+        }
+    }
+
     Context 'XAML' {
         It 'finds the XAML strings in Optimizer.ps1' {
             @($script:XamlCases).Count | Should -BeGreaterThan 0

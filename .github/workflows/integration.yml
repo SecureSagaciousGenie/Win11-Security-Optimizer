@@ -83,3 +83,71 @@ jobs:
         with:
           name: fixtures
           path: fixtures-out
+
+  pro-tools:
+    name: Pro Tools pipeline on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GetNewClosure scope semantics on Windows PowerShell 5.1
+        run: |
+          $script:Probe = 'outer'
+          function Test-Closure { $sb = { "closure reads script:Probe = [$script:Probe]" }.GetNewClosure(); & $sb }
+          Test-Closure
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Autoruns via the tool's own downloader, signature check, run, cards and tamper refusal
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $res = Resolve-ExternalToolRelease -Key 'autoruns'
+          'Resolved {0} ({1} MB, integrity: {2})' -f $res.DownloadUrl, $res.SizeMB, $res.Sha256Source
+          $inst = Install-ExternalTool -Key 'autoruns' -ConsentAccepted -Resolution $res -Progress $say
+          if (-not $inst.Success) { throw $inst.Message }
+          'Installed {0}' -f $inst.ExePath
+          'Signer: {0}' -f (Get-AuthenticodeSignature -LiteralPath $inst.ExePath).SignerCertificate.Subject
+          'Test-MicrosoftSigned: {0}' -f (Test-MicrosoftSigned -Path $inst.ExePath)
+          $cards = @(Invoke-ExternalDfirScan -Key 'autoruns' -ExePath $inst.ExePath -Progress $say)
+          'Cards: {0}' -f $cards.Count
+          foreach ($c in $cards) { '  [{0}/{1}] {2} | paths {3}' -f $c.Status, $c.Severity, $c.Title, @($c.Paths).Count }
+          if ($cards.Count -eq 0) { throw 'No cards were produced.' }
+          $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root $base)
+          'Tools root secure: {0}' -f (Test-ToolsRootSecure)
+          if (-not (Test-TreeOwnership -Root $base)) { throw 'The next launch would quarantine the base.' }
+          $b = [System.IO.File]::ReadAllBytes($inst.ExePath)
+          $b[4096] = $b[4096] -bxor 0xFF
+          [System.IO.File]::WriteAllBytes($inst.ExePath, $b)
+          $refused = $false
+          try { Invoke-ExternalDfirScan -Key 'autoruns' -ExePath $inst.ExePath | Out-Null } catch { $refused = $true; 'Refused after one flipped byte: {0}' -f $_.Exception.Message }
+          if (-not $refused) { throw 'A tampered exe was NOT refused.' }
+
+      - name: Chainsaw pinned download and --level support
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $res = Resolve-ExternalToolRelease -Key 'chainsaw'
+          'Resolved {0} {1} (integrity: {2})' -f $res.Name, $res.Version, $res.Sha256Source
+          $inst = Install-ExternalTool -Key 'chainsaw' -ConsentAccepted -Resolution $res -Progress $say
+          if (-not $inst.Success) { throw $inst.Message }
+          $help = (& $inst.ExePath 'hunt' '--help' 2>&1 | Out-String)
+          'hunt --help lists --level: {0}' -f ($help -match '--level')
+
+      - name: GUI self-test (best effort; needs a desktop session)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', '.\src\Optimizer.ps1', '-SelfTest' -NoNewWindow -Wait -PassThru -RedirectStandardOutput selftest.out.txt -RedirectStandardError selftest.err.txt
+          'Exit code: {0}' -f $p.ExitCode
+          Get-Content selftest.out.txt -ErrorAction SilentlyContinue
+          Get-Content selftest.err.txt -ErrorAction SilentlyContinue | Select-Object -First 30
