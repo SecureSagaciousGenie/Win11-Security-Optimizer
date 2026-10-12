@@ -1,6 +1,8 @@
 <#
     SecurityCore.ps1
     ----------------
+    Author: Ahmad Shaukat
+
     Backend engine for the Windows 11 Security Optimizer.
 
     This module contains ALL logic (scanning, hardening, debloat, DFIR triage,
@@ -44,6 +46,14 @@ $script:Core = [ordered]@{
 }
 
 $script:SeverityWeight = @{ 'Critical'=10; 'High'=7; 'Medium'=4; 'Low'=2; 'Info'=0 }
+
+# Extension points. Feature files (src\features) register into these when they
+# load at the end of this file: extra Security-tab checks (Id = scriptblock that
+# returns New-Finding objects, read-only) and the fix and verify scriptblocks
+# that Get-SecurityFixAction and Test-SecurityFixApplied fall back to.
+$script:ExtraSecurityChecks = [ordered]@{}
+$script:ExtraFixActions     = @{}
+$script:ExtraFixTests       = @{}
 
 function Initialize-Core {
     <# Sets up the data/log folder. Safe to call repeatedly.
@@ -503,8 +513,26 @@ function Invoke-SecurityScan {
         & $add (New-Finding -Id 'RDP-NLA' -Category 'Remote Access' -Name 'RDP Network Level Authentication' -Severity 'High' -Status $(if($nla -eq 1){'Pass'}else{'Fail'}) -Observed $(if($nla -ne $null){"NLA=$nla"}else{'Not set'}) -Expected 'Enabled (1)' -Detail 'Forces auth before a session starts.' -Advice 'Require NLA for RDP.' -RiskTier 'Elevated' -Fixable ($nla -ne 1))
     }
 
+    foreach ($x in @(Invoke-ExtraSecurityCheck)) { [void]$findings.Add($x) }
+
     Write-CoreLog -Message ("Security scan complete: {0} findings." -f $findings.Count) -Level INFO
     return $findings.ToArray()
+}
+
+function Invoke-ExtraSecurityCheck {
+    <# Runs every check registered by a feature file. A check that throws becomes
+       an Error finding naming it, so a broken check is never silently skipped. #>
+    $out = New-Object System.Collections.ArrayList
+    foreach ($id in @($script:ExtraSecurityChecks.Keys)) {
+        try {
+            foreach ($x in @(& $script:ExtraSecurityChecks[$id])) { if ($x) { [void]$out.Add($x) } }
+        } catch {
+            Write-CoreLog -Message ("Security check {0} failed: {1}" -f $id, $_.Exception.Message) -Level WARN
+            [void]$out.Add((New-Finding -Id $id -Category 'Checks' -Name ("Check {0} could not run" -f $id) -Severity 'Info' -Status 'Error' `
+                -Observed 'Error' -Expected 'Check runs' -Detail ("The check {0} could not run: {1}" -f $id, $_.Exception.Message) -Advice 'Re-run as Administrator. If it keeps failing, note it as a tool issue.' -RiskTier 'AuditOnly'))
+        }
+    }
+    return @($out.ToArray())
 }
 
 function Get-SecurityScore {
@@ -615,7 +643,10 @@ function Get-SecurityFixAction {
         'HVCI'       { return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled' -Value 1 -Type DWord } }
         'RDP-ENABLED'{ return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord } }
         'RDP-NLA'    { return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Type DWord } }
-        default      { return $null }
+        default      {
+            if ($script:ExtraFixActions.ContainsKey($Id)) { return $script:ExtraFixActions[$Id] }
+            return $null
+        }
     }
 }
 
@@ -678,7 +709,10 @@ function Test-SecurityFixApplied {
             'RDP-ENABLED'{ return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') -eq 1) }
             'RDP-NLA'    { return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication') -eq 1) }
             'SMB1'       { try { return ((Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol).State -ne 'Enabled') } catch { return $true } }
-            default      { return $true }
+            default      {
+                if ($script:ExtraFixTests.ContainsKey($Id)) { return [bool](& $script:ExtraFixTests[$Id]) }
+                return $true
+            }
         }
     } catch { return $false }
 }
@@ -1959,6 +1993,7 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^hayabusa.*\.exe$'
             OutputKind   = 'HayabusaCsv'
             NeedsAdmin   = $true
+            Verify       = 'Sha256'
             # PINNED version + per-asset SHA-256 (the strongest upstream integrity
             # anchor). This is the version the project has reviewed; the download is
             # verified against THESE hashes, not just whatever the API advertises at
@@ -1988,6 +2023,7 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^chainsaw.*windows.*\.exe$|^chainsaw\.exe$'
             OutputKind   = 'ChainsawJson'
             NeedsAdmin   = $true
+            Verify       = 'Sha256'
             PinnedVersion = 'v2.16.5'
             PinnedSha256 = @{
                 'chainsaw_all_platforms+rules.zip' = 'FBD5E12FBD70395BC7FDFDF2D3903E8545F27CA2F35E23059DF6177641B76205'
@@ -1999,6 +2035,138 @@ function Get-ExternalToolRegistry {
 function Get-ExternalTool {
     param([Parameter(Mandatory)][string]$Key)
     Get-ExternalToolRegistry | Where-Object { $_.Key -eq $Key } | Select-Object -First 1
+}
+
+function Get-ExternalToolVerifyMode {
+    <# 'Sha256' (pinned or GitHub digest, checked before extraction) or
+       'Authenticode' (fixed MS URL, MS signature checked on every exe after
+       extraction). Read from the static registry only, never from a resolution
+       object, so a caller cannot downgrade a tool's verification. #>
+    param([Parameter(Mandatory)]$Tool)
+    if (($Tool.PSObject.Properties.Name -contains 'Verify') -and ([string]$Tool.Verify -eq 'Authenticode')) { return 'Authenticode' }
+    return 'Sha256'
+}
+
+function Get-ExternalToolExeName {
+    <# For Authenticode tools: the console exe this tool runs on this machine's
+       architecture (from ExeByArch). Throws when there is no build for it. #>
+    param([Parameter(Mandatory)]$Tool)
+    $arch = Get-SystemArch
+    $name = $null
+    if ($Tool.PSObject.Properties.Name -contains 'ExeByArch') { $name = $Tool.ExeByArch[$arch] }
+    if (-not $name) { throw ("{0} has no build for architecture {1}." -f $Tool.Name, $arch) }
+    return [string]$name
+}
+
+function Get-ExternalToolExePattern {
+    param([Parameter(Mandatory)]$Tool)
+    if ((Get-ExternalToolVerifyMode -Tool $Tool) -eq 'Authenticode') {
+        return ('^{0}$' -f [regex]::Escape((Get-ExternalToolExeName -Tool $Tool)))
+    }
+    return [string]$Tool.ExePattern
+}
+
+function Resolve-MicrosoftToolDownload {
+    <# Authenticode tools have no GitHub release: the download is always the
+       fixed MS URL in the registry. A HEAD request reports the size for the
+       consent screen. Metadata only. #>
+    param([Parameter(Mandatory)]$Tool)
+    $url = [string]$Tool.Url
+    if ($url -notmatch '^https://download\.sysinternals\.com/files/[A-Za-z0-9]+\.zip$') {
+        throw ("{0} is not a fixed download.sysinternals.com file URL; refusing to download." -f $url)
+    }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-CoreLog -Message ("TLS 1.2 could not be enabled: {0}" -f $_.Exception.Message) -Level WARN }
+    $resp = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $size = $null
+    try {
+        $len = @($resp.Headers['Content-Length']) | Select-Object -First 1
+        if ($len) { $size = [int64]$len }
+    } catch { Write-CoreLog -Message ("{0}: no usable Content-Length in the HEAD reply." -f $Tool.Name) -Level WARN }
+    [pscustomobject]@{
+        Key          = $Tool.Key
+        Name         = $Tool.Name
+        Vendor       = $Tool.Vendor
+        License      = $Tool.License
+        HomeUrl      = $Tool.HomeUrl
+        Summary      = $Tool.Summary
+        Version      = 'latest'
+        AssetName    = [System.IO.Path]::GetFileName($url)
+        DownloadUrl  = $url
+        SizeBytes    = $size
+        SizeMB       = $(if ($null -ne $size) { [math]::Round($size / 1MB, 1) } else { $null })
+        Arch         = Get-SystemArch
+        NeedsAdmin   = $Tool.NeedsAdmin
+        Published    = ''
+        Sha256Expected = $null
+        Sha256Source   = 'authenticode'
+        PinnedVersion  = $null
+        VersionMatchesPin = $false
+        IsLatest       = $true
+    }
+}
+
+function Expand-ZipEntrySafe {
+    <# Extract only the named top-level entries of a zip. Entries in sub-folders
+       or with path segments are skipped, so a crafted entry can never write
+       outside the destination. Returns the extracted paths. #>
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $out = New-Object System.Collections.ArrayList
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $full = [string]$entry.FullName
+            if ($full -match '[\\/]' -or $full -match '\.\.') { continue }
+            $wanted = $false
+            foreach ($n in $Names) { if ([string]::Equals($full, $n, [System.StringComparison]::OrdinalIgnoreCase)) { $wanted = $true; break } }
+            if (-not $wanted) { continue }
+            $target = Join-Path $Destination $full
+            $in = $entry.Open()
+            try {
+                $fs = [System.IO.File]::Create($target)
+                try { $in.CopyTo($fs) } finally { $fs.Dispose() }
+            } finally { $in.Dispose() }
+            [void]$out.Add($target)
+        }
+    } finally { $zip.Dispose() }
+    return @($out.ToArray())
+}
+
+function Assert-ExternalToolIntegrity {
+    <# Run immediately before every elevated run of an external tool. Throws
+       unless the tools root is admin-locked, the install manifest and recorded
+       exe hash exist, the exe hash still matches and, for Authenticode tools,
+       the exe is still signed by MS. Fails closed. #>
+    param([Parameter(Mandatory)]$Tool, [Parameter(Mandatory)][string]$ExePath)
+    if (-not (Test-ToolsRootSecure)) {
+        throw "$($Tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
+    }
+    $installDir  = Split-Path -Path $ExePath -Parent
+    $metaPath    = Join-Path $installDir 'install.json'
+    $exeHashPath = Join-Path $installDir 'exe.sha256'
+    if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) {
+        throw "$($Tool.Name) has no install manifest (install.json); it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    if (-not (Test-Path -LiteralPath $exeHashPath -PathType Leaf)) {
+        throw "$($Tool.Name) has no recorded executable hash (exe.sha256); it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    $pinned = ([string](Get-Content -LiteralPath $exeHashPath -Raw)).Trim().ToUpper()
+    if (-not $pinned) {
+        throw "$($Tool.Name)'s recorded hash file is empty. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    $current = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash.ToUpper()
+    if ($pinned -ne $current) {
+        throw "The $($Tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    if ((Get-ExternalToolVerifyMode -Tool $Tool) -eq 'Authenticode') {
+        if (-not (Test-MicrosoftSigned -Path $ExePath)) {
+            throw "The $($Tool.Name) executable no longer carries a valid MS signature. Refusing to run. Delete it in Restore & Logs and re-download."
+        }
+    }
 }
 
 function Get-SystemArch {
@@ -2219,6 +2387,7 @@ function Resolve-ExternalToolRelease {
     )
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { throw "Unknown tool '$Key'." }
+    if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') { return (Resolve-MicrosoftToolDownload -Tool $tool) }
     $arch = Get-SystemArch
     $pattern = $tool.AssetPattern[$arch]
     if (-not $pattern) { throw "$($tool.Name) has no build for architecture $arch." }
@@ -2326,14 +2495,15 @@ function Test-ExternalToolInstalled {
     param([Parameter(Mandatory)][string]$Key, [string]$Version)
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { return $null }
+    $pattern = Get-ExternalToolExePattern -Tool $tool
     if ($Version) {
         $p = Get-ExternalToolInstallPath -Key $Key -Version $Version
-        return (Find-ExternalToolExe -InstallPath $p -ExePattern $tool.ExePattern)
+        return (Find-ExternalToolExe -InstallPath $p -ExePattern $pattern)
     }
     # any installed version
     $base = Join-Path (Get-ExternalToolsRoot) $Key
     if (-not (Test-Path $base)) { return $null }
-    return (Find-ExternalToolExe -InstallPath $base -ExePattern $tool.ExePattern)
+    return (Find-ExternalToolExe -InstallPath $base -ExePattern $pattern)
 }
 
 function Install-ExternalTool {
@@ -2365,6 +2535,15 @@ function Install-ExternalTool {
 
     try {
         if (-not $Resolution) { $Resolution = Resolve-ExternalToolRelease -Key $Key }
+        $verifyMode = Get-ExternalToolVerifyMode -Tool $tool
+        $downloadUrl = [string]$Resolution.DownloadUrl
+        $assetName = [string]$Resolution.AssetName
+        if ($verifyMode -eq 'Authenticode') {
+            # Always the fixed MS URL from the registry, whatever the caller passed.
+            $downloadUrl = [string]$tool.Url
+            $assetName = [System.IO.Path]::GetFileName($downloadUrl)
+            $runExeName = Get-ExternalToolExeName -Tool $tool
+        }
 
         # The main thread secures the base and tools root (Initialize-SecureToolsRoot
         # in Start-ProScan) before this runs. This may run in a background runspace,
@@ -2382,23 +2561,23 @@ function Install-ExternalTool {
 
         $installPath = Get-ExternalToolInstallPath -Key $Key -Version $Resolution.Version
         if (-not (Test-Path $installPath)) { New-Item -ItemType Directory -Path $installPath -Force | Out-Null }
-        $zipPath = Join-Path $installPath $Resolution.AssetName
+        $zipPath = Join-Path $installPath $assetName
 
-        & $report ("Downloading {0} {1} ({2} MB) from {3}" -f $tool.Name, $Resolution.Version, $Resolution.SizeMB, $Resolution.DownloadUrl)
+        & $report ("Downloading {0} {1} ({2} MB) from {3}" -f $tool.Name, $Resolution.Version, $Resolution.SizeMB, $downloadUrl)
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
         $downloaded = $false
         # Prefer BITS (resumable, shows in Windows), fall back to WebClient.
         try {
             Import-Module BitsTransfer -ErrorAction Stop
-            Start-BitsTransfer -Source $Resolution.DownloadUrl -Destination $zipPath -ErrorAction Stop
+            Start-BitsTransfer -Source $downloadUrl -Destination $zipPath -ErrorAction Stop
             $downloaded = $true
         } catch {
             & $report 'BITS unavailable - using direct download...'
             try {
                 $wc = New-Object System.Net.WebClient
                 $wc.Headers.Add('User-Agent','Win11SecurityOptimizer')
-                $wc.DownloadFile($Resolution.DownloadUrl, $zipPath)
+                $wc.DownloadFile($downloadUrl, $zipPath)
                 $downloaded = $true
             } catch {
                 throw "Download failed: $($_.Exception.Message)"
@@ -2417,66 +2596,96 @@ function Install-ExternalTool {
             throw 'Downloaded file is not a valid ZIP archive (unexpected content). Aborting for safety.'
         }
 
-        # Compute the SHA-256 and VERIFY it against the expected hash (pinned hash
-        # preferred, else the digest GitHub advertised for this exact asset). This is
-        # the real integrity gate - if it does not match, OR if there is NO expected
-        # hash at all, the file is deleted and nothing is extracted or executed.
-        # These binaries run ELEVATED, so we FAIL CLOSED rather than trusting an
-        # unverifiable download.
-        $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToUpper()
+        $sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpper()
         & $report ("SHA-256: {0}" -f $sha)
         $expected = $null; $expectedSource = 'none'
-        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected } } catch { }
-        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Source') { $expectedSource = [string]$Resolution.Sha256Source } } catch { }
 
-        if (-not $expected) {
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-            throw 'No trusted hash is available for this download (neither a project-pinned hash nor a GitHub-advertised digest). Because this tool runs with administrator rights, it will NOT be installed from an unverifiable download. Aborting.'
-        }
-        if ($sha -ne $expected.ToUpper()) {
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-            throw ("SHA-256 MISMATCH. Expected {0} ({1}) but got {2}. The download was corrupted or tampered with; it has been deleted and NOT run." -f $expected.ToUpper(), $expectedSource, $sha)
-        }
-        if ($expectedSource -eq 'pinned') {
-            & $report 'SHA-256 verified against the project-pinned (reviewed) hash.'
-            Write-CoreLog -Message ("{0} {1} SHA-256 verified against PINNED hash: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+        if ($verifyMode -eq 'Sha256') {
+            # Verify the archive hash against the trusted hash (pinned hash preferred,
+            # else the digest GitHub advertised for this exact asset) BEFORE anything
+            # is extracted. No hash or a mismatch deletes the file. These binaries run
+            # ELEVATED, so we FAIL CLOSED rather than trust an unverifiable download.
+            if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected }
+            if ($Resolution.PSObject.Properties.Name -contains 'Sha256Source') { $expectedSource = [string]$Resolution.Sha256Source }
+            if ($expectedSource -eq 'authenticode') { $expected = $null }
+
+            if (-not $expected) {
+                Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+                throw 'No trusted hash is available for this download (neither a project-pinned hash nor a GitHub-advertised digest). Because this tool runs with administrator rights, it will NOT be installed from an unverifiable download. Aborting.'
+            }
+            if ($sha -ne ([string]$expected).ToUpper()) {
+                Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+                throw ("SHA-256 MISMATCH. Expected {0} ({1}) but got {2}. The download was corrupted or tampered with; it has been deleted and NOT run." -f ([string]$expected).ToUpper(), $expectedSource, $sha)
+            }
+            if ($expectedSource -eq 'pinned') {
+                & $report 'SHA-256 verified against the project-pinned (reviewed) hash.'
+                Write-CoreLog -Message ("{0} {1} SHA-256 verified against PINNED hash: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            } else {
+                & $report 'SHA-256 verified against the official GitHub release digest (this version is newer than the project-reviewed pin).'
+                Write-CoreLog -Message ("{0} {1} SHA-256 verified against GitHub digest: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            }
+
+            & $report 'Extracting...'
+            Expand-Archive -Path $zipPath -DestinationPath $installPath -Force
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue   # keep only the extracted tool
+
+            $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
+            if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
         } else {
-            & $report 'SHA-256 verified against the official GitHub release digest (this version is newer than the project-reviewed pin).'
-            Write-CoreLog -Message ("{0} {1} SHA-256 verified against GitHub digest: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            # Authenticode: MS publishes no hash for these zips. Extract ONLY the exe
+            # this tool runs (plus listed text files) as top-level entries, then
+            # require a valid MS signature on the exe before it is ever run.
+            $expectedSource = 'authenticode'
+            $names = @($runExeName)
+            if ($tool.PSObject.Properties.Name -contains 'ExtraFiles') { $names += @($tool.ExtraFiles) }
+            & $report 'Extracting the signed program...'
+            $extracted = @(Expand-ZipEntrySafe -ZipPath $zipPath -Destination $installPath -Names $names)
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+            $exe = Join-Path $installPath $runExeName
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+                foreach ($x in $extracted) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue }
+                throw ("The download from {0} did not contain {1}, the program {2} needs on a {3} PC. Nothing was run." -f $downloadUrl, $runExeName, $tool.Name, (Get-SystemArch))
+            }
+            if (-not (Test-MicrosoftSigned -Path $exe)) {
+                foreach ($x in $extracted) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue }
+                throw ("{0} is not signed by MS (the Authenticode check failed). It has been deleted and was not run." -f $runExeName)
+            }
+            & $report ("{0} is signed by MS (Authenticode verified)." -f $runExeName)
+            Write-CoreLog -Message ("{0}: {1} Authenticode-verified as MS-signed; zip SHA-256 {2}" -f $tool.Name, $runExeName, $sha) -Level OK
         }
 
-        & $report 'Extracting...'
-        Expand-Archive -Path $zipPath -DestinationPath $installPath -Force
-        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue   # keep only the extracted tool
-
-        $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
-        if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
-
-        # PIN THE EXE HASH NOW - at install time, immediately after extracting from
-        # the hash-verified ZIP - so the trusted baseline is "what we just extracted
-        # from a verified archive", NOT "whatever happens to be on disk at first run".
-        $exeHash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToUpper()
+        # Record the exe hash NOW, straight after extraction from the verified
+        # download, so the trusted baseline is "what we just verified", not
+        # "whatever is on disk at first run". Re-checked before every run.
+        $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpper()
         $exeHashPath = Join-Path $installPath 'exe.sha256'
         Write-SecureFile -Path $exeHashPath -Value $exeHash
 
-        # Verify the binary runs (sanity + anti-corruption check). Different tools
-        # expose version differently (Hayabusa uses a 'help' subcommand, not
-        # --version), so try a few and capture the first line of banner/output.
         $verText = ''
-        foreach ($probe in @(@('help'), @('--version'), @('-V'), @('--help'))) {
-            try {
-                $out = (& $exe @probe 2>&1 | Out-String).Trim()
-                if ($out -and $out -notmatch 'unexpected argument') { $verText = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim(); break }
-            } catch { }
+        if ($verifyMode -eq 'Authenticode') {
+            # Never probe Sysinternals tools by running them: without -accepteula
+            # they open a EULA window that would block this background runspace.
+            try { $verText = [string](Get-Item -LiteralPath $exe).VersionInfo.FileVersion } catch { Write-CoreLog -Message ("No file version for {0}: {1}" -f $exe, $_.Exception.Message) -Level WARN }
+            if (-not $verText) { $verText = 'version not recorded in the file' }
+        } else {
+            # Verify the binary runs (sanity + anti-corruption check). Different tools
+            # expose version differently (Hayabusa uses a 'help' subcommand, not
+            # --version), so try a few and capture the first line of banner/output.
+            foreach ($probe in @(@('help'), @('--version'), @('-V'), @('--help'))) {
+                try {
+                    $out = (& $exe @probe 2>&1 | Out-String).Trim()
+                    if ($out -and $out -notmatch 'unexpected argument') { $verText = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim(); break }
+                } catch { Write-CoreLog -Message ("Version probe {0} failed: {1}" -f ($probe -join ' '), $_.Exception.Message) -Level DEBUG }
+            }
+            if (-not $verText) { $verText = 'ran (version banner not detected)' }
         }
-        if (-not $verText) { $verText = 'ran (version banner not detected)' }
         & $report ("Verified binary: {0}" -f $verText)
 
         # Record install metadata (incl. both the verified ZIP hash and the pinned
         # exe hash) for later re-verification.
         $meta = [pscustomobject]@{
             Key=$Key; Name=$tool.Name; Version=$Resolution.Version; Vendor=$tool.Vendor; License=$tool.License
-            Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
+            Source=$downloadUrl; Verify=$verifyMode; Sha256=$sha; Sha256Expected=$expected; Sha256Source=$expectedSource; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
         }
         Write-SecureFile -Path (Join-Path $installPath 'install.json') -Value (ConvertTo-Json -InputObject $meta -Depth 6)
 
@@ -2492,7 +2701,7 @@ function Install-ExternalTool {
             Set-ToolsFolderAcl -Path (Get-ExternalToolsRoot)
         }
 
-        Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $Resolution.DownloadUrl)
+        Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $downloadUrl)
 
         return [pscustomobject]@{ Success=$true; Message='Installed.'; ExePath=$exe; Version=$Resolution.Version; Sha256=$sha }
     } catch {
@@ -2706,39 +2915,12 @@ function Invoke-ExternalDfirScan {
     if (-not $ExePath) { $ExePath = Test-ExternalToolInstalled -Key $Key }
     if (-not $ExePath) { throw "$($tool.Name) is not installed. Download it first." }
 
-    # Re-verify the binary's hash against the hash recorded at INSTALL time BEFORE
-    # running it elevated. Fails CLOSED: if the install manifest or the pinned exe
-    # hash is missing (e.g. a non-admin planted the exe without going through our
-    # verified installer), we refuse to run rather than trusting whatever is there.
+    # Re-verify the binary immediately before running it elevated: recorded exe
+    # hash for every tool, plus the MS signature for Authenticode tools. Fails closed.
     try {
-        # The tools root must be admin-locked first - a user-writable location means
-        # anything in it (incl. install.json / exe.sha256) could have been forged.
-        if (-not (Test-ToolsRootSecure)) {
-            throw "$($tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
-        }
-
-        $installDir  = Split-Path $ExePath -Parent
-        $metaPath    = Join-Path $installDir 'install.json'
-        $exeHashPath = Join-Path $installDir 'exe.sha256'
-
-        # Fail closed when the trust anchors our installer writes are absent.
-        if (-not (Test-Path $metaPath)) {
-            throw "$($tool.Name) has no install manifest (install.json) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-        if (-not (Test-Path $exeHashPath)) {
-            throw "$($tool.Name) has no pinned executable hash (exe.sha256) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-
-        $pinned    = (Get-Content $exeHashPath -Raw).Trim().ToUpper()
-        $curExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToUpper()
-        if (-not $pinned) {
-            throw "$($tool.Name)'s pinned hash file is empty. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-        if ($pinned -ne $curExeHash) {
-            throw "The $($tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
-        }
+        Assert-ExternalToolIntegrity -Tool $tool -ExePath $ExePath
     } catch {
-        if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { } }
+        if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { Write-CoreLog -Message 'Progress callback failed.' -Level DEBUG } }
         throw
     }
 
@@ -2755,3 +2937,15 @@ function Invoke-ExternalDfirScan {
     }
 }
 
+
+#region FeatureLoader
+# ----------------------------------------------------------------------------
+#  Feature files. Explicit, ordered list (no wildcard) so load order is fixed
+#  and a stray .ps1 dropped into the folder is never run. Build-Exe.ps1 inlines
+#  the same list in the same order and drops this block.
+# ----------------------------------------------------------------------------
+$script:FeatureFiles = @('Common.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
+foreach ($featureFile in $script:FeatureFiles) {
+    . (Join-Path (Join-Path $PSScriptRoot 'features') $featureFile)
+}
+#endregion FeatureLoader

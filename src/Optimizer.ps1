@@ -1,6 +1,8 @@
 <#
     Optimizer.ps1  --  Windows 11 Security Optimizer (WPF GUI)
     ----------------------------------------------------------
+    Author: Ahmad Shaukat
+
     Everything the user does happens in this window:
       Dashboard | Security | Debloat | Investigate (DFIR) | Startup | Restore & Logs
 

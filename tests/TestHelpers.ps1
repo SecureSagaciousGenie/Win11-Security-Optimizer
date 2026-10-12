@@ -74,3 +74,16 @@ function Get-XamlStringFromScript {
     }
     return @($out.ToArray())
 }
+
+function Get-FeatureFileList {
+    <# The string constants in SecurityCore's $script:FeatureFiles list, in order. #>
+    param([Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Ast)
+    $assign = $Ast.Find({
+        param($n)
+        ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) -and
+        ($n.Left -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+        ($n.Left.VariablePath.UserPath -eq 'script:FeatureFiles')
+    }, $true)
+    if (-not $assign) { return @() }
+    return @($assign.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+}

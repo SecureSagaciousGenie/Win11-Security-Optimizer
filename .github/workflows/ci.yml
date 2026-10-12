@@ -23,13 +23,23 @@ jobs:
       - name: Show engine
         run: $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Output
 
+      - name: Cache PowerShell modules
+        uses: actions/cache@v4
+        with:
+          path: ~\Documents\WindowsPowerShell\Modules
+          key: psmodules-${{ runner.os }}-pester5plus-psscriptanalyzer-v1
+
       - name: Install Pester 5 and PSScriptAnalyzer
         run: |
-          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $pester = @(Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5.0' })
+          $psa = @(Get-Module -ListAvailable PSScriptAnalyzer)
+          if ($pester.Count -eq 0 -or $psa.Count -eq 0) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          }
+          if ($pester.Count -eq 0) { Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser }
+          if ($psa.Count -eq 0) { Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser }
           Get-Module -ListAvailable Pester, PSScriptAnalyzer | Select-Object Name, Version | Format-Table | Out-String | Write-Output
 
       - name: Pester
