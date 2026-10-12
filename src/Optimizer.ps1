@@ -895,10 +895,10 @@ function Show-ConsentDialog {
         [System.Windows.MessageBox]::Show("$($tool.Name) cannot be installed: no trusted SHA-256 is available for this download (the project has no pinned hash for it and GitHub advertised no digest).`n`nBecause this tool runs with administrator rights, it will not be downloaded from an unverifiable source.", 'Download refused (no verifiable hash)', 'OK', 'Warning') | Out-Null
         return $null
     } elseif ($src -eq 'pinned') {
-        $cInteg.Text = 'SHA-256 pinned & reviewed by this project (verified before running)'
+        $cInteg.Text = ("SHA-256 pinned & reviewed by this project for {0} (verified before running)" -f $res.Version)
         try { $cInteg.Foreground = '#3FB950' } catch { }
     } else {
-        $cInteg.Text = ("SHA-256 from GitHub release digest (verified before running). Note: version {0} is newer than this project's reviewed version {1}." -f $res.Version, $res.PinnedVersion)
+        $cInteg.Text = ("SHA-256 from GitHub's official release digest for {0}, verified before running. This is a newer release than the project's reviewed version {1}, so its hash has not been independently reviewed here." -f $res.Version, $res.PinnedVersion)
         try { $cInteg.Foreground = '#D29922' } catch { }
     }
 
@@ -1164,6 +1164,18 @@ function Start-Optimizer {
 
     Register-Handlers
     Show-Page 'Dashboard'
+
+    # If we are elevated but could NOT secure the ProgramData data folder (e.g. a
+    # standard user pre-created it and denied Administrators), Initialize-Core fell
+    # back to %LOCALAPPDATA% for rollback/backup files. That is user-writable, so
+    # warn the user explicitly rather than letting it pass silently.
+    if (-not $SelfTest -and $script:Core.SecureSetupWarning) {
+        try {
+            [System.Windows.MessageBox]::Show(
+                ($script:Core.SecureSetupWarning + "`n`nUntil this is resolved, treat the generated rollback script as lower-trust and review it before running it elevated."),
+                'Could not secure the backup folder', 'OK', 'Warning') | Out-Null
+        } catch { }
+    }
 
     if ($SelfTest) {
         # Build + render the window, run read-only scans synchronously, then auto-close.

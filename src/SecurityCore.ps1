@@ -34,6 +34,7 @@ $script:Core = [ordered]@{
     BackupDir     = $null
     RollbackFile  = $null
     BackupFile    = $null
+    SecureSetupWarning = $null
     TranscriptOn  = $false
     RestorePointMade = $false
     Rollback      = (New-Object System.Collections.ArrayList)   # apply-order rollback blocks
@@ -74,16 +75,27 @@ function Initialize-Core {
         $env:W11SO_SESSION_LOG = $script:Core.LogFile
     }
     # Rollback/backup go to the admin-locked ProgramData tree when elevated.
+    # The rollback script is run ELEVATED, so it must not sit anywhere a non-admin
+    # process could tamper with it. The WHOLE base folder gets the same ownership
+    # gate + delete-and-recreate as the tools folder (a standard user who
+    # pre-creates C:\ProgramData\Win11SecurityOptimizer, or its backups subfolder,
+    # keeps ownership and could swap in a malicious Rollback_*.ps1). If securing
+    # fails while elevated we DO fall back to %LOCALAPPDATA% so the app still works,
+    # but we record a warning for the UI instead of failing silently.
     $backupDir = Join-Path $DataPath 'backups'
-    try {
-        if (Test-IsAdmin) {
-            $secureBase = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
-            Set-ToolsFolderAcl -Path $secureBase   # idempotent lock of the base
+    $script:Core.SecureSetupWarning = $null
+    if (Test-IsAdmin) {
+        try {
+            $secureBase = Initialize-SecureBase    # verifies ownership, recreates if planted, locks ACL
             $secureBackups = Join-Path $secureBase 'backups'
             if (-not (Test-Path $secureBackups)) { New-Item -ItemType Directory -Path $secureBackups -Force | Out-Null }
+            Set-TreeOwnerToAdministrators -Path $secureBackups   # our own folder -> Administrators-owned so the gate stays green
             $backupDir = $secureBackups
+        } catch {
+            $script:Core.SecureSetupWarning = ("Could not secure the system data folder C:\ProgramData\Win11SecurityOptimizer ({0}). Rollback and backup files for this session will be written to your user profile (%LOCALAPPDATA%) instead, where another program running as you could modify them before you run the rollback. Re-run as administrator, or check who owns that folder in File Explorer (Properties > Security > Advanced > Owner)." -f $_.Exception.Message)
+            Write-CoreLog -Message $script:Core.SecureSetupWarning -Level WARN
         }
-    } catch { }
+    }
     $script:Core.BackupDir    = $backupDir
     $script:Core.RollbackFile = Join-Path $backupDir ("Rollback_{0}.ps1" -f $stamp)
     $script:Core.BackupFile   = Join-Path $backupDir ("Backup_{0}.json"  -f $stamp)
@@ -1580,6 +1592,36 @@ function Get-ServiceInstallEventFields {
     return $out
 }
 
+function Test-IsDefenderDefinitionDriver {
+    <# True only for a GENUINE Microsoft Defender definition-update driver install.
+       Both conditions must hold on the event's OWN structured fields:
+         * ServiceName is exactly MpKsl + 8 hex digits.
+         * ImagePath, once a leading NT prefix (\??\ or \\?\) is stripped, STARTS
+           WITH %ProgramData%\Microsoft\Windows Defender\Definition Updates\ and
+           ENDS WITH \MpKslDrv.sys, with nothing after it.
+       The anchoring is what matters: an earlier version matched the Definition
+       Updates string ANYWHERE in ImagePath, so a planted service with
+       ImagePath = C:\Users\Public\evil.exe "...\Definition Updates\x" was wrongly
+       filtered out. Here, extra arguments or a different real path fail the anchor. #>
+    param([string]$ServiceName, [string]$ImagePath)
+    if ($ServiceName -notmatch '^MpKsl[0-9a-fA-F]{8}$') { return $false }
+    if (-not $ImagePath) { return $false }
+
+    # Strip a leading NT object-manager prefix the kernel often prepends.
+    $path = $ImagePath
+    if ($path -match '^(\\\?\?\\|\\\\\?\\)(.+)$') { $path = $Matches[2] }
+    $path = $path.Trim()
+
+    # The genuine driver image is a bare .sys path (no quotes, no trailing args).
+    # Build the expected prefix from the real ProgramData location on this machine.
+    $expectedPrefix = (Join-Path $env:ProgramData 'Microsoft\Windows Defender\Definition Updates\')
+    $startsOk = $path.StartsWith($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+    $endsOk   = $path.EndsWith('\MpKslDrv.sys', [System.StringComparison]::OrdinalIgnoreCase)
+    # Reject anything with a quote or whitespace-delimited argument after the .sys.
+    $noExtra  = ($path -notmatch '["]') -and ($path.Length -eq ($path.TrimEnd()).Length)
+    return ($startsOk -and $endsOk -and $noExtra)
+}
+
 function Invoke-EventLogTriage {
     <#
       Reviews the Windows event logs for attacker footprints (the heart of what
@@ -1643,18 +1685,17 @@ function Invoke-EventLogTriage {
     # Defender's own anti-malware definition-update drivers (MpKslDrv) are
     # reinstalled constantly under random-looking names. We filter THOSE out, but
     # match on the event's OWN structured fields (ServiceName + ImagePath), NOT a
-    # substring of the message. A substring filter was bypassable: a malicious
-    # service literally named "Windows Defender Update Service" running from
-    # C:\Users\Public would vanish. The genuine Defender driver has BOTH a service
-    # name like MpKsl + 8 hex chars AND an image path under the Defender
-    # "Definition Updates" tree - a planted service can't fake both.
+    # substring of the message. The ImagePath match is ANCHORED (starts-with the
+    # Definition Updates tree, ends with \MpKslDrv.sys, nothing after) so a planted
+    # service cannot smuggle an evil path in and append the trusted string as an
+    # argument to dodge the filter (e.g. ImagePath = C:\Users\Public\evil.exe
+    # "...\Definition Updates\x"). A planted service can fake neither the anchored
+    # path nor the MpKsl+8-hex name together.
     try {
-        $defUpdateRx = [regex]::Escape('\Windows Defender\Definition Updates\')
         $svc = @(& $queryEvents 'System' 7045 200) | Where-Object {
             if (-not $_) { return $false }
             $info = Get-ServiceInstallEventFields $_
-            $isDefenderDefDriver = ($info.ServiceName -match '^MpKsl[0-9a-fA-F]{8}$') -and ($info.ImagePath -match $defUpdateRx)
-            -not $isDefenderDefDriver
+            -not (Test-IsDefenderDefinitionDriver -ServiceName $info.ServiceName -ImagePath $info.ImagePath)
         }
         $svc = @($svc)
         if ($svc.Count -gt 0) {
@@ -1911,9 +1952,10 @@ function Test-FolderOwnedBySystemOrAdmins {
     } catch { return $false }
 }
 
-function Test-ToolsTreeOwnership {
-    <# Read-only: true only if the tools root AND every item under it are owned by
-       Administrators/SYSTEM. Catches a non-admin pre-planting tools\x\evil.exe. #>
+function Test-TreeOwnership {
+    <# Read-only: true only if $Root AND every item under it are owned by
+       Administrators/SYSTEM. Catches a non-admin pre-planting content anywhere in
+       the tree (tools\x\evil.exe, or a swapped backups\Rollback_*.ps1). #>
     param([string]$Root)
     if (-not (Test-Path $Root)) { return $true }   # nothing there yet = fine
     if (-not (Test-FolderOwnedBySystemOrAdmins $Root)) { return $false }
@@ -1923,6 +1965,88 @@ function Test-ToolsTreeOwnership {
         }
         return $true
     } catch { return $false }
+}
+
+function Test-ToolsTreeOwnership {
+    <# Back-compat shim: tools-root ownership check (now a thin wrapper). #>
+    param([string]$Root)
+    return (Test-TreeOwnership -Root $Root)
+}
+
+function Remove-TreeSafely {
+    <# Delete a directory tree that a STANDARD USER may have built, while running
+       ELEVATED, without following a planted junction/symlink out of the tree. A
+       reparse point (junction/symlink) planted inside the tree could otherwise
+       turn `Remove-Item -Recurse` into an elevated delete of whatever it targets.
+       So: first walk the tree and remove every reparse-point item WITHOUT
+       recursing into it (deleting only the link, never its target), deepest-first;
+       then remove whatever remains. #>
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    $reparse = [System.IO.FileAttributes]::ReparsePoint
+    # Deepest-first so we unlink nested junctions before their parents are touched.
+    $items = @()
+    try { $items = @(Get-ChildItem -Path $Path -Recurse -Force -ErrorAction Stop) } catch { $items = @() }
+    $items = $items | Sort-Object { $_.FullName.Length } -Descending
+    foreach ($it in $items) {
+        try {
+            if (($it.Attributes -band $reparse) -eq $reparse) {
+                # It's a junction/symlink. Delete the LINK only - never -Recurse,
+                # which would traverse into (and delete the contents of) the target.
+                if ($it.PSIsContainer) {
+                    [System.IO.Directory]::Delete($it.FullName, $false)
+                } else {
+                    [System.IO.File]::Delete($it.FullName)
+                }
+            }
+        } catch {
+            Write-CoreLog -Message ("Could not unlink reparse point {0}: {1}" -f $it.FullName, $_.Exception.Message) -Level WARN
+        }
+    }
+    # If the ROOT itself is a reparse point, unlink it (not its target) and stop.
+    try {
+        $rootInfo = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (($rootInfo.Attributes -band $reparse) -eq $reparse) {
+            [System.IO.Directory]::Delete($Path, $false)
+            return
+        }
+    } catch { }
+    # Remaining real files/folders: safe to recurse now (no reparse points left inside).
+    Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+}
+
+function Initialize-SecureBase {
+    <# Admin-only: ensure the WHOLE base folder
+       (%ProgramData%\Win11SecurityOptimizer) is owned by Administrators/SYSTEM and
+       ACL-locked. If it (or anything under it - backups, tools, logs) is NOT so
+       owned (a standard user pre-created it), DELETE and recreate it so no planted
+       content (e.g. a malicious Rollback_*.ps1) survives. Returns the secured base
+       path, or throws if it cannot be secured. Shared by both the tools folder and
+       the rollback/backup folder. #>
+    if (-not (Test-IsAdmin)) { throw 'Administrator rights are required to prepare the secure data folder.' }
+    $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+    if (Test-Path $base) {
+        if (-not (Test-TreeOwnership -Root $base)) {
+            Write-CoreLog -Message 'System data folder (or an item in it) is not owned by Administrators/SYSTEM - deleting and recreating to drop any planted content.' -Level WARN
+            Remove-TreeSafely -Path $base
+        }
+    }
+    if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
+    Set-ToolsFolderAcl -Path $base
+    if (-not (Test-FolderOwnedBySystemOrAdmins $base)) { throw 'The system data folder could not be secured (ownership check failed after locking).' }
+    return $base
+}
+
+function Initialize-SecureToolsRoot {
+    <# Admin-only: secure the base folder (see Initialize-SecureBase), then create
+       and lock the tools subtree. Any non-admin-owned content anywhere under the
+       base is deleted first. Returns the secured tools root, or throws. #>
+    $base = Initialize-SecureBase
+    $root = Join-Path $base 'tools'
+    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    Set-ToolsFolderAcl -Path $root
+    if (-not (Test-ToolsRootSecure)) { throw 'The tools folder could not be secured (ACL/ownership check failed).' }
+    return $root
 }
 
 function Test-ToolsRootSecure {
@@ -1945,30 +2069,6 @@ function Test-ToolsRootSecure {
         }
     } catch { return $false }
     return (Test-ToolsTreeOwnership -Root $root)
-}
-
-function Initialize-SecureToolsRoot {
-    <# Admin-only: create the ProgramData tools tree, lock its ACL, and — crucially
-       — if it (or anything in it) is NOT already owned by Administrators/SYSTEM
-       (i.e. a standard user pre-created it to plant a binary), DELETE and recreate
-       it so no attacker-planted content survives. Returns the secured root path,
-       or throws if it cannot be secured. #>
-    if (-not (Test-IsAdmin)) { throw 'Administrator rights are required to prepare the secure tools folder.' }
-    $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
-    $root = Join-Path $base 'tools'
-
-    if (Test-Path $root) {
-        if (-not (Test-ToolsTreeOwnership -Root $root)) {
-            Write-CoreLog -Message 'Tools folder (or an item in it) is not owned by Administrators/SYSTEM - deleting and recreating to drop any planted content.' -Level WARN
-            Remove-Item -Path $root -Recurse -Force -ErrorAction Stop
-        }
-    }
-    if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
-    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
-    Set-ToolsFolderAcl -Path $base
-    Set-ToolsFolderAcl -Path $root
-    if (-not (Test-ToolsRootSecure)) { throw 'The tools folder could not be secured (ACL/ownership check failed).' }
-    return $root
 }
 
 function Set-ToolsFolderAcl {
@@ -2018,23 +2118,54 @@ function Set-TreeOwnerToAdministrators {
 
 function Resolve-ExternalToolRelease {
     <#
-      Queries the official GitHub repo for the latest release and selects the
-      correct Windows asset for this machine's architecture. METADATA ONLY - does
-      not download the binary. Returns a resolution object or throws a clear error.
+      Queries the official GitHub repo and selects the correct Windows asset for
+      this machine's architecture. METADATA ONLY - does not download the binary.
+
+      By DEFAULT it resolves the project-PINNED version (releases/tags/<PinnedVersion>)
+      so the reviewed, pinned SHA-256 genuinely applies - this is what makes the pin
+      meaningful. Pass -UseLatest to explicitly fetch the newest release instead
+      (an opt-in choice the user makes knowingly); in that mode the pinned hash is
+      only used if the latest tag happens to equal the pin, otherwise verification
+      falls back to GitHub's advertised digest for that newer asset.
+
+      Returns a resolution object or throws a clear error.
     #>
-    param([Parameter(Mandatory)][string]$Key)
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [switch]$UseLatest
+    )
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { throw "Unknown tool '$Key'." }
     $arch = Get-SystemArch
     $pattern = $tool.AssetPattern[$arch]
     if (-not $pattern) { throw "$($tool.Name) has no build for architecture $arch." }
 
+    $pinnedVersion = $null
+    try { if ($tool.PSObject.Properties.Name -contains 'PinnedVersion') { $pinnedVersion = [string]$tool.PinnedVersion } } catch { }
+
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
     $headers = @{ 'User-Agent' = 'Win11SecurityOptimizer'; 'Accept' = 'application/vnd.github+json' }
-    $api = "https://api.github.com/repos/$($tool.Repo)/releases/latest"
 
-    Write-CoreLog -Message ("Resolving latest release for {0} ({1})" -f $tool.Name, $tool.Repo) -Level INFO
-    $rel = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+    # Decide which release to fetch. Default = the pinned tag (so the pin holds);
+    # -UseLatest or no pin configured = /releases/latest.
+    if ($pinnedVersion -and -not $UseLatest) {
+        $api = "https://api.github.com/repos/$($tool.Repo)/releases/tags/$pinnedVersion"
+        Write-CoreLog -Message ("Resolving PINNED release {0} for {1} ({2})" -f $pinnedVersion, $tool.Name, $tool.Repo) -Level INFO
+    } else {
+        $api = "https://api.github.com/repos/$($tool.Repo)/releases/latest"
+        Write-CoreLog -Message ("Resolving LATEST release for {0} ({1})" -f $tool.Name, $tool.Repo) -Level INFO
+    }
+
+    try {
+        $rel = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30 -ErrorAction Stop
+    } catch {
+        # If the pinned tag has vanished upstream, say so clearly rather than
+        # silently drifting to 'latest'.
+        if ($pinnedVersion -and -not $UseLatest) {
+            throw ("Could not fetch the pinned release {0} of {1} ({2}). It may have been removed upstream. Error: {3}" -f $pinnedVersion, $tool.Name, $tool.Repo, $_.Exception.Message)
+        }
+        throw
+    }
 
     $asset = $rel.assets | Where-Object { $_.name -match $pattern } | Select-Object -First 1
     if (-not $asset) {
@@ -2049,27 +2180,25 @@ function Resolve-ExternalToolRelease {
     $apiSha256 = $null
     if ($digest -and $digest -match '^sha256:([0-9a-fA-F]{64})$') { $apiSha256 = $Matches[1].ToUpper() }
 
-    # PINNED hash is the strongest anchor: it was reviewed out-of-band and committed
-    # to this registry, so it also catches a MALICIOUS UPSTREAM re-release of the
-    # same tag (which the API digest, coming from that same release, would not).
-    # Precedence for the hash we verify against:
-    #   1. pinned hash for this exact asset name  (strongest)
-    #   2. the API-advertised digest               (catches in-transit tampering)
-    #   3. none                                     (caller fails closed)
-    $pinnedSha = $null
-    try { if ($tool.PSObject.Properties.Name -contains 'PinnedSha256' -and $tool.PinnedSha256 -and $tool.PinnedSha256.ContainsKey($asset.name)) { $pinnedSha = ([string]$tool.PinnedSha256[$asset.name]).ToUpper() } } catch { }
-    $pinnedVersion = $null
-    try { if ($tool.PSObject.Properties.Name -contains 'PinnedVersion') { $pinnedVersion = [string]$tool.PinnedVersion } } catch { }
     $versionMatchesPin = ($pinnedVersion -and ($rel.tag_name -eq $pinnedVersion))
 
-    # If a newer tag than the pin shipped, the pinned hash won't match the new
-    # asset. Warn clearly - but still verify against the API digest so the download
-    # is at least transit-verified; the caller refuses if even that is missing.
+    # PINNED hash is the strongest anchor, BUT it is keyed only by asset name, and
+    # some tools (e.g. Chainsaw) reuse the SAME asset name across versions. So only
+    # trust the pinned hash when the resolved version ACTUALLY equals the pin -
+    # otherwise the v2.16.5 hash would be applied to a v2.16.6 download and raise a
+    # false "tampered" alarm. When the version matches, use the pinned hash; when it
+    # does not (an explicit -UseLatest on a newer tag), fall back to the API digest.
+    $pinnedSha = $null
+    if ($versionMatchesPin) {
+        try { if ($tool.PSObject.Properties.Name -contains 'PinnedSha256' -and $tool.PinnedSha256 -and $tool.PinnedSha256.ContainsKey($asset.name)) { $pinnedSha = ([string]$tool.PinnedSha256[$asset.name]).ToUpper() } } catch { }
+    }
+
     if ($pinnedVersion -and -not $versionMatchesPin) {
-        Write-CoreLog -Message ("{0}: latest release {1} differs from the reviewed/pinned version {2}. Using the GitHub-advertised digest for this release; its hash has not been reviewed by this project." -f $tool.Name, $rel.tag_name, $pinnedVersion) -Level WARN
+        Write-CoreLog -Message ("{0}: resolved release {1} differs from the reviewed/pinned version {2}. Verifying against GitHub's advertised digest for this release; its hash has not been reviewed by this project." -f $tool.Name, $rel.tag_name, $pinnedVersion) -Level WARN
     }
 
     $sha256Expected = if ($pinnedSha) { $pinnedSha } elseif ($apiSha256) { $apiSha256 } else { $null }
+    $sha256Source   = if ($pinnedSha) { 'pinned' } elseif ($apiSha256) { 'github-digest' } else { 'none' }
 
     [pscustomobject]@{
         Key          = $Key
@@ -2086,10 +2215,11 @@ function Resolve-ExternalToolRelease {
         Arch         = $arch
         NeedsAdmin   = $tool.NeedsAdmin
         Published    = $rel.published_at
-        Sha256Expected = $sha256Expected   # pinned hash if we have one, else API digest, else $null
-        Sha256Source   = if ($pinnedSha) { 'pinned' } elseif ($apiSha256) { 'github-digest' } else { 'none' }
+        Sha256Expected = $sha256Expected   # pinned hash (only if version matches), else API digest, else $null
+        Sha256Source   = $sha256Source
         PinnedVersion  = $pinnedVersion
         VersionMatchesPin = $versionMatchesPin
+        IsLatest       = [bool]$UseLatest
     }
 }
 
