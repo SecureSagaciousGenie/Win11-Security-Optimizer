@@ -555,6 +555,9 @@ function Invoke-Background {
     # needs is captured as locals here.
     $ui = $script:UIRef.UI
     $state = $script:State
+    # Script functions are not visible inside the closure either; keep a
+    # reference so a failed job reaches the session log.
+    $writeLog = ${function:Write-CoreLog}
 
     # Thread-safe channel so the background work can push live status to the UI.
     $shared = [hashtable]::Synchronized(@{ Status = $Status })
@@ -609,6 +612,9 @@ function Invoke-Background {
             } finally {
                 $state.Busy = $false
                 if ($Control) { try { $Control.IsEnabled = $true } catch { } }
+            }
+            if ($failure) {
+                try { & $writeLog -Message ("Background task '{0}' failed: {1}" -f $Status, $failure) -Level ERROR } catch { $ui.StatusText.Text = "Error: $failure (not logged)" }
             }
             if ($Next) {
                 try { & $Next $failure } catch { try { $ui.StatusText.Text = "Error: $($_.Exception.Message)" } catch { } }
@@ -1663,6 +1669,14 @@ function Get-SelfTestItemCount {
     return @($Items).Count
 }
 
+function Write-SelfTestLine {
+    <# SelfTest result line: to stdout for the CI runner and to the session log. #>
+    param([Parameter(Mandatory)][string]$Text)
+    try { Write-CoreLog -Message $Text -Level INFO } catch { [Console]::Error.WriteLine('SelfTest: could not write the session log.') }
+    try { [Console]::Out.WriteLine($Text); [Console]::Out.Flush() }
+    catch { Write-CoreLog -Message ("SelfTest: stdout write failed: {0}" -f $_.Exception.Message) -Level WARN }
+}
+
 function Close-SelfTestWindow {
     $script:CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:CloseTimer.Interval = [TimeSpan]::FromMilliseconds(400)
@@ -1673,16 +1687,32 @@ function Close-SelfTestWindow {
 function Test-SelfTestFullScan {
     <# SelfTest timer tick: waits for the Full Scan chain, checks that every
        scan filled its list and none failed, prints the result and closes. #>
-    $fs = $script:State.FullScan
-    $done = ($null -ne $fs) -and [bool]$fs.Done
-    if (-not $done -and (Get-Date) -lt $script:SelfTestDeadline) { return }
-    $script:SelfTestTimer.Stop()
+    try {
+        $fs = $script:State.FullScan
+        $done = ($null -ne $fs) -and [bool]$fs.Done
+        $script:SelfTestTicks++
+        if ($script:SelfTestTicks % 20 -eq 1) {
+            Write-CoreLog -Message ("SelfTest: tick {0}, full scan started={1} done={2} busy={3} status={4}" -f $script:SelfTestTicks, ($null -ne $fs), $done, $script:State.Busy, $script:UIRef.UI.StatusText.Text) -Level INFO
+        }
+        if (-not $done -and (Get-Date) -lt $script:SelfTestDeadline) { return }
+        $script:SelfTestTimer.Stop()
+        Test-SelfTestResult -FullScan $fs -Done $done
+    } catch {
+        try { $script:SelfTestTimer.Stop() } catch { Write-CoreLog -Message 'SelfTest: timer stop failed.' -Level WARN }
+        Write-SelfTestLine ("SELFTEST_FAIL self-test tick: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
+    }
+    Close-SelfTestWindow
+}
+
+function Test-SelfTestResult {
+    param($FullScan, [bool]$Done)
+    $fs = $FullScan; $done = $Done
     $u = $script:UIRef.UI
     $security = Get-SelfTestItemCount $u.SecList.ItemsSource
     $apps = Get-SelfTestItemCount $u.BloatList.ItemsSource
     $startup = Get-SelfTestItemCount $u.StartupListView.ItemsSource
     $cards = @($script:State.Cards).Count
-    Write-Host ("SELFTEST_FULLSCAN done={0} security={1} apps={2} cards={3} startup={4} busy={5} status={6}" -f $done, $security, $apps, $cards, $startup, $script:State.Busy, $u.StatusText.Text)
+    Write-SelfTestLine ("SELFTEST_FULLSCAN done={0} security={1} apps={2} cards={3} startup={4} busy={5} status={6}" -f $done, $security, $apps, $cards, $startup, $script:State.Busy, $u.StatusText.Text)
     $problems = @()
     if (-not $done) { $problems += 'the full scan did not finish within 10 minutes' }
     if ($security -lt 1) { $problems += 'no security findings were listed' }
@@ -1691,9 +1721,8 @@ function Test-SelfTestFullScan {
     if ($startup -lt 0) { $problems += 'the startup list was never filled' }
     if ($script:State.Busy) { $problems += 'the busy flag is still set' }
     if ($fs) { foreach ($e in @($fs.Errors)) { $problems += [string]$e } }
-    if ($problems.Count -eq 0) { Write-Host $script:SelfTestLine }
-    else { Write-Host ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')) }
-    Close-SelfTestWindow
+    if ($problems.Count -eq 0) { Write-SelfTestLine $script:SelfTestLine }
+    else { Write-SelfTestLine ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')) }
 }
 
 # ============================================================================
@@ -1772,20 +1801,22 @@ function Start-Optimizer {
                 # The path a user takes: background jobs, the busy guard, the
                 # OnDone handlers and the scan chain, run by a real click.
                 $script:SelfTestDeadline = (Get-Date).AddMinutes(10)
+                $script:SelfTestTicks = 0
                 $script:SelfTestTimer = New-Object System.Windows.Threading.DispatcherTimer
                 $script:SelfTestTimer.Interval = [TimeSpan]::FromMilliseconds(500)
                 $script:SelfTestTimer.Add_Tick({ Test-SelfTestFullScan })
                 $script:UIRef.UI.BtnFullScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
                 $script:SelfTestTimer.Start()
+                Write-CoreLog -Message ("SelfTest: clicked Run Full Scan; full scan started={0}, busy={1}" -f ($null -ne $script:State.FullScan), $script:State.Busy) -Level INFO
                 $driving = $true
             } catch {
-                Write-Host "SELFTEST_FAIL $($_.Exception.Message)"
+                Write-SelfTestLine ("SELFTEST_FAIL {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
             } finally {
                 if (-not $driving) { Close-SelfTestWindow }
             }
         })
         try { [void]$script:UIRef.Window.ShowDialog() }
-        catch { Write-Host "SELFTEST_FAIL the window stopped with an error: $($_.Exception.Message)" }
+        catch { Write-SelfTestLine ("SELFTEST_FAIL the window stopped with an error: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- ')) }
         return
     }
 
