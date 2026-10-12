@@ -567,7 +567,11 @@ function Invoke-Background {
     $rs.ThreadOptions  = 'ReuseThread'
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('CorePath', $script:CorePath)
-    $rs.SessionStateProxy.SetVariable('WorkBody', $Work)
+    # A scriptblock stays bound to the runspace that created it. Invoked on the
+    # background thread it would run against this (UI) runspace while the UI
+    # thread uses it too, which corrupts state and can kill the process. Pass
+    # the source text instead and rebuild it inside the background runspace.
+    $rs.SessionStateProxy.SetVariable('WorkText', $Work.ToString())
     $rs.SessionStateProxy.SetVariable('SharedState', $shared)
     foreach ($k in $Vars.Keys) { $rs.SessionStateProxy.SetVariable($k, $Vars[$k]) }
 
@@ -576,10 +580,10 @@ function Invoke-Background {
     [void]$ps.AddScript({
         . $CorePath
         Initialize-Core -ReadOnly | Out-Null
-        # Progress helper available to $WorkBody as $Report.
+        # Progress helper available to the work as $Report.
         $Report = { param($m) try { $SharedState.Status = $m } catch { } }
         Set-Variable -Name Report -Value $Report -Scope Global
-        & $WorkBody
+        & ([scriptblock]::Create($WorkText))
     })
 
     $handle = $ps.BeginInvoke()

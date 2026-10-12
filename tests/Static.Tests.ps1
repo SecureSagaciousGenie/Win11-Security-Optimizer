@@ -87,6 +87,37 @@ Describe 'Static checks' {
             })
             $direct.Count | Should -Be 1
         }
+        # A scriptblock stays bound to the runspace that created it; run on the
+        # background thread it would use the UI runspace from two threads.
+        It 'Invoke-Background hands the work to the runspace as text' {
+            $fn = Get-OptFunction 'Invoke-Background'
+            $sets = @($fn.Body.FindAll({ param($n) ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and $n.Member.Extent.Text -eq 'SetVariable' }, $true))
+            $sets.Count | Should -BeGreaterThan 0
+            $passed = @($sets | ForEach-Object { $_.Arguments[1].Extent.Text })
+            @($passed | Where-Object { $_ -in @('$Work', '$OnDone', '$Next') }) | Should -BeNullOrEmpty
+            $passed | Should -Contain '$Work.ToString()'
+        }
+        It 'every -Work block calls only functions the background runspace loads' {
+            $root = Get-RepoRoot
+            $coreFns = @(@((Join-Path $root 'src\SecurityCore.ps1')) + @(Get-ChildItem -LiteralPath (Join-Path $root 'src\features') -Filter *.ps1 | ForEach-Object { $_.FullName }) | ForEach-Object {
+                (Get-ScriptAst -Path $_).Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name }
+            })
+            $uiFns = @($script:OptAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+            $calls = @($script:OptAst.FindAll({ param($n) ($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -eq 'Invoke-Background' }, $true))
+            $calls.Count | Should -BeGreaterThan 5
+            $bad = foreach ($c in $calls) {
+                $els = $c.CommandElements
+                for ($i = 0; $i -lt $els.Count - 1; $i++) {
+                    if (($els[$i] -is [System.Management.Automation.Language.CommandParameterAst]) -and $els[$i].ParameterName -eq 'Work') {
+                        foreach ($cmd in @($els[$i + 1].FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+                            $name = $cmd.GetCommandName()
+                            if ($name -and ($uiFns -contains $name) -and ($coreFns -notcontains $name)) { '{0} (line {1})' -f $name, $cmd.Extent.StartLineNumber }
+                        }
+                    }
+                }
+            }
+            @($bad) | Should -BeNullOrEmpty
+        }
         It '<_> forwards -Next to Invoke-Background' -ForEach @('Start-SecurityScan', 'Start-BloatScan', 'Start-DfirScan', 'Start-StartupScan') {
             $fn = Get-OptFunction $_
             @($fn.Body.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Should -Contain 'Next'

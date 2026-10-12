@@ -62,6 +62,10 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
   on this object" as soon as a background scan finished, so Run Full Scan never
   showed results. Handlers built with `GetNewClosure()` could not see script
   state; the same flaw meant the Pro Tools consent was never accepted.
+- Background scans ran their work against the window's own runspace from a
+  second thread, because a script block stays bound to the runspace that
+  created it. That could corrupt state and close the window a few seconds into
+  a scan. The work is now rebuilt inside the background runspace.
 - Run Full Scan runs the security, app, investigation and startup scans one
   after another and reports any scan that failed. The CI self-test now clicks
   it on a real Windows runner and waits for every scan.
