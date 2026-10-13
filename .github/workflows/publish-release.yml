@@ -1,0 +1,38 @@
+# Publish a draft release created by release.yml. Run by hand with the tag.
+# It refuses anything but a vN.N.N draft and re-checks the attached zip
+# against SHA256SUMS.txt before publishing.
+# Author: Ahmad Shaukat
+name: Publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish, for example v1.2.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check the draft and its checksums, then publish it
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::Not a release tag: $TAG"; exit 1; fi
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then echo "::error::$TAG is not a draft release"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/check" && cd "$RUNNER_TEMP/check"
+          gh release download "$TAG" --pattern 'SHA256SUMS.txt' --pattern "Win11-Security-Optimizer-$TAG.zip"
+          sha256sum -c SHA256SUMS.txt
+          gh release edit "$TAG" --draft=false --latest
+          gh release view "$TAG" --json url,isDraft,assets --jq '{url: .url, isDraft: .isDraft, assets: [.assets[].name]}'

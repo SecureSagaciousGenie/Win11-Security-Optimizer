@@ -1,0 +1,131 @@
+[
+  {
+    "Name": "clean",
+    "Security": [
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Pass"
+      },
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Info"
+      },
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Error"
+      }
+    ],
+    "Investigate": [
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Info",
+        "Status": "Clean"
+      },
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Info",
+        "Status": "Info"
+      }
+    ],
+    "ExpectedExit": 0
+  },
+  {
+    "Name": "security warning only",
+    "Security": [
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Pass"
+      },
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Warning"
+      }
+    ],
+    "Investigate": [
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Info",
+        "Status": "Clean"
+      }
+    ],
+    "ExpectedExit": 1
+  },
+  {
+    "Name": "review card",
+    "Security": [
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "Medium",
+        "Status": "Pass"
+      }
+    ],
+    "Investigate": [
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Medium",
+        "Status": "Review"
+      }
+    ],
+    "ExpectedExit": 1
+  },
+  {
+    "Name": "alert beats review",
+    "Security": [
+      {
+        "Id": "X",
+        "Name": "x",
+        "Severity": "High",
+        "Status": "Fail"
+      }
+    ],
+    "Investigate": [
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Medium",
+        "Status": "Review"
+      },
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "Critical",
+        "Status": "Alert"
+      }
+    ],
+    "ExpectedExit": 2
+  },
+  {
+    "Name": "single alert, no security",
+    "Security": [],
+    "Investigate": [
+      {
+        "Id": "C",
+        "Title": "c",
+        "Severity": "High",
+        "Status": "Alert"
+      }
+    ],
+    "ExpectedExit": 2
+  },
+  {
+    "Name": "nothing at all",
+    "Security": [],
+    "Investigate": [],
+    "ExpectedExit": 0
+  }
+]

@@ -10,3 +10,7 @@ dist/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Test output
+testResults.xml
+coverage.xml

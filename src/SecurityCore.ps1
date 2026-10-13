@@ -1,6 +1,8 @@
 <#
     SecurityCore.ps1
     ----------------
+    Author: Ahmad Shaukat
+
     Backend engine for the Windows 11 Security Optimizer.
 
     This module contains ALL logic (scanning, hardening, debloat, DFIR triage,
@@ -26,7 +28,7 @@ Set-StrictMode -Version 2.0
 # ----------------------------------------------------------------------------
 $script:Core = [ordered]@{
     Name          = 'Windows 11 Security Optimizer'
-    Version       = '1.1.0'
+    Version       = '1.2.0'
     StartTime     = Get-Date
     RootPath      = if ($PSScriptRoot) { Split-Path $PSScriptRoot -Parent } else { (Get-Location).Path }
     DataPath      = $null
@@ -35,6 +37,7 @@ $script:Core = [ordered]@{
     RollbackFile  = $null
     BackupFile    = $null
     SecureSetupWarning = $null
+    SecureSetupNotice = $null
     TranscriptOn  = $false
     RestorePointMade = $false
     Rollback      = (New-Object System.Collections.ArrayList)   # apply-order rollback blocks
@@ -43,6 +46,14 @@ $script:Core = [ordered]@{
 }
 
 $script:SeverityWeight = @{ 'Critical'=10; 'High'=7; 'Medium'=4; 'Low'=2; 'Info'=0 }
+
+# Extension points. Feature files (src\features) register into these when they
+# load at the end of this file: extra Security-tab checks (Id = scriptblock that
+# returns New-Finding objects, read-only) and the fix and verify scriptblocks
+# that Get-SecurityFixAction and Test-SecurityFixApplied fall back to.
+$script:ExtraSecurityChecks = [ordered]@{}
+$script:ExtraFixActions     = @{}
+$script:ExtraFixTests       = @{}
 
 function Initialize-Core {
     <# Sets up the data/log folder. Safe to call repeatedly.
@@ -56,8 +67,12 @@ function Initialize-Core {
        live anywhere a non-admin process could tamper with it before the user runs
        it. When elevated, rollback + backup files are written under an ACL-locked
        %ProgramData% tree (Administrators/SYSTEM write, Users read-only). Logs stay
-       in %LOCALAPPDATA% because they are only ever read, never executed. #>
-    param([string]$DataPath)
+       in %LOCALAPPDATA% because they are only ever read, never executed.
+
+       -ReadOnly is for background runspaces: it never creates, re-owns, locks or
+       quarantines anything under %ProgramData%. It reuses the secure backups
+       folder only when it already exists and is owned by Administrators/SYSTEM. #>
+    param([string]$DataPath, [switch]$ReadOnly)
     if (-not $DataPath) {
         $DataPath = Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer'
     }
@@ -77,14 +92,22 @@ function Initialize-Core {
     # Rollback/backup go to the admin-locked ProgramData tree when elevated.
     # The rollback script is run ELEVATED, so it must not sit anywhere a non-admin
     # process could tamper with it. The WHOLE base folder gets the same ownership
-    # gate + delete-and-recreate as the tools folder (a standard user who
+    # gate + quarantine-and-recreate as the tools folder (a standard user who
     # pre-creates C:\ProgramData\Win11SecurityOptimizer, or its backups subfolder,
     # keeps ownership and could swap in a malicious Rollback_*.ps1). If securing
     # fails while elevated we DO fall back to %LOCALAPPDATA% so the app still works,
     # but we record a warning for the UI instead of failing silently.
     $backupDir = Join-Path $DataPath 'backups'
     $script:Core.SecureSetupWarning = $null
-    if (Test-IsAdmin) {
+    if ($ReadOnly) {
+        if (Test-IsAdmin) {
+            $secureBackups = Join-Path $env:ProgramData 'Win11SecurityOptimizer\backups'
+            if ((Test-Path -LiteralPath $secureBackups -PathType Container) -and (Test-FolderOwnedBySystemOrAdmins $secureBackups)) {
+                $backupDir = $secureBackups
+            }
+        }
+    } elseif (Test-IsAdmin) {
+        $script:Core.SecureSetupNotice = $null
         try {
             $secureBase = Initialize-SecureBase    # verifies ownership, recreates if planted, locks ACL
             $secureBackups = Join-Path $secureBase 'backups'
@@ -232,8 +255,12 @@ Write-Host 'Rolling back Windows 11 Security Optimizer changes...' -ForegroundCo
 "@
     $body = $script:Core.Rollback.ToArray(); [array]::Reverse($body)
     $full = $header + ($body -join "`r`n`r`n") + "`r`n`r`nWrite-Host 'Rollback complete. A restart is recommended.' -ForegroundColor Green`r`n"
-    Set-Content -Path $script:Core.RollbackFile -Value $full -Encoding UTF8
-    try { $script:Core.Backups.ToArray() | ConvertTo-Json -Depth 6 | Set-Content -Path $script:Core.BackupFile -Encoding UTF8 } catch { }
+    Write-SecureFile -Path $script:Core.RollbackFile -Value $full
+    try {
+        Write-SecureFile -Path $script:Core.BackupFile -Value (ConvertTo-Json -InputObject @($script:Core.Backups.ToArray()) -Depth 6)
+    } catch {
+        Write-CoreLog -Message ("Backup file {0} could not be written: {1}" -f $script:Core.BackupFile, $_.Exception.Message) -Level WARN
+    }
     Write-CoreLog -Message ("Rollback script written: {0}" -f $script:Core.RollbackFile) -Level OK
 }
 
@@ -408,9 +435,13 @@ function Invoke-SecurityScan {
         -Status $(if($ar -eq 255){'Pass'}else{'Warning'}) -Observed $(if($ar -ne $null){("0x{0:X}" -f [int]$ar)}else{'Not set'}) -Expected '0xFF (255)' `
         -Detail 'USB autorun is a classic worm vector.' -Advice 'Disable AutoRun on all drive types.' -RiskTier 'Safe' -Fixable ($ar -ne 255))
 
-    # ---- Guest account ----
-    $guest = $null; try { $guest = Get-LocalUser -Name 'Guest' -ErrorAction Stop } catch { }
-    if ($guest) {
+    # ---- Guest account (found by RID 501, not by its localised name) ----
+    $guest = $null; $guestErr = $null
+    try { $guest = Get-GuestAccount } catch { $guestErr = $_.Exception.Message }
+    if ($guestErr) {
+        & $add (New-Finding -Id 'ACCT-GUEST' -Category 'Accounts' -Name 'Built-in Guest account' -Severity 'Info' `
+            -Status 'Error' -Observed 'Could not read local accounts' -Expected 'Disabled' -Detail ("The Guest-account check could not run: {0}" -f $guestErr) -Advice 'Re-run as Administrator.' -RiskTier 'AuditOnly')
+    } elseif ($guest) {
         $en = [bool]$guest.Enabled
         & $add (New-Finding -Id 'ACCT-GUEST' -Category 'Accounts' -Name 'Built-in Guest account' -Severity 'Medium' `
             -Status $(if($en){'Fail'}else{'Pass'}) -Observed $(if($en){'Enabled'}else{'Disabled'}) -Expected 'Disabled' `
@@ -482,8 +513,26 @@ function Invoke-SecurityScan {
         & $add (New-Finding -Id 'RDP-NLA' -Category 'Remote Access' -Name 'RDP Network Level Authentication' -Severity 'High' -Status $(if($nla -eq 1){'Pass'}else{'Fail'}) -Observed $(if($nla -ne $null){"NLA=$nla"}else{'Not set'}) -Expected 'Enabled (1)' -Detail 'Forces auth before a session starts.' -Advice 'Require NLA for RDP.' -RiskTier 'Elevated' -Fixable ($nla -ne 1))
     }
 
+    foreach ($x in @(Invoke-ExtraSecurityCheck)) { [void]$findings.Add($x) }
+
     Write-CoreLog -Message ("Security scan complete: {0} findings." -f $findings.Count) -Level INFO
     return $findings.ToArray()
+}
+
+function Invoke-ExtraSecurityCheck {
+    <# Runs every check registered by a feature file. A check that throws becomes
+       an Error finding naming it, so a broken check is never silently skipped. #>
+    $out = New-Object System.Collections.ArrayList
+    foreach ($id in @($script:ExtraSecurityChecks.Keys)) {
+        try {
+            foreach ($x in @(& $script:ExtraSecurityChecks[$id])) { if ($x) { [void]$out.Add($x) } }
+        } catch {
+            Write-CoreLog -Message ("Security check {0} failed: {1}" -f $id, $_.Exception.Message) -Level WARN
+            [void]$out.Add((New-Finding -Id $id -Category 'Checks' -Name ("Check {0} could not run" -f $id) -Severity 'Info' -Status 'Error' `
+                -Observed 'Error' -Expected 'Check runs' -Detail ("The check {0} could not run: {1}" -f $id, $_.Exception.Message) -Advice 'Re-run as Administrator. If it keeps failing, note it as a tool issue.' -RiskTier 'AuditOnly'))
+        }
+    }
+    return @($out.ToArray())
 }
 
 function Get-SecurityScore {
@@ -580,12 +629,24 @@ function Get-SecurityFixAction {
         'SMB1'       { return { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null; Add-RollbackCommand 'Enable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart' 'Re-enable SMBv1'; Add-ChangeRecord 'Disabled SMBv1 (restart may be needed)' } }
         'LLMNR'      { return { Set-RegValueTracked -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' -Value 0 -Type DWord } }
         'AUTORUN'    { return { Set-RegValueTracked -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' -Name 'NoDriveTypeAutoRun' -Value 255 -Type DWord } }
-        'ACCT-GUEST' { return { Disable-LocalUser -Name 'Guest' -ErrorAction Stop; Add-RollbackCommand 'Enable-LocalUser -Name ''Guest''' 'Re-enable Guest'; Add-ChangeRecord 'Disabled Guest account' } }
+        'ACCT-GUEST' { return {
+                        $g = Get-GuestAccount
+                        if (-not $g) { throw 'No built-in Guest account (RID 501) was found on this PC.' }
+                        $sid = [string]$g.SID.Value
+                        if ($sid -notmatch '^S-1-5-21-\d+-\d+-\d+-501$') { throw ("Unexpected Guest SID '{0}'." -f (ConvertTo-SafeComment $sid)) }
+                        if (-not $g.Enabled) { return }
+                        Disable-LocalUser -SID $sid -ErrorAction Stop
+                        # The SID matched the strict pattern above, so it is safe to embed.
+                        Add-RollbackCommand ("Enable-LocalUser -SID '{0}'" -f $sid) 'Re-enable Guest'
+                        Add-ChangeRecord 'Disabled Guest account' } }
         'WU-SVC'     { return { Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop; Add-RollbackCommand 'Set-Service -Name wuauserv -StartupType Disabled' 'Revert WU service'; Add-ChangeRecord 'Set Windows Update to Manual' } }
         'HVCI'       { return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' -Name 'Enabled' -Value 1 -Type DWord } }
         'RDP-ENABLED'{ return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -Type DWord } }
         'RDP-NLA'    { return { Set-RegValueTracked -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Type DWord } }
-        default      { return $null }
+        default      {
+            if ($script:ExtraFixActions.ContainsKey($Id)) { return $script:ExtraFixActions[$Id] }
+            return $null
+        }
     }
 }
 
@@ -623,7 +684,7 @@ function Test-SecurityFixApplied {
             'UAC-SECUREDESK'{ return ((Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'PromptOnSecureDesktop') -eq 1) }
             'LLMNR'      { return ((Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast') -eq 0) }
             'AUTORUN'    { return ((Get-RegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'NoDriveTypeAutoRun') -eq 255) }
-            'ACCT-GUEST' { return (-not (Get-LocalUser -Name 'Guest' -ErrorAction SilentlyContinue).Enabled) }
+            'ACCT-GUEST' { $g = Get-GuestAccount; if (-not $g) { return $true }; return (-not [bool]$g.Enabled) }
             'WU-SVC'     { return ((Get-Service wuauserv).StartType -ne 'Disabled') }
             'DEF-ASR'    {
                 try {
@@ -648,7 +709,10 @@ function Test-SecurityFixApplied {
             'RDP-ENABLED'{ return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections') -eq 1) }
             'RDP-NLA'    { return ((Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication') -eq 1) }
             'SMB1'       { try { return ((Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol).State -ne 'Enabled') } catch { return $true } }
-            default      { return $true }
+            default      {
+                if ($script:ExtraFixTests.ContainsKey($Id)) { return [bool](& $script:ExtraFixTests[$Id]) }
+                return $true
+            }
         }
     } catch { return $false }
 }
@@ -672,34 +736,45 @@ function Get-DebloatCatalog {
         AppxName   - wildcard PackageName match for Get-AppxPackage
         Category   - grouping for the UI
         Recommended- whether it is a safe/common removal (UI hint only; NOT pre-ticked)
+        Impact     - Low, Medium or High: how much you would notice it gone
+        Risk       - one line on what stops working
         ReinstallNote - how to get it back
     #>
     @(
-        [pscustomobject]@{ Key='xbox';        Name='Xbox Game Bar & overlay';     Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxGamingOverlay*';            Recommended=$true;  Description='The Xbox Game Bar overlay (Win+G) and app companion. Safe to remove if you do not use it; PC games still run. Does NOT touch Game Pass sign-in.'; ReinstallNote='Reinstall "Xbox Game Bar" from the Microsoft Store.' }
-        [pscustomobject]@{ Key='xboxtcui';    Name='Xbox Game UI (TCUI)';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.Xbox.TCUI*';                    Recommended=$false; Description='In-game Xbox UI used by some titles for invites/profiles. Removing it CAN break in-game social features. Leave it unless you are sure.'; ReinstallNote='Reinstall "Xbox" components from the Microsoft Store.' }
-        [pscustomobject]@{ Key='xboxspeech';  Name='Xbox Speech To Text';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxSpeechToTextOverlay*';      Recommended=$true;  Description='Game-chat speech-to-text overlay. Rarely used; safe to remove.'; ReinstallNote='Reinstall from the Microsoft Store.' }
-        [pscustomobject]@{ Key='gamingapp';   Name='Xbox Gaming App';             Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.GamingApp*';                    Recommended=$false; Description='The main Xbox PC gaming app / Game Pass launcher. Remove only if you do not use Game Pass.'; ReinstallNote='Reinstall "Xbox" from the Microsoft Store.' }
-        [pscustomobject]@{ Key='bingnews';    Name='Microsoft News (Bing News)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingNews*';                     Recommended=$true;  Description='News feed app that runs live-tile/background updates. Pure bloat for most users.'; ReinstallNote='Reinstall "Microsoft News" from the Store.' }
-        [pscustomobject]@{ Key='bingweather'; Name='MSN Weather (Bing Weather)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingWeather*';                  Recommended=$true;  Description='Weather app with background refresh. Removable; use a website or widget instead.'; ReinstallNote='Reinstall "MSN Weather" from the Store.' }
-        [pscustomobject]@{ Key='clipchamp';   Name='Clipchamp Video Editor';      Publisher='Microsoft'; Category='Media';         AppxName='Clipchamp.Clipchamp*';                    Recommended=$true;  Description='Bundled video editor few people use. Removable without affecting playback.'; ReinstallNote='Reinstall "Clipchamp" from the Store.' }
-        [pscustomobject]@{ Key='solitaire';   Name='Microsoft Solitaire Collection';Publisher='Microsoft';Category='Games';         AppxName='Microsoft.MicrosoftSolitaireCollection*'; Recommended=$true;  Description='Ad-supported solitaire games bundle. Pure bloat.'; ReinstallNote='Reinstall "Microsoft Solitaire Collection" from the Store.' }
-        [pscustomobject]@{ Key='3dviewer';    Name='3D Viewer';                   Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.Microsoft3DViewer*';            Recommended=$true;  Description='Views 3D models. Rarely used; safe to remove.'; ReinstallNote='Reinstall "3D Viewer" from the Store.' }
-        [pscustomobject]@{ Key='paint3d';     Name='Paint 3D';                    Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.MSPaint*';                      Recommended=$true;  Description='3D painting app (not classic Paint). Classic Paint is unaffected.'; ReinstallNote='Reinstall "Paint 3D" from the Store.' }
-        [pscustomobject]@{ Key='mixedreality';Name='Mixed Reality Portal';        Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.MixedReality.Portal*';          Recommended=$true;  Description='Windows Mixed Reality portal. Useless without a WMR headset.'; ReinstallNote='Reinstall "Mixed Reality Portal" from the Store.' }
-        [pscustomobject]@{ Key='teamsconsumer';Name='Microsoft Teams (personal)'; Publisher='Microsoft'; Category='Communication'; AppxName='MicrosoftTeams*';                         Recommended=$true;  Description='Consumer Teams/Chat auto-installed with Windows 11. Does NOT remove work/school Teams installed separately.'; ReinstallNote='Reinstall "Microsoft Teams" from the Store.' }
-        [pscustomobject]@{ Key='gethelp';     Name='Get Help';                    Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.GetHelp*';                      Recommended=$false; Description='Microsoft support/help app. Minor; removable.'; ReinstallNote='Reinstall "Get Help" from the Store.' }
-        [pscustomobject]@{ Key='tips';        Name='Tips';                        Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.Getstarted*';                   Recommended=$true;  Description='"Tips" / Get Started suggestions app. Bloat.'; ReinstallNote='Reinstall "Tips" from the Store.' }
-        [pscustomobject]@{ Key='feedback';    Name='Feedback Hub';                Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.WindowsFeedbackHub*';           Recommended=$false; Description='Sends feedback to Microsoft. Removable if you never file feedback.'; ReinstallNote='Reinstall "Feedback Hub" from the Store.' }
-        [pscustomobject]@{ Key='maps';        Name='Windows Maps';                Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.WindowsMaps*';                  Recommended=$true;  Description='Offline maps app. Most people use a browser instead.'; ReinstallNote='Reinstall "Windows Maps" from the Store.' }
-        [pscustomobject]@{ Key='soundrec';    Name='Sound Recorder';              Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.WindowsSoundRecorder*';         Recommended=$false; Description='Voice recorder app. Remove only if unused.'; ReinstallNote='Reinstall "Windows Sound Recorder" from the Store.' }
-        [pscustomobject]@{ Key='people';      Name='People';                      Publisher='Microsoft'; Category='Communication'; AppxName='Microsoft.People*';                       Recommended=$true;  Description='Legacy contacts aggregator. Largely abandoned; safe to remove.'; ReinstallNote='Reinstall "People" from the Store.' }
-        [pscustomobject]@{ Key='yourphone';   Name='Phone Link (Your Phone)';     Publisher='Microsoft'; Category='Communication'; AppxName='Microsoft.YourPhone*';                    Recommended=$false; Description='Links your Android/iPhone to Windows. Remove only if you do not pair a phone.'; ReinstallNote='Reinstall "Phone Link" from the Store.' }
-        [pscustomobject]@{ Key='bingsearch';  Name='Web Search (Bing) app';       Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingSearch*';                   Recommended=$false; Description='Bing web-search app component. Removing may reduce web results in Start search.'; ReinstallNote='Reinstall from the Store if Start search feels limited.' }
-        [pscustomobject]@{ Key='quickassist'; Name='Quick Assist';                Publisher='Microsoft'; Category='Remote Access';  AppxName='MicrosoftCorporationII.QuickAssist*';     Recommended=$true;  Description='Remote-assistance tool frequently abused by tech-support scammers. Remove if you never use it.'; ReinstallNote='Reinstall "Quick Assist" from the Store.' }
-        [pscustomobject]@{ Key='familysafety';Name='Family Safety';               Publisher='Microsoft'; Category='System Extras';  AppxName='MicrosoftCorporationII.MicrosoftFamily*'; Recommended=$false; Description='Family/parental controls companion. Remove if you do not use Microsoft Family.'; ReinstallNote='Reinstall "Microsoft Family Safety" from the Store.' }
-        [pscustomobject]@{ Key='todos';       Name='Microsoft To Do';             Publisher='Microsoft'; Category='Productivity';   AppxName='Microsoft.Todos*';                        Recommended=$false; Description='Task/to-do list app. Remove only if unused.'; ReinstallNote='Reinstall "Microsoft To Do" from the Store.' }
-        [pscustomobject]@{ Key='solitaire2';  Name='Solitaire (alt package)';     Publisher='Microsoft'; Category='Games';         AppxName='Microsoft.MicrosoftSolitaire*';           Recommended=$false; Description='Alternate solitaire package id (if present).'; ReinstallNote='Reinstall from the Store.' }
+        [pscustomobject]@{ Key='xbox';        Name='Xbox Game Bar & overlay';     Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxGamingOverlay*';            Recommended=$true; Impact='Low'; Risk='The Game Bar overlay and game recording stop working.';  Description='The Xbox Game Bar overlay (Win+G) and app companion. Safe to remove if you do not use it; PC games still run. Does NOT touch Game Pass sign-in.'; ReinstallNote='Reinstall "Xbox Game Bar" from the Microsoft Store.' }
+        [pscustomobject]@{ Key='xboxtcui';    Name='Xbox Game UI (TCUI)';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.Xbox.TCUI*';                    Recommended=$false; Impact='High'; Risk='Some games lose friend invites and profile screens.'; Description='In-game Xbox UI used by some titles for invites/profiles. Removing it CAN break in-game social features. Leave it unless you are sure.'; ReinstallNote='Reinstall "Xbox" components from the Microsoft Store.' }
+        [pscustomobject]@{ Key='xboxspeech';  Name='Xbox Speech To Text';         Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.XboxSpeechToTextOverlay*';      Recommended=$true; Impact='Low'; Risk='Speech-to-text in game chat stops.';  Description='Game-chat speech-to-text overlay. Rarely used; safe to remove.'; ReinstallNote='Reinstall from the Microsoft Store.' }
+        [pscustomobject]@{ Key='gamingapp';   Name='Xbox Gaming App';             Publisher='Microsoft'; Category='Gaming';        AppxName='Microsoft.GamingApp*';                    Recommended=$false; Impact='Medium'; Risk='Game Pass and the Xbox app stop working until reinstalled.'; Description='The main Xbox PC gaming app / Game Pass launcher. Remove only if you do not use Game Pass.'; ReinstallNote='Reinstall "Xbox" from the Microsoft Store.' }
+        [pscustomobject]@{ Key='bingnews';    Name='Microsoft News (Bing News)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingNews*';                     Recommended=$true; Impact='Low'; Risk='No news app; the widgets board still works.';  Description='News feed app that runs live-tile/background updates. Pure bloat for most users.'; ReinstallNote='Reinstall "Microsoft News" from the Store.' }
+        [pscustomobject]@{ Key='bingweather'; Name='MSN Weather (Bing Weather)';  Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingWeather*';                  Recommended=$true; Impact='Low'; Risk='No weather app.';  Description='Weather app with background refresh. Removable; use a website or widget instead.'; ReinstallNote='Reinstall "MSN Weather" from the Store.' }
+        [pscustomobject]@{ Key='clipchamp';   Name='Clipchamp Video Editor';      Publisher='Microsoft'; Category='Media';         AppxName='Clipchamp.Clipchamp*';                    Recommended=$true; Impact='Low'; Risk='No built-in video editor.';  Description='Bundled video editor few people use. Removable without affecting playback.'; ReinstallNote='Reinstall "Clipchamp" from the Store.' }
+        [pscustomobject]@{ Key='solitaire';   Name='Microsoft Solitaire Collection';Publisher='Microsoft';Category='Games';         AppxName='Microsoft.MicrosoftSolitaireCollection*'; Recommended=$true; Impact='Low'; Risk='The solitaire games are gone.';  Description='Ad-supported solitaire games bundle. Pure bloat.'; ReinstallNote='Reinstall "Microsoft Solitaire Collection" from the Store.' }
+        [pscustomobject]@{ Key='3dviewer';    Name='3D Viewer';                   Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.Microsoft3DViewer*';            Recommended=$true; Impact='Low'; Risk='3D model files no longer open by default.';  Description='Views 3D models. Rarely used; safe to remove.'; ReinstallNote='Reinstall "3D Viewer" from the Store.' }
+        [pscustomobject]@{ Key='paint3d';     Name='Paint 3D';                    Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.MSPaint*';                      Recommended=$true; Impact='Low'; Risk='Paint 3D is gone; classic Paint stays.';  Description='3D painting app (not classic Paint). Classic Paint is unaffected.'; ReinstallNote='Reinstall "Paint 3D" from the Store.' }
+        [pscustomobject]@{ Key='mixedreality';Name='Mixed Reality Portal';        Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.MixedReality.Portal*';          Recommended=$true; Impact='Low'; Risk='A Windows Mixed Reality headset needs it reinstalled.';  Description='Windows Mixed Reality portal. Useless without a WMR headset.'; ReinstallNote='Reinstall "Mixed Reality Portal" from the Store.' }
+        [pscustomobject]@{ Key='teamsconsumer';Name='Microsoft Teams (personal)'; Publisher='Microsoft'; Category='Communication'; AppxName='MicrosoftTeams*';                         Recommended=$true; Impact='Low'; Risk='Personal Teams chat is gone; work or school Teams is not affected.';  Description='Consumer Teams/Chat auto-installed with Windows 11. Does NOT remove work/school Teams installed separately.'; ReinstallNote='Reinstall "Microsoft Teams" from the Store.' }
+        [pscustomobject]@{ Key='gethelp';     Name='Get Help';                    Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.GetHelp*';                      Recommended=$false; Impact='Medium'; Risk='Some Settings help links and troubleshooters stop opening.'; Description='Microsoft support/help app. Minor; removable.'; ReinstallNote='Reinstall "Get Help" from the Store.' }
+        [pscustomobject]@{ Key='tips';        Name='Tips';                        Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.Getstarted*';                   Recommended=$true; Impact='Low'; Risk='No Tips app.';  Description='"Tips" / Get Started suggestions app. Bloat.'; ReinstallNote='Reinstall "Tips" from the Store.' }
+        [pscustomobject]@{ Key='feedback';    Name='Feedback Hub';                Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.WindowsFeedbackHub*';           Recommended=$false; Impact='Low'; Risk='You can no longer send feedback to MS.'; Description='Sends feedback to Microsoft. Removable if you never file feedback.'; ReinstallNote='Reinstall "Feedback Hub" from the Store.' }
+        [pscustomobject]@{ Key='maps';        Name='Windows Maps';                Publisher='Microsoft'; Category='System Extras';  AppxName='Microsoft.WindowsMaps*';                  Recommended=$true; Impact='Low'; Risk='No offline maps app.';  Description='Offline maps app. Most people use a browser instead.'; ReinstallNote='Reinstall "Windows Maps" from the Store.' }
+        [pscustomobject]@{ Key='soundrec';    Name='Sound Recorder';              Publisher='Microsoft'; Category='Media';         AppxName='Microsoft.WindowsSoundRecorder*';         Recommended=$false; Impact='Low'; Risk='No voice recorder app.'; Description='Voice recorder app. Remove only if unused.'; ReinstallNote='Reinstall "Windows Sound Recorder" from the Store.' }
+        [pscustomobject]@{ Key='people';      Name='People';                      Publisher='Microsoft'; Category='Communication'; AppxName='Microsoft.People*';                       Recommended=$true; Impact='Low'; Risk='The People view in older Mail and Calendar may stop working.';  Description='Legacy contacts aggregator. Largely abandoned; safe to remove.'; ReinstallNote='Reinstall "People" from the Store.' }
+        [pscustomobject]@{ Key='yourphone';   Name='Phone Link (Your Phone)';     Publisher='Microsoft'; Category='Communication'; AppxName='Microsoft.YourPhone*';                    Recommended=$false; Impact='Medium'; Risk='Phone notifications, texts and calls on the PC stop.'; Description='Links your Android/iPhone to Windows. Remove only if you do not pair a phone.'; ReinstallNote='Reinstall "Phone Link" from the Store.' }
+        [pscustomobject]@{ Key='bingsearch';  Name='Web Search (Bing) app';       Publisher='Microsoft'; Category='Bing/News';     AppxName='Microsoft.BingSearch*';                   Recommended=$false; Impact='Medium'; Risk='Start menu search shows fewer web results.'; Description='Bing web-search app component. Removing may reduce web results in Start search.'; ReinstallNote='Reinstall from the Store if Start search feels limited.' }
+        [pscustomobject]@{ Key='quickassist'; Name='Quick Assist';                Publisher='Microsoft'; Category='Remote Access';  AppxName='MicrosoftCorporationII.QuickAssist*';     Recommended=$true; Impact='Medium'; Risk='Nobody can help you remotely with Quick Assist until it is reinstalled.';  Description='Remote-assistance tool frequently abused by tech-support scammers. Remove if you never use it.'; ReinstallNote='Reinstall "Quick Assist" from the Store.' }
+        [pscustomobject]@{ Key='familysafety';Name='Family Safety';               Publisher='Microsoft'; Category='System Extras';  AppxName='MicrosoftCorporationII.MicrosoftFamily*'; Recommended=$false; Impact='Medium'; Risk='Family Safety controls on this PC stop applying.'; Description='Family/parental controls companion. Remove if you do not use Microsoft Family.'; ReinstallNote='Reinstall "Microsoft Family Safety" from the Store.' }
+        [pscustomobject]@{ Key='todos';       Name='Microsoft To Do';             Publisher='Microsoft'; Category='Productivity';   AppxName='Microsoft.Todos*';                        Recommended=$false; Impact='Low'; Risk='Your lists stay online, but the To Do app is gone.'; Description='Task/to-do list app. Remove only if unused.'; ReinstallNote='Reinstall "Microsoft To Do" from the Store.' }
+        [pscustomobject]@{ Key='solitaire2';  Name='Solitaire (alt package)';     Publisher='Microsoft'; Category='Games';         AppxName='Microsoft.MicrosoftSolitaire*';           Recommended=$false; Impact='Low'; Risk='The solitaire games are gone.'; Description='Alternate solitaire package id (if present).'; ReinstallNote='Reinstall from the Store.' }
     )
+}
+
+function Test-DebloatPreset {
+    <# Recommended: entries marked Recommended. Minimal: the Recommended entries
+       with Low impact only, the smallest change most people never notice. #>
+    param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][ValidateSet('Recommended', 'Minimal')][string]$Preset)
+    if (-not [bool]$Entry.Recommended) { return $false }
+    if ($Preset -eq 'Minimal') { return ([string]$Entry.Impact -eq 'Low') }
+    return $true
 }
 
 function Get-DebloatInventory {
@@ -720,6 +795,7 @@ function Get-DebloatInventory {
             [void]$result.Add([pscustomobject]@{
                 Key=$c.Key; Name=$c.Name; Publisher=$c.Publisher; Category=$c.Category
                 Description=$c.Description; ReinstallNote=$c.ReinstallNote; Recommended=$c.Recommended
+                Impact=$c.Impact; Risk=$c.Risk
                 PackageFullName=$match.PackageFullName; PackageFamilyName=$match.PackageFamilyName
                 Version=$match.Version; Installed=$true
             })
@@ -1053,12 +1129,56 @@ function New-DfirFinding {
         [string]$Id, [string]$Category, [string]$Title,
         [ValidateSet('Critical','High','Medium','Low','Info')][string]$Severity,
         [ValidateSet('Alert','Review','Clean','Info')][string]$Status,
-        [string]$What, [string]$Why, [string]$WhatToDo, $Evidence
+        [string]$What, [string]$Why, [string]$WhatToDo, $Evidence,
+        [string[]]$Paths = @()
     )
     [pscustomobject]@{
         Id=$Id; Category=$Category; Title=$Title; Severity=$Severity; Status=$Status
-        What=$What; Why=$Why; WhatToDo=$WhatToDo; Evidence=$Evidence
+        What=$What; Why=$Why; WhatToDo=$WhatToDo; Evidence=$Evidence; Paths=@($Paths)
     }
+}
+
+function ConvertFrom-NetLocalGroupOutput {
+    <# Members from `net localgroup <name>` output in any display language: the
+       lines between the dashed separator and the final line (the localised
+       "command completed" message). #>
+    param([AllowEmptyCollection()][string[]]$Lines)
+    $text = @($Lines | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+    $sep = -1
+    for ($i = 0; $i -lt $text.Count; $i++) { if ($text[$i] -match '^-{3,}$') { $sep = $i; break } }
+    if ($sep -lt 0) { return @() }
+    $last = $text.Count - 2
+    if ($last -le $sep) { return @() }
+    return @($text[($sep + 1)..$last])
+}
+
+function Get-LocalAdminMember {
+    <# Members of the local Administrators group, found by SID S-1-5-32-544.
+       Returns objects with Name and Sid (Sid is empty from the net fallback).
+       Throws when neither method works. #>
+    try {
+        $out = New-Object System.Collections.ArrayList
+        foreach ($m in @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop)) {
+            $sid = ''
+            if ($m.PSObject.Properties.Name -contains 'SID' -and $m.SID) { $sid = [string]$m.SID.Value }
+            [void]$out.Add([pscustomobject]@{ Name = [string]$m.Name; Sid = $sid })
+        }
+        return @($out.ToArray())
+    } catch {
+        # Get-LocalGroupMember fails on orphaned SIDs and some domain states.
+        Write-CoreLog -Message ("Get-LocalGroupMember failed ({0}); falling back to net localgroup." -f $_.Exception.Message) -Level WARN
+        $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+        $groupName = ($admins.Translate([System.Security.Principal.NTAccount]).Value -split '\\')[-1]
+        $raw = @(& net.exe localgroup $groupName 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw ("net localgroup exited with code {0}." -f $LASTEXITCODE) }
+        return @(ConvertFrom-NetLocalGroupOutput -Lines $raw | ForEach-Object { [pscustomobject]@{ Name = $_; Sid = '' } })
+    }
+}
+
+function Get-GuestAccount {
+    <# The built-in Guest account, found by RID 501 rather than by its localised
+       name. Returns $null when it does not exist. Throws when users cannot be read. #>
+    return (@(Get-LocalUser -ErrorAction Stop | Where-Object { $_.SID -and ([string]$_.SID.Value -match '^S-1-5-21-\d+-\d+-\d+-501$') }) | Select-Object -First 1)
 }
 
 function Invoke-DfirTriage {
@@ -1067,39 +1187,31 @@ function Invoke-DfirTriage {
     $add = { param($x) [void]$f.Add($x) }
 
     # ---------- 1. Local administrators ----------
+    # Looked up by SID (S-1-5-32-544) so the check works on non-English Windows,
+    # where the group and the built-in Administrator account have other names.
     try {
-        $adminMembers = @()
-        try {
-            $grp = Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop
-            $adminMembers = $grp | ForEach-Object { $_.Name }
-        } catch {
-            # Fallback via net localgroup for odd SID/translation cases
-            $raw = (net localgroup administrators) 2>$null
-            if ($raw) {
-                $capture=$false
-                foreach ($line in $raw) {
-                    if ($line -match '^----') { $capture=$true; continue }
-                    if ($line -match 'completed successfully') { $capture=$false; continue }
-                    if ($capture -and $line.Trim()) { $adminMembers += $line.Trim() }
-                }
-            }
-        }
-        $adminMembers = @($adminMembers | Where-Object { $_ } | Select-Object -Unique)
-        # Known/expected: current user, built-in Administrator, Domain Admins
+        $members = @(Get-LocalAdminMember)
+        $adminMembers = @($members | ForEach-Object { $_.Name } | Where-Object { $_ } | Select-Object -Unique)
+        $currentSid = $null
+        try { $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $currentSid = $null }
+        # Known/expected: current user, built-in Administrator (RID 500), Domain Admins (512), Enterprise Admins (519)
         $expectedPatterns = @('*\Administrator', 'Administrator', "*\$env:USERNAME", $env:USERNAME, '*\Domain Admins', '*\Enterprise Admins')
         $unexpected = @()
-        foreach ($m in $adminMembers) {
+        foreach ($m in $members) {
             $isExpected = $false
-            foreach ($pat in $expectedPatterns) { if ($m -like $pat) { $isExpected=$true; break } }
-            if (-not $isExpected) { $unexpected += $m }
+            if ($m.Sid -and (($m.Sid -match '^S-1-5-21-\d+-\d+-\d+-(500|512|519)$') -or ($currentSid -and $m.Sid -eq $currentSid))) { $isExpected = $true }
+            if (-not $isExpected) {
+                foreach ($pat in $expectedPatterns) { if ($m.Name -like $pat) { $isExpected=$true; break } }
+            }
+            if (-not $isExpected) { $unexpected += $m.Name }
         }
-        $unexpected = @($unexpected)
+        $unexpected = @($unexpected | Where-Object { $_ } | Select-Object -Unique)
         $evidence = ($adminMembers -join "`n")
         if ($unexpected.Count -gt 0) {
             & $add (New-DfirFinding -Id 'DFIR-ADMIN' -Category 'Accounts & Access' -Title 'Extra accounts in the Administrators group' -Severity 'High' -Status 'Review' `
                 -What ("These accounts have full administrator rights on this PC:`n  " + ($adminMembers -join "`n  ")) `
                 -Why 'Attackers add a hidden admin account to keep control. Any account here can change anything, install software, and read all files.' `
-                -WhatToDo ("Confirm you recognise every account above. If one is unfamiliar (especially these: " + ($unexpected -join ', ') + "), it may have been added without your knowledge. Investigate before removing. Remove with: Remove-LocalGroupMember -Group Administrators -Member '<name>'.") `
+                -WhatToDo ("Confirm you recognise every account above. If one is unfamiliar (especially these: " + ($unexpected -join ', ') + "), it may have been added without your knowledge. Investigate before removing. Remove one with: Remove-LocalGroupMember -SID S-1-5-32-544 -Member 'account name' (this works whatever the group is called in your language).") `
                 -Evidence $evidence)
         } else {
             & $add (New-DfirFinding -Id 'DFIR-ADMIN' -Category 'Accounts & Access' -Title 'Administrators group looks normal' -Severity 'Info' -Status 'Clean' `
@@ -1143,7 +1255,8 @@ function Invoke-DfirTriage {
             & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title ("Startup entries worth reviewing: {0}" -f $suspicious.Count) -Severity 'Medium' -Status 'Review' `
                 -What ("These programs run at startup from a temporary/user folder (unsigned ones in AppData are included):`n" + $ev) `
                 -Why 'Malware persists by auto-starting from Temp/AppData. Note that some legitimate apps (OneDrive, Teams, Zoom, Discord) also start from AppData - so this is a review list, not a verdict.' `
-                -WhatToDo 'Recognise each one? Then it is fine. If you do not, disable it in the Startup tab (reversible) and scan the file with Defender.' -Evidence $ev)
+                -WhatToDo 'Recognise each one? Then it is fine. If you do not, disable it in the Startup tab (reversible) and scan the file with Defender.' -Evidence $ev `
+                -Paths @(Get-ExistingFilePath -Path @($suspicious | ForEach-Object { [string]$_.ExePath })))
         } else {
             & $add (New-DfirFinding -Id 'DFIR-STARTUP' -Category 'Startup Persistence' -Title 'No obviously suspicious startup entries' -Severity 'Info' -Status 'Clean' -What 'No startup entries run unsigned from temp/user folders.' -Why '' -WhatToDo 'No action needed. See the Startup tab for the full list.' -Evidence '')
         }
@@ -1178,10 +1291,12 @@ function Invoke-DfirTriage {
     try {
         $svcs = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.State -eq 'Running' -and $_.PathName })
         $flagged = New-Object System.Collections.ArrayList
+        $svcPaths = New-Object System.Collections.ArrayList
         foreach ($s in $svcs) {
             $exe = ConvertTo-CommandPath -Command ($s.PathName -replace '^"','' )
             if ($exe -match 'Temp|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\') {
                 [void]$flagged.Add(("  {0}  ->  {1}" -f $s.Name, $s.PathName))
+                [void]$svcPaths.Add([string]$exe)
             }
         }
         $flagged = @($flagged)
@@ -1190,7 +1305,8 @@ function Invoke-DfirTriage {
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title ("Services running from user/temp folders: {0}" -f $flagged.Count) -Severity 'High' -Status 'Review' `
                 -What ("Running services whose program lives in a temporary/user folder:`n" + $ev) `
                 -Why 'Legitimate services run from Program Files or System32. A service pointing into Temp/AppData is a strong malware indicator.' `
-                -WhatToDo 'Investigate each service name online. Do not stop critical services blindly; confirm first.' -Evidence $ev)
+                -WhatToDo 'Investigate each service name online. Do not stop critical services blindly; confirm first.' -Evidence $ev `
+                -Paths @(Get-ExistingFilePath -Path @($svcPaths.ToArray())))
         } else {
             & $add (New-DfirFinding -Id 'DFIR-SVC' -Category 'Startup Persistence' -Title 'No services from suspicious paths' -Severity 'Info' -Status 'Clean' -What 'All running services launch from standard locations.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
         }
@@ -1318,6 +1434,16 @@ function Invoke-DfirTriage {
     return $f.ToArray()
 }
 
+function Sort-DfirFinding {
+    <# Investigate cards: Alert, Review, Info, Clean; inside each status by
+       severity rank (Critical first). Sorting the Severity string would put
+       Info before Low and Medium. Always returns an array. #>
+    param([AllowEmptyCollection()][object[]]$Findings)
+    $order   = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
+    $sevRank = @{ 'Critical'=0; 'High'=1; 'Medium'=2; 'Low'=3; 'Info'=4 }
+    return @(@($Findings) | Where-Object { $_ } | Sort-Object @{ Expression={ $order[[string]$_.Status] } }, @{ Expression={ $sevRank[[string]$_.Severity] } })
+}
+
 function Get-DfirSummary {
     param($Findings)
     [pscustomobject]@{
@@ -1419,6 +1545,11 @@ function Invoke-ProcessThreatScan {
     $unsignedNetInstalled = New-Object System.Collections.ArrayList
     $badCmd = New-Object System.Collections.ArrayList
     $script:_cmdHasAlert = $false
+    # Executable paths behind each card, for the card actions (scan, open).
+    $pathsFor = @{
+        masq = (New-Object System.Collections.ArrayList); badPath = (New-Object System.Collections.ArrayList)
+        unsignedNet = (New-Object System.Collections.ArrayList); unsignedNetInstalled = (New-Object System.Collections.ArrayList)
+    }
 
     foreach ($p in $procs) {
         $name = $null; $exe = $null; $cmd = $null; $procId = $null
@@ -1438,12 +1569,14 @@ function Invoke-ProcessThreatScan {
                 foreach ($d in $expected) { if ($exeDir -and $exeDir.TrimEnd('\') -ieq $d.TrimEnd('\')) { $okDir = $true; break } }
                 if (-not $okDir) {
                     [void]$masq.Add(("  {0} (PID {1}) runs from: {2}  [should be in {3}]" -f $name, $procId, $exe, ($expected -join ' or ')))
+                    [void]$pathsFor.masq.Add([string]$exe)
                 }
             }
         }
         # Near-miss lookalike names (scvhost, lsas, etc.)
         if ($script:LookalikeNames -contains $base.ToLower()) {
             [void]$masq.Add(("  {0} (PID {1}) at {2}  [name imitates a Windows process]" -f $name, $procId, $(if($exe){$exe}else{'unknown path'})))
+            if ($exe) { [void]$pathsFor.masq.Add([string]$exe) }
         }
 
         # ---- 2. Running from a user/temp folder ----
@@ -1460,6 +1593,7 @@ function Invoke-ProcessThreatScan {
                 $signText = if ($isSigned) { "signed: $($sig.Publisher)" } else { 'UNSIGNED' }
                 if ($tempLoc -or (-not $isSigned)) {
                     [void]$badPath.Add(("  {0} (PID {1}) -> {2}  ({3})" -f $name, $procId, $exe, $signText))
+                    [void]$pathsFor.badPath.Add([string]$exe)
                 }
             }
         }
@@ -1473,8 +1607,10 @@ function Invoke-ProcessThreatScan {
             if ($sig -and -not $sig.Signed -and $exe -notmatch '\\System32\\|\\SysWOW64\\') {
                 if ($exe -match '\\Temp\\|\\AppData\\|\\ProgramData\\|\\Users\\Public\\|\\Downloads\\|\\\$Recycle') {
                     [void]$unsignedNet.Add(("  {0} (PID {1}) -> {2}  [unsigned + network, from a user/temp folder]" -f $name, $procId, $exe))
+                    [void]$pathsFor.unsignedNet.Add([string]$exe)
                 } else {
                     [void]$unsignedNetInstalled.Add(("  {0} (PID {1}) -> {2}" -f $name, $procId, $exe))
+                    [void]$pathsFor.unsignedNetInstalled.Add([string]$exe)
                 }
             }
         }
@@ -1512,7 +1648,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-MASQ' -Category 'Running Processes' -Title ("Process masquerading as Windows: {0}" -f @($masq).Count) -Severity 'Critical' -Status 'Alert' `
             -What ("These running programs use a Windows system name but are NOT in the right place (or imitate a system name):`n" + $ev) `
             -Why 'Real Windows processes like svchost.exe/lsass.exe only run from the System32 folder. Malware copies these trusted names to hide. This is one of the strongest signs of infection.' `
-            -WhatToDo 'Do not ignore this. Note the PID and path, scan the file with Defender (right-click > Scan), and search the exact path online. If confirmed malicious, end the process and remove the file.' -Evidence $ev)
+            -WhatToDo 'Do not ignore this. Note the PID and path, scan the file with Defender (right-click > Scan), and search the exact path online. If confirmed malicious, end the process and remove the file.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.masq.ToArray())))
     } else {
         & $add (New-DfirFinding -Id 'DEEP-MASQ' -Category 'Running Processes' -Title 'No process masquerading detected' -Severity 'Info' -Status 'Clean' -What 'All system-named processes run from their correct Windows folders.' -Why '' -WhatToDo 'No action needed.' -Evidence '')
     }
@@ -1522,7 +1659,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-PROCPATH' -Category 'Running Processes' -Title ("Programs running from temporary/user folders: {0}" -f @($badPath).Count) -Severity 'High' -Status 'Review' `
             -What ("These programs are running from folders malware often hides in (Temp, Downloads, Public, or UNSIGNED from AppData/ProgramData). Signed programs in AppData/ProgramData - like OneDrive/Teams/Zoom - are deliberately excluded:`n" + $ev) `
             -Why 'Legitimate software usually runs from Program Files. Things running from Temp/Downloads, or UNSIGNED from AppData, are more suspicious.' `
-            -WhatToDo 'Look at each. Installers and some updaters are normal here. Anything UNSIGNED that you do not recognise should be scanned with Defender and investigated.' -Evidence $ev)
+            -WhatToDo 'Look at each. Installers and some updaters are normal here. Anything UNSIGNED that you do not recognise should be scanned with Defender and investigated.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.badPath.ToArray())))
     }
 
     if ($unsignedNet.Count -gt 0) {
@@ -1530,7 +1668,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-UNSIGNEDNET' -Category 'Running Processes' -Title ("Unsigned networked programs in user/temp folders: {0}" -f @($unsignedNet).Count) -Severity 'High' -Status 'Review' `
             -What ("These programs have NO digital signature, are using the network, AND run from a user-writable/temp folder:`n" + $ev) `
             -Why 'That combination - unsigned + networked + running from Temp/AppData/Downloads - is a strong malware indicator. Trusted software is signed and installed under Program Files.' `
-            -WhatToDo 'Identify each program. If you do not recognise it, disconnect from the internet, scan with Defender, and investigate the file path before allowing it.' -Evidence $ev)
+            -WhatToDo 'Identify each program. If you do not recognise it, disconnect from the internet, scan with Defender, and investigate the file path before allowing it.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.unsignedNet.ToArray())))
     }
 
     if ($unsignedNetInstalled.Count -gt 0) {
@@ -1538,7 +1677,8 @@ function Invoke-ProcessThreatScan {
         & $add (New-DfirFinding -Id 'DEEP-UNSIGNEDNET-INST' -Category 'Running Processes' -Title ("Installed unsigned apps using the network: {0}" -f @($unsignedNetInstalled).Count) -Severity 'Low' -Status 'Review' `
             -What ("These installed programs have no digital signature but are using the network:`n" + $ev) `
             -Why 'Many legitimate open-source and indie apps are unsigned (code-signing certificates cost money). This is usually fine - it is listed only so you can confirm you recognise each one.' `
-            -WhatToDo 'If you installed and trust these, no action is needed. Investigate only ones you do not recognise.' -Evidence $ev)
+            -WhatToDo 'If you installed and trust these, no action is needed. Investigate only ones you do not recognise.' -Evidence $ev `
+            -Paths @(Get-ExistingFilePath -Path @($pathsFor.unsignedNetInstalled.ToArray())))
     }
 
     if ($badCmd.Count -gt 0) {
@@ -1611,6 +1751,11 @@ function Test-IsDefenderDefinitionDriver {
     $path = $ImagePath
     if ($path -match '^(\\\?\?\\|\\\\\?\\)(.+)$') { $path = $Matches[2] }
     $path = $path.Trim()
+
+    # Canonicalise and require the result to equal the input, so a path that
+    # climbs out of Definition Updates with ..\ segments cannot pass the prefix test.
+    try { $full = [System.IO.Path]::GetFullPath($path) } catch { return $false }
+    if (-not [string]::Equals($full, $path, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
 
     # The genuine driver image is a bare .sys path (no quotes, no trailing args).
     # Build the expected prefix from the real ProgramData location on this machine.
@@ -1879,6 +2024,7 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^hayabusa.*\.exe$'
             OutputKind   = 'HayabusaCsv'
             NeedsAdmin   = $true
+            Verify       = 'Sha256'
             # PINNED version + per-asset SHA-256 (the strongest upstream integrity
             # anchor). This is the version the project has reviewed; the download is
             # verified against THESE hashes, not just whatever the API advertises at
@@ -1908,10 +2054,42 @@ function Get-ExternalToolRegistry {
             ExePattern   = '^chainsaw.*windows.*\.exe$|^chainsaw\.exe$'
             OutputKind   = 'ChainsawJson'
             NeedsAdmin   = $true
+            Verify       = 'Sha256'
             PinnedVersion = 'v2.16.5'
             PinnedSha256 = @{
                 'chainsaw_all_platforms+rules.zip' = 'FBD5E12FBD70395BC7FDFDF2D3903E8545F27CA2F35E23059DF6177641B76205'
             }
+        },
+        [pscustomobject]@{
+            Key          = 'autoruns'
+            Name         = 'Autoruns'
+            Vendor       = 'MS Sysinternals'
+            License      = 'Sysinternals Software License Terms: free to use, not redistributable, downloaded from MS at runtime'
+            HomeUrl      = 'https://learn.microsoft.com/sysinternals/downloads/autoruns'
+            Url          = 'https://download.sysinternals.com/files/Autoruns.zip'
+            Summary      = 'Lists everything set to start automatically (services, drivers, scheduled tasks, Winlogon, WMI, image hijacks, AppInit, KnownDLLs, LSA providers) and checks each signature. Maintained by MS.'
+            Verify       = 'Authenticode'
+            # Console builds in Autoruns.zip, by architecture.
+            ExeByArch    = @{ 'AMD64' = 'autorunsc64.exe'; 'x86' = 'autorunsc.exe'; 'ARM64' = 'autorunsc64a.exe' }
+            ExtraFiles   = @('Eula.txt')
+            ExePattern   = '^autorunsc(64a?)?\.exe$'
+            OutputKind   = 'AutorunsCsv'
+            NeedsAdmin   = $true
+        },
+        [pscustomobject]@{
+            Key          = 'sysmon'
+            Name         = 'Sysmon'
+            Vendor       = 'MS Sysinternals'
+            License      = 'Sysinternals Software License Terms: free to use, not redistributable, downloaded from MS at runtime'
+            HomeUrl      = 'https://learn.microsoft.com/sysinternals/downloads/sysmon'
+            Url          = 'https://download.sysinternals.com/files/Sysmon.zip'
+            Summary      = 'System Monitor: a driver and service that log process, network, driver and file activity to the event log. Used only when Windows has no built-in Sysmon.'
+            Verify       = 'Authenticode'
+            ExeByArch    = @{ 'AMD64' = 'Sysmon64.exe'; 'x86' = 'Sysmon.exe'; 'ARM64' = 'Sysmon64a.exe' }
+            ExtraFiles   = @('Eula.txt')
+            ExePattern   = '^Sysmon(64a?)?\.exe$'
+            OutputKind   = 'None'
+            NeedsAdmin   = $true
         }
     )
 }
@@ -1919,6 +2097,154 @@ function Get-ExternalToolRegistry {
 function Get-ExternalTool {
     param([Parameter(Mandatory)][string]$Key)
     Get-ExternalToolRegistry | Where-Object { $_.Key -eq $Key } | Select-Object -First 1
+}
+
+function Get-ExternalToolVerifyMode {
+    <# 'Sha256' (pinned or GitHub digest, checked before extraction) or
+       'Authenticode' (fixed MS URL, MS signature checked on every exe after
+       extraction). Read from the static registry only, never from a resolution
+       object, so a caller cannot downgrade a tool's verification. #>
+    param([Parameter(Mandatory)]$Tool)
+    if (($Tool.PSObject.Properties.Name -contains 'Verify') -and ([string]$Tool.Verify -eq 'Authenticode')) { return 'Authenticode' }
+    return 'Sha256'
+}
+
+function Get-ExternalToolExeName {
+    <# For Authenticode tools: the console exe this tool runs on this machine's
+       architecture (from ExeByArch). Throws when there is no build for it. #>
+    param([Parameter(Mandatory)]$Tool)
+    $arch = Get-SystemArch
+    $name = $null
+    if ($Tool.PSObject.Properties.Name -contains 'ExeByArch') { $name = $Tool.ExeByArch[$arch] }
+    if (-not $name) { throw ("{0} has no build for architecture {1}." -f $Tool.Name, $arch) }
+    return [string]$name
+}
+
+function Get-ExternalToolExePattern {
+    param([Parameter(Mandatory)]$Tool)
+    if ((Get-ExternalToolVerifyMode -Tool $Tool) -eq 'Authenticode') {
+        return ('^{0}$' -f [regex]::Escape((Get-ExternalToolExeName -Tool $Tool)))
+    }
+    return [string]$Tool.ExePattern
+}
+
+function Resolve-MicrosoftToolDownload {
+    <# Authenticode tools have no GitHub release: the download is always the
+       fixed MS URL in the registry. A HEAD request reports the size for the
+       consent screen. Metadata only. #>
+    param([Parameter(Mandatory)]$Tool)
+    $url = [string]$Tool.Url
+    if ($url -notmatch '^https://download\.sysinternals\.com/files/[A-Za-z0-9]+\.zip$') {
+        throw ("{0} is not a fixed download.sysinternals.com file URL; refusing to download." -f $url)
+    }
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { Write-CoreLog -Message ("TLS 1.2 could not be enabled: {0}" -f $_.Exception.Message) -Level WARN }
+    $resp = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $size = $null
+    try {
+        $len = @($resp.Headers['Content-Length']) | Select-Object -First 1
+        if ($len) { $size = [int64]$len }
+    } catch { Write-CoreLog -Message ("{0}: no usable Content-Length in the HEAD reply." -f $Tool.Name) -Level WARN }
+    [pscustomobject]@{
+        Key          = $Tool.Key
+        Name         = $Tool.Name
+        Vendor       = $Tool.Vendor
+        License      = $Tool.License
+        HomeUrl      = $Tool.HomeUrl
+        Summary      = $Tool.Summary
+        Version      = 'latest'
+        AssetName    = [System.IO.Path]::GetFileName($url)
+        DownloadUrl  = $url
+        SizeBytes    = $size
+        SizeMB       = $(if ($null -ne $size) { [math]::Round($size / 1MB, 1) } else { $null })
+        Arch         = Get-SystemArch
+        NeedsAdmin   = $Tool.NeedsAdmin
+        Published    = ''
+        Sha256Expected = $null
+        Sha256Source   = 'authenticode'
+        PinnedVersion  = $null
+        VersionMatchesPin = $false
+        IsLatest       = $true
+    }
+}
+
+function Expand-ZipEntrySafe {
+    <# Extract only the named top-level entries of a zip. Entries in sub-folders
+       or with path segments are skipped, so a crafted entry can never write
+       outside the destination. Returns the extracted paths. #>
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $out = New-Object System.Collections.ArrayList
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $zip.Entries) {
+            $full = [string]$entry.FullName
+            if ($full -match '[\\/]' -or $full -match '\.\.') { continue }
+            $wanted = $false
+            foreach ($n in $Names) { if ([string]::Equals($full, $n, [System.StringComparison]::OrdinalIgnoreCase)) { $wanted = $true; break } }
+            if (-not $wanted) { continue }
+            $target = Join-Path $Destination $full
+            $in = $entry.Open()
+            try {
+                $fs = [System.IO.File]::Create($target)
+                try { $in.CopyTo($fs) } finally { $fs.Dispose() }
+            } finally { $in.Dispose() }
+            [void]$out.Add($target)
+        }
+    } finally { $zip.Dispose() }
+    return @($out.ToArray())
+}
+
+function Get-ExternalToolInstallDir {
+    <# The version folder (tools\KEY\VERSION) that holds install.json and
+       exe.sha256 for an installed exe. Some archives put the exe in a subfolder
+       (Chainsaw: chainsaw\chainsaw_x86_64-pc-windows-msvc.exe), so walk up from
+       the exe's folder, never above the tools root. $null when none is found. #>
+    param([Parameter(Mandatory)][string]$ExePath)
+    $root = (Get-ExternalToolsRoot).TrimEnd('\', '/')
+    $dir = Split-Path -Path $ExePath -Parent
+    while ($dir -and ($dir.Length -gt $root.Length) -and $dir.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-Path -LiteralPath (Join-Path $dir 'install.json') -PathType Leaf) { return $dir }
+        $dir = Split-Path -Path $dir -Parent
+    }
+    return $null
+}
+
+function Assert-ExternalToolIntegrity {
+    <# Run immediately before every elevated run of an external tool. Throws
+       unless the tools root is admin-locked, the install manifest and recorded
+       exe hash exist, the exe hash still matches and, for Authenticode tools,
+       the exe is still signed by MS. Fails closed. #>
+    param([Parameter(Mandatory)]$Tool, [Parameter(Mandatory)][string]$ExePath)
+    if (-not (Test-ToolsRootSecure)) {
+        throw "$($Tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
+    }
+    $installDir  = Get-ExternalToolInstallDir -ExePath $ExePath
+    if (-not $installDir) { $installDir = Split-Path -Path $ExePath -Parent }
+    $metaPath    = Join-Path $installDir 'install.json'
+    $exeHashPath = Join-Path $installDir 'exe.sha256'
+    if (-not (Test-Path -LiteralPath $metaPath -PathType Leaf)) {
+        throw "$($Tool.Name) has no install manifest (install.json); it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    if (-not (Test-Path -LiteralPath $exeHashPath -PathType Leaf)) {
+        throw "$($Tool.Name) has no recorded executable hash (exe.sha256); it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    $pinned = ([string](Get-Content -LiteralPath $exeHashPath -Raw)).Trim().ToUpper()
+    if (-not $pinned) {
+        throw "$($Tool.Name)'s recorded hash file is empty. Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    $current = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash.ToUpper()
+    if ($pinned -ne $current) {
+        throw "The $($Tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
+    }
+    if ((Get-ExternalToolVerifyMode -Tool $Tool) -eq 'Authenticode') {
+        if (-not (Test-MicrosoftSigned -Path $ExePath)) {
+            throw "The $($Tool.Name) executable no longer carries a valid MS signature. Refusing to run. Delete it in Restore & Logs and re-download."
+        }
+    }
 }
 
 function Get-SystemArch {
@@ -1973,67 +2299,45 @@ function Test-ToolsTreeOwnership {
     return (Test-TreeOwnership -Root $Root)
 }
 
-function Remove-TreeSafely {
-    <# Delete a directory tree that a STANDARD USER may have built, while running
-       ELEVATED, without following a planted junction/symlink out of the tree. A
-       reparse point (junction/symlink) planted inside the tree could otherwise
-       turn `Remove-Item -Recurse` into an elevated delete of whatever it targets.
-       So: first walk the tree and remove every reparse-point item WITHOUT
-       recursing into it (deleting only the link, never its target), deepest-first;
-       then remove whatever remains. #>
-    param([string]$Path)
-    if (-not (Test-Path $Path)) { return }
-    $reparse = [System.IO.FileAttributes]::ReparsePoint
-    # Deepest-first so we unlink nested junctions before their parents are touched.
-    $items = @()
-    try { $items = @(Get-ChildItem -Path $Path -Recurse -Force -ErrorAction Stop) } catch { $items = @() }
-    $items = $items | Sort-Object { $_.FullName.Length } -Descending
-    foreach ($it in $items) {
-        try {
-            if (($it.Attributes -band $reparse) -eq $reparse) {
-                # It's a junction/symlink. Delete the LINK only - never -Recurse,
-                # which would traverse into (and delete the contents of) the target.
-                if ($it.PSIsContainer) {
-                    [System.IO.Directory]::Delete($it.FullName, $false)
-                } else {
-                    [System.IO.File]::Delete($it.FullName)
-                }
-            }
-        } catch {
-            Write-CoreLog -Message ("Could not unlink reparse point {0}: {1}" -f $it.FullName, $_.Exception.Message) -Level WARN
-        }
-    }
-    # If the ROOT itself is a reparse point, unlink it (not its target) and stop.
-    try {
-        $rootInfo = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        if (($rootInfo.Attributes -band $reparse) -eq $reparse) {
-            [System.IO.Directory]::Delete($Path, $false)
-            return
-        }
-    } catch { }
-    # Remaining real files/folders: safe to recurse now (no reparse points left inside).
-    Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+function Move-TreeToQuarantine {
+    <# Rename an untrusted tree aside instead of deleting it. A rename never
+       follows a planted junction or symlink, so nothing outside the tree is
+       touched, and the user keeps the content for review. Returns the new path. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $dest = '{0}.untrusted-{1}' -f $Path.TrimEnd('\'), [guid]::NewGuid().ToString('N')
+    [System.IO.Directory]::Move($Path, $dest)
+    return $dest
 }
 
 function Initialize-SecureBase {
     <# Admin-only: ensure the WHOLE base folder
        (%ProgramData%\Win11SecurityOptimizer) is owned by Administrators/SYSTEM and
        ACL-locked. If it (or anything under it - backups, tools, logs) is NOT so
-       owned (a standard user pre-created it), DELETE and recreate it so no planted
-       content (e.g. a malicious Rollback_*.ps1) survives. Returns the secured base
-       path, or throws if it cannot be secured. Shared by both the tools folder and
-       the rollback/backup folder. #>
+       owned (a standard user pre-created it), MOVE it aside to a quarantine
+       folder and recreate it, so no planted content (e.g. a malicious
+       Rollback_*.ps1) is ever run. Sets $script:Core.SecureSetupNotice for the UI.
+       Returns the secured base path, or throws if it cannot be secured. Shared by
+       both the tools folder and the rollback/backup folder. #>
     if (-not (Test-IsAdmin)) { throw 'Administrator rights are required to prepare the secure data folder.' }
     $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
     if (Test-Path $base) {
         if (-not (Test-TreeOwnership -Root $base)) {
-            Write-CoreLog -Message 'System data folder (or an item in it) is not owned by Administrators/SYSTEM - deleting and recreating to drop any planted content.' -Level WARN
-            Remove-TreeSafely -Path $base
+            Write-CoreLog -Message 'System data folder (or an item in it) is not owned by Administrators/SYSTEM. Moving it aside and recreating it.' -Level WARN
+            $quarantine = Move-TreeToQuarantine -Path $base
+            $script:Core.SecureSetupNotice = ("The folder {0} was not owned by Administrators, so another program could have changed its contents. It was moved to:`n`n{1}`n`nNothing in that folder is ever run by this tool. Any older rollback scripts inside it are untrusted: review each one line by line before you run it. A new, locked folder was created in its place. You can delete the moved folder once you have reviewed it." -f $base, $quarantine)
+            Write-CoreLog -Message ("Untrusted data folder quarantined to {0}" -f $quarantine) -Level WARN
         }
     }
     if (-not (Test-Path $base)) { New-Item -ItemType Directory -Path $base -Force | Out-Null }
     Set-ToolsFolderAcl -Path $base
     if (-not (Test-FolderOwnedBySystemOrAdmins $base)) { throw 'The system data folder could not be secured (ownership check failed after locking).' }
+    # Recreate backups at once so this session's rollback path stays valid even
+    # when the base is quarantined mid-session (for example from Pro Tools).
+    $backups = Join-Path $base 'backups'
+    if (-not (Test-Path -LiteralPath $backups)) {
+        New-Item -ItemType Directory -Path $backups -Force | Out-Null
+        Set-ItemOwnerAdministrators -Path $backups
+    }
     return $base
 }
 
@@ -2116,6 +2420,31 @@ function Set-TreeOwnerToAdministrators {
     }
 }
 
+function Set-ItemOwnerAdministrators {
+    <# Set the owner of one file or folder to Administrators (S-1-5-32-544).
+       A file an elevated admin creates is owned by that user, which fails the
+       ownership gate on the next launch. Throws on failure. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $admins = New-Object System.Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner($admins)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Write-SecureFile {
+    <# Write a text file. When it lands inside the secure base, re-own it to
+       Administrators straight after the write so the ownership gate stays green. #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    Set-Content -LiteralPath $Path -Value $Value -Encoding UTF8
+    $base = (Join-Path $env:ProgramData 'Win11SecurityOptimizer') + [System.IO.Path]::DirectorySeparatorChar
+    if ($Path.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Set-ItemOwnerAdministrators -Path $Path
+    }
+}
+
 function Resolve-ExternalToolRelease {
     <#
       Queries the official GitHub repo and selects the correct Windows asset for
@@ -2136,6 +2465,7 @@ function Resolve-ExternalToolRelease {
     )
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { throw "Unknown tool '$Key'." }
+    if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') { return (Resolve-MicrosoftToolDownload -Tool $tool) }
     $arch = Get-SystemArch
     $pattern = $tool.AssetPattern[$arch]
     if (-not $pattern) { throw "$($tool.Name) has no build for architecture $arch." }
@@ -2145,6 +2475,9 @@ function Resolve-ExternalToolRelease {
 
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
     $headers = @{ 'User-Agent' = 'Win11SecurityOptimizer'; 'Accept' = 'application/vnd.github+json' }
+    # Optional token for the GitHub API (CI runners share IPs and hit the
+    # unauthenticated rate limit). Users never need to set this.
+    if ($env:W11SO_GITHUB_TOKEN) { $headers['Authorization'] = 'Bearer ' + $env:W11SO_GITHUB_TOKEN }
 
     # Decide which release to fetch. Default = the pinned tag (so the pin holds);
     # -UseLatest or no pin configured = /releases/latest.
@@ -2243,14 +2576,15 @@ function Test-ExternalToolInstalled {
     param([Parameter(Mandatory)][string]$Key, [string]$Version)
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { return $null }
+    $pattern = Get-ExternalToolExePattern -Tool $tool
     if ($Version) {
         $p = Get-ExternalToolInstallPath -Key $Key -Version $Version
-        return (Find-ExternalToolExe -InstallPath $p -ExePattern $tool.ExePattern)
+        return (Find-ExternalToolExe -InstallPath $p -ExePattern $pattern)
     }
     # any installed version
     $base = Join-Path (Get-ExternalToolsRoot) $Key
     if (-not (Test-Path $base)) { return $null }
-    return (Find-ExternalToolExe -InstallPath $base -ExePattern $tool.ExePattern)
+    return (Find-ExternalToolExe -InstallPath $base -ExePattern $pattern)
 }
 
 function Install-ExternalTool {
@@ -2282,13 +2616,19 @@ function Install-ExternalTool {
 
     try {
         if (-not $Resolution) { $Resolution = Resolve-ExternalToolRelease -Key $Key }
+        $verifyMode = Get-ExternalToolVerifyMode -Tool $tool
+        $downloadUrl = [string]$Resolution.DownloadUrl
+        $assetName = [string]$Resolution.AssetName
+        if ($verifyMode -eq 'Authenticode') {
+            # Always the fixed MS URL from the registry, whatever the caller passed.
+            $downloadUrl = [string]$tool.Url
+            $assetName = [System.IO.Path]::GetFileName($downloadUrl)
+            $runExeName = Get-ExternalToolExeName -Tool $tool
+        }
 
-        # Prepare + lock the tools root BEFORE anything is written. This creates the
-        # ProgramData tree, locks its ACL, and - critically - if a standard user
-        # pre-created it (or planted content) so it is NOT owned by
-        # Administrators/SYSTEM, deletes and recreates it. Mutating setup lives here;
-        # the gate below (Test-ToolsRootSecure) stays read-only.
-        [void](Initialize-SecureToolsRoot)
+        # The main thread secures the base and tools root (Initialize-SecureToolsRoot
+        # in Start-ProScan) before this runs. This may run in a background runspace,
+        # so it only checks the read-only gate here and never re-secures the base.
         if (-not (Test-ToolsRootSecure)) {
             throw 'The tools folder is not in a protected (admin-only) location, so an elevated download would be unsafe. Aborting.'
         }
@@ -2302,23 +2642,23 @@ function Install-ExternalTool {
 
         $installPath = Get-ExternalToolInstallPath -Key $Key -Version $Resolution.Version
         if (-not (Test-Path $installPath)) { New-Item -ItemType Directory -Path $installPath -Force | Out-Null }
-        $zipPath = Join-Path $installPath $Resolution.AssetName
+        $zipPath = Join-Path $installPath $assetName
 
-        & $report ("Downloading {0} {1} ({2} MB) from {3}" -f $tool.Name, $Resolution.Version, $Resolution.SizeMB, $Resolution.DownloadUrl)
+        & $report ("Downloading {0} {1} ({2} MB) from {3}" -f $tool.Name, $Resolution.Version, $Resolution.SizeMB, $downloadUrl)
         try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 
         $downloaded = $false
         # Prefer BITS (resumable, shows in Windows), fall back to WebClient.
         try {
             Import-Module BitsTransfer -ErrorAction Stop
-            Start-BitsTransfer -Source $Resolution.DownloadUrl -Destination $zipPath -ErrorAction Stop
+            Start-BitsTransfer -Source $downloadUrl -Destination $zipPath -ErrorAction Stop
             $downloaded = $true
         } catch {
             & $report 'BITS unavailable - using direct download...'
             try {
                 $wc = New-Object System.Net.WebClient
                 $wc.Headers.Add('User-Agent','Win11SecurityOptimizer')
-                $wc.DownloadFile($Resolution.DownloadUrl, $zipPath)
+                $wc.DownloadFile($downloadUrl, $zipPath)
                 $downloaded = $true
             } catch {
                 throw "Download failed: $($_.Exception.Message)"
@@ -2337,84 +2677,112 @@ function Install-ExternalTool {
             throw 'Downloaded file is not a valid ZIP archive (unexpected content). Aborting for safety.'
         }
 
-        # Compute the SHA-256 and VERIFY it against the expected hash (pinned hash
-        # preferred, else the digest GitHub advertised for this exact asset). This is
-        # the real integrity gate - if it does not match, OR if there is NO expected
-        # hash at all, the file is deleted and nothing is extracted or executed.
-        # These binaries run ELEVATED, so we FAIL CLOSED rather than trusting an
-        # unverifiable download.
-        $sha = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToUpper()
+        $sha = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpper()
         & $report ("SHA-256: {0}" -f $sha)
         $expected = $null; $expectedSource = 'none'
-        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected } } catch { }
-        try { if ($Resolution.PSObject.Properties.Name -contains 'Sha256Source') { $expectedSource = [string]$Resolution.Sha256Source } } catch { }
 
-        if (-not $expected) {
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-            throw 'No trusted hash is available for this download (neither a project-pinned hash nor a GitHub-advertised digest). Because this tool runs with administrator rights, it will NOT be installed from an unverifiable download. Aborting.'
-        }
-        if ($sha -ne $expected.ToUpper()) {
-            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
-            throw ("SHA-256 MISMATCH. Expected {0} ({1}) but got {2}. The download was corrupted or tampered with; it has been deleted and NOT run." -f $expected.ToUpper(), $expectedSource, $sha)
-        }
-        if ($expectedSource -eq 'pinned') {
-            & $report 'SHA-256 verified against the project-pinned (reviewed) hash.'
-            Write-CoreLog -Message ("{0} {1} SHA-256 verified against PINNED hash: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+        if ($verifyMode -eq 'Sha256') {
+            # Verify the archive hash against the trusted hash (pinned hash preferred,
+            # else the digest GitHub advertised for this exact asset) BEFORE anything
+            # is extracted. No hash or a mismatch deletes the file. These binaries run
+            # ELEVATED, so we FAIL CLOSED rather than trust an unverifiable download.
+            if ($Resolution.PSObject.Properties.Name -contains 'Sha256Expected') { $expected = $Resolution.Sha256Expected }
+            if ($Resolution.PSObject.Properties.Name -contains 'Sha256Source') { $expectedSource = [string]$Resolution.Sha256Source }
+            if ($expectedSource -eq 'authenticode') { $expected = $null }
+
+            if (-not $expected) {
+                Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+                throw 'No trusted hash is available for this download (neither a project-pinned hash nor a GitHub-advertised digest). Because this tool runs with administrator rights, it will NOT be installed from an unverifiable download. Aborting.'
+            }
+            if ($sha -ne ([string]$expected).ToUpper()) {
+                Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+                throw ("SHA-256 MISMATCH. Expected {0} ({1}) but got {2}. The download was corrupted or tampered with; it has been deleted and NOT run." -f ([string]$expected).ToUpper(), $expectedSource, $sha)
+            }
+            if ($expectedSource -eq 'pinned') {
+                & $report 'SHA-256 verified against the project-pinned (reviewed) hash.'
+                Write-CoreLog -Message ("{0} {1} SHA-256 verified against PINNED hash: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            } else {
+                & $report 'SHA-256 verified against the official GitHub release digest (this version is newer than the project-reviewed pin).'
+                Write-CoreLog -Message ("{0} {1} SHA-256 verified against GitHub digest: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            }
+
+            & $report 'Extracting...'
+            Expand-Archive -Path $zipPath -DestinationPath $installPath -Force
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue   # keep only the extracted tool
+
+            $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
+            if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
         } else {
-            & $report 'SHA-256 verified against the official GitHub release digest (this version is newer than the project-reviewed pin).'
-            Write-CoreLog -Message ("{0} {1} SHA-256 verified against GitHub digest: {2}" -f $tool.Name, $Resolution.Version, $sha) -Level OK
+            # Authenticode: MS publishes no hash for these zips. Extract ONLY the exe
+            # this tool runs (plus listed text files) as top-level entries, then
+            # require a valid MS signature on the exe before it is ever run.
+            $expectedSource = 'authenticode'
+            $names = @($runExeName)
+            if ($tool.PSObject.Properties.Name -contains 'ExtraFiles') { $names += @($tool.ExtraFiles) }
+            & $report 'Extracting the signed program...'
+            $extracted = @(Expand-ZipEntrySafe -ZipPath $zipPath -Destination $installPath -Names $names)
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+            $exe = Join-Path $installPath $runExeName
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+                foreach ($x in $extracted) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue }
+                throw ("The download from {0} did not contain {1}, the program {2} needs on a {3} PC. Nothing was run." -f $downloadUrl, $runExeName, $tool.Name, (Get-SystemArch))
+            }
+            if (-not (Test-MicrosoftSigned -Path $exe)) {
+                foreach ($x in $extracted) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue }
+                throw ("{0} is not signed by MS (the Authenticode check failed). It has been deleted and was not run." -f $runExeName)
+            }
+            & $report ("{0} is signed by MS (Authenticode verified)." -f $runExeName)
+            Write-CoreLog -Message ("{0}: {1} Authenticode-verified as MS-signed; zip SHA-256 {2}" -f $tool.Name, $runExeName, $sha) -Level OK
         }
 
-        & $report 'Extracting...'
-        Expand-Archive -Path $zipPath -DestinationPath $installPath -Force
-        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue   # keep only the extracted tool
-
-        $exe = Find-ExternalToolExe -InstallPath $installPath -ExePattern $tool.ExePattern
-        if (-not $exe) { throw "Extraction succeeded but no executable matching '$($tool.ExePattern)' was found." }
-
-        # PIN THE EXE HASH NOW - at install time, immediately after extracting from
-        # the hash-verified ZIP - so the trusted baseline is "what we just extracted
-        # from a verified archive", NOT "whatever happens to be on disk at first run".
-        $exeHash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash.ToUpper()
+        # Record the exe hash NOW, straight after extraction from the verified
+        # download, so the trusted baseline is "what we just verified", not
+        # "whatever is on disk at first run". Re-checked before every run.
+        $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToUpper()
         $exeHashPath = Join-Path $installPath 'exe.sha256'
-        Set-Content -Path $exeHashPath -Value $exeHash -Encoding ASCII
+        Write-SecureFile -Path $exeHashPath -Value $exeHash
 
-        # Verify the binary runs (sanity + anti-corruption check). Different tools
-        # expose version differently (Hayabusa uses a 'help' subcommand, not
-        # --version), so try a few and capture the first line of banner/output.
         $verText = ''
-        foreach ($probe in @(@('help'), @('--version'), @('-V'), @('--help'))) {
-            try {
-                $out = (& $exe @probe 2>&1 | Out-String).Trim()
-                if ($out -and $out -notmatch 'unexpected argument') { $verText = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim(); break }
-            } catch { }
+        if ($verifyMode -eq 'Authenticode') {
+            # Never probe Sysinternals tools by running them: without -accepteula
+            # they open a EULA window that would block this background runspace.
+            try { $verText = [string](Get-Item -LiteralPath $exe).VersionInfo.FileVersion } catch { Write-CoreLog -Message ("No file version for {0}: {1}" -f $exe, $_.Exception.Message) -Level WARN }
+            if (-not $verText) { $verText = 'version not recorded in the file' }
+        } else {
+            # Verify the binary runs (sanity + anti-corruption check). Different tools
+            # expose version differently (Hayabusa uses a 'help' subcommand, not
+            # --version), so try a few and capture the first line of banner/output.
+            foreach ($probe in @(@('help'), @('--version'), @('-V'), @('--help'))) {
+                try {
+                    $out = (& $exe @probe 2>&1 | Out-String).Trim()
+                    if ($out -and $out -notmatch 'unexpected argument') { $verText = ($out -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1).Trim(); break }
+                } catch { Write-CoreLog -Message ("Version probe {0} failed: {1}" -f ($probe -join ' '), $_.Exception.Message) -Level DEBUG }
+            }
+            if (-not $verText) { $verText = 'ran (version banner not detected)' }
         }
-        if (-not $verText) { $verText = 'ran (version banner not detected)' }
         & $report ("Verified binary: {0}" -f $verText)
 
         # Record install metadata (incl. both the verified ZIP hash and the pinned
         # exe hash) for later re-verification.
         $meta = [pscustomobject]@{
             Key=$Key; Name=$tool.Name; Version=$Resolution.Version; Vendor=$tool.Vendor; License=$tool.License
-            Source=$Resolution.DownloadUrl; Sha256=$sha; Sha256Expected=$expected; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
+            Source=$downloadUrl; Verify=$verifyMode; Sha256=$sha; Sha256Expected=$expected; Sha256Source=$expectedSource; ExeSha256=$exeHash; Exe=$exe; VersionText=$verText; InstalledAt=(Get-Date -Format o)
         }
-        try { $meta | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $installPath 'install.json') -Encoding UTF8 } catch { }
+        Write-SecureFile -Path (Join-Path $installPath 'install.json') -Value (ConvertTo-Json -InputObject $meta -Depth 6)
 
         # LAST: force ownership of the WHOLE tools tree (every tool/version subfolder
-        # and the files we just wrote - exe, rules, install.json, exe.sha256) to the
-        # Administrators group, then re-assert the ACL lock. On modern Windows a
-        # folder created by an elevated admin is owned by that USER, not the
-        # Administrators group, so without this the ownership gate would fail on the
-        # NEXT run. This must happen AFTER the manifests are written. A non-admin's
-        # pre-planted file (owned by a standard-user SID) still fails the gate, which
-        # is the whole point.
+        # and the extracted files) to the Administrators group, then re-assert the
+        # tools ACL. On modern Windows a folder created by an elevated admin is owned
+        # by that USER, so without this the ownership gate would fail on the NEXT
+        # run. A non-admin's pre-planted file (owned by a standard-user SID) still
+        # fails the gate. Only the tools tree is touched; the base belongs to the
+        # main thread.
         if ((Get-ExternalToolsRoot) -eq (Join-Path $env:ProgramData 'Win11SecurityOptimizer\tools')) {
             Set-TreeOwnerToAdministrators -Path (Get-ExternalToolsRoot)
-            Set-ToolsFolderAcl -Path (Join-Path $env:ProgramData 'Win11SecurityOptimizer')
             Set-ToolsFolderAcl -Path (Get-ExternalToolsRoot)
         }
 
-        Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $Resolution.DownloadUrl)
+        Add-ChangeRecord -Description ("Downloaded external tool {0} {1} (SHA256 {2}) from {3}" -f $tool.Name, $Resolution.Version, $sha.Substring(0,16), $downloadUrl)
 
         return [pscustomobject]@{ Success=$true; Message='Installed.'; ExePath=$exe; Version=$Resolution.Version; Sha256=$sha }
     } catch {
@@ -2424,9 +2792,15 @@ function Install-ExternalTool {
 }
 
 function Remove-ExternalTools {
-    <# Deletes everything under the tools folder. Returns count removed. #>
+    <# Deletes everything under the tools folder. Returns count removed. Keeps
+       the downloaded Sysmon while Sysmon is installed: it is needed to
+       uninstall it. #>
     $root = Get-ExternalToolsRoot
-    $items = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue
+    $items = @(Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue)
+    if (Test-SysmonToolInUse) {
+        $items = @($items | Where-Object { $_.Name -ne 'sysmon' })
+        Write-CoreLog -Message 'Kept the downloaded Sysmon: Sysmon is installed and needs it to uninstall.' -Level WARN
+    }
     $n = @($items).Count
     foreach ($d in $items) { Remove-Item $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     Write-CoreLog -Message ("Removed {0} downloaded tool folder(s)." -f $n) -Level INFO
@@ -2446,17 +2820,39 @@ function Invoke-HayabusaScan {
     # -K no color, -Q quiet errors. (Subcommand/flags verified against v4.x.)
     $hArgs = @('dfir-timeline','-l','-w','-C','-o', $outCsv, '-m', $MinLevel, '-p','standard','-K','-Q')
     & $report ("Running Hayabusa (min level: {0}) - this can take a few minutes..." -f $MinLevel)
-    $stdout = ''
+    $run = $null
     try {
         Push-Location $toolDir
-        $stdout = (& $ExePath @hArgs 2>&1 | Out-String)
+        $run = Invoke-NativeCommand -FilePath $ExePath -ArgumentList $hArgs
     } finally { Pop-Location }
-    Write-CoreLog -Message ("Hayabusa finished. Output: {0}" -f $outCsv) -Level INFO
-    return [pscustomobject]@{ OutputPath=$outCsv; StdOut=$stdout; Kind='HayabusaCsv' }
+    Write-CoreLog -Message ("Hayabusa finished (exit {0}). Output: {1}" -f $run.ExitCode, $outCsv) -Level INFO
+    return [pscustomobject]@{ OutputPath=$outCsv; StdOut=[string]$run.Output; ExitCode=$run.ExitCode; Kind='HayabusaCsv' }
+}
+
+function Get-ExternalLevelAtOrAbove {
+    <# Rule levels at or above the minimum, lowest first. #>
+    param([ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium')
+    $all = @('low', 'medium', 'high', 'critical')
+    return @($all[([array]::IndexOf($all, $MinLevel))..($all.Count - 1)])
+}
+
+function Get-ExternalLevelRank {
+    <# 0 info, 1 low, 2 medium, 3 high, 4 critical. Unknown text ranks as info. #>
+    param([AllowEmptyString()][string]$Level)
+    switch -regex (([string]$Level).ToLowerInvariant()) {
+        '^crit' { return 4 }
+        '^high' { return 3 }
+        '^med'  { return 2 }
+        '^low'  { return 1 }
+        default { return 0 }
+    }
 }
 
 function Invoke-ChainsawScan {
-    param([Parameter(Mandatory)][string]$ExePath, [scriptblock]$Progress)
+    param(
+        [Parameter(Mandatory)][string]$ExePath, [scriptblock]$Progress,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
     $report = { param($m) if ($Progress) { try { & $Progress $m } catch { } }; Write-CoreLog -Message $m -Level INFO }
     $toolDir = Split-Path $ExePath -Parent
     $outJson = Join-Path $script:Core.DataPath ("logs\chainsaw_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
@@ -2470,15 +2866,30 @@ function Invoke-ChainsawScan {
     $csArgs = @('hunt', $logDir, '--json', '-o', $outJson, '--skip-errors')
     if ($sigmaDir -and $mappingFile) { $csArgs += @('-s', $sigmaDir.FullName, '--mapping', $mappingFile.FullName) }
     if ($rulesDir) { $csArgs += @('-r', $rulesDir.FullName) }
+    # Pass --level only when this build's hunt help lists it; the parser also
+    # filters by level, so older builds still honour the minimum.
+    $helpText = ''
+    try { $helpText = [string](Invoke-NativeCommand -FilePath $ExePath -ArgumentList @('hunt', '--help')).Output } catch { Write-CoreLog -Message ("chainsaw hunt --help failed: {0}" -f $_.Exception.Message) -Level WARN }
+    if ($helpText -match '--level') {
+        foreach ($lv in @(Get-ExternalLevelAtOrAbove -MinLevel $MinLevel)) { $csArgs += @('--level', $lv) }
+    }
 
     & $report 'Running Chainsaw against the local event logs - this can take a few minutes...'
-    $stdout = ''
+    # Invoke-NativeCommand: Chainsaw prints its banner and progress to stderr,
+    # which Windows PowerShell 5.1 turns into a terminating error when the
+    # caller runs with ErrorActionPreference Stop.
+    $run = $null
     try {
         Push-Location $toolDir
-        $stdout = (& $ExePath @csArgs 2>&1 | Out-String)
+        $run = Invoke-NativeCommand -FilePath $ExePath -ArgumentList $csArgs
     } finally { Pop-Location }
-    Write-CoreLog -Message ("Chainsaw finished. Output: {0}" -f $outJson) -Level INFO
-    return [pscustomobject]@{ OutputPath=$outJson; StdOut=$stdout; Kind='ChainsawJson' }
+    Write-CoreLog -Message ("Chainsaw finished (exit {0}). Output: {1}" -f $run.ExitCode, $outJson) -Level INFO
+    if (-not (Test-Path -LiteralPath $outJson)) {
+        $tail = [string]$run.Output
+        if ($tail.Length -gt 600) { $tail = $tail.Substring($tail.Length - 600) }
+        Write-CoreLog -Message ("Chainsaw wrote no results file. Exit code {0}. Last output: {1}" -f $run.ExitCode, $tail) -Level WARN
+    }
+    return [pscustomobject]@{ OutputPath=$outJson; StdOut=[string]$run.Output; ExitCode=$run.ExitCode; Kind='ChainsawJson' }
 }
 
 # ----------------------------------------------------------------------------
@@ -2504,7 +2915,8 @@ function ConvertFrom-HayabusaCsv {
         return $f.ToArray()
     }
     $rows = @()
-    try { $rows = Import-Csv -Path $CsvPath -ErrorAction Stop } catch { }
+    # Hayabusa writes UTF-8; Windows PowerShell would otherwise read the ANSI code page.
+    try { $rows = Import-Csv -LiteralPath $CsvPath -Encoding UTF8 -ErrorAction Stop } catch { Write-CoreLog -Message ("Hayabusa CSV could not be read: {0}" -f $_.Exception.Message) -Level WARN }
     if (@($rows).Count -eq 0) {
         [void]$f.Add((New-DfirFinding -Id 'HAYA-CLEAN' -Category 'Hayabusa (event-log hunt)' -Title 'Hayabusa found no detections' -Severity 'Info' -Status 'Clean' -What 'Hayabusa scanned the event logs and did not flag anything at the chosen level.' -Why '' -WhatToDo 'No action needed.' -Evidence ''))
         return $f.ToArray()
@@ -2518,6 +2930,9 @@ function ConvertFrom-HayabusaCsv {
     $colChan  = ($cols | Where-Object { $_ -match '(Channel)' } | Select-Object -First 1)
     $colEid   = ($cols | Where-Object { $_ -match '(EventID|EvtID|Event ID)' } | Select-Object -First 1)
     $colComp  = ($cols | Where-Object { $_ -match '(Computer)' } | Select-Object -First 1)
+    $colDet   = ($cols | Where-Object { $_ -match '^Details$' } | Select-Object -First 1)
+    $colExtra = ($cols | Where-Object { $_ -match '^ExtraFieldInfo$' } | Select-Object -First 1)
+    $colRule  = ($cols | Where-Object { $_ -match '^(RuleID|RuleFile)$' } | Select-Object -First 1)
     if (-not $colTitle) { $colTitle = $cols | Select-Object -First 1 }
 
     # Summary card
@@ -2541,17 +2956,37 @@ function ConvertFrom-HayabusaCsv {
     foreach ($r in $ranked) {
         if ($shown -ge $MaxCards) { break }
         $shown++
-        $samples = $r.Group.Group | Select-Object -First 3 | ForEach-Object {
-            $t = if ($colTime) { $_.$colTime } else { '' }
-            $ch = if ($colChan) { $_.$colChan } else { '' }
-            $eid = if ($colEid) { $_.$colEid } else { '' }
-            ("  {0}  channel={1} eventID={2}" -f $t, $ch, $eid)
+        # The event behind the rule, its details (threat, file, account, program)
+        # and concrete search terms, so the card can be acted on as it stands.
+        $first = @($r.Group.Group)[0]
+        $chan = if ($colChan) { [string]$first.$colChan } else { '' }
+        $eid = if ($colEid) { [string]$first.$colEid } else { '' }
+        $guide = Get-EventGuidance -Channel $chan -EventId $eid
+        $lines = New-Object System.Collections.ArrayList
+        $allDetail = New-Object System.Collections.ArrayList
+        $paths = New-Object System.Collections.ArrayList
+        foreach ($row in @($r.Group.Group | Select-Object -First 3)) {
+            $t = if ($colTime) { [string]$row.$colTime } else { '' }
+            $comp = if ($colComp) { [string]$row.$colComp } else { '' }
+            $rc = Resolve-EventChannel -Channel $(if ($colChan) { [string]$row.$colChan } else { '' })
+            $re = if ($colEid) { [string]$row.$colEid } else { '' }
+            [void]$lines.Add(("{0} | {1} | {2} event {3}" -f $t, $comp, $rc, $re))
+            $det = if ($colDet) { [string]$row.$colDet } else { '' }
+            if ($det -and $det -ne '-') {
+                [void]$lines.Add(('    ' + (Limit-Text -Text $det -Max 400)))
+                [void]$allDetail.Add($det)
+                foreach ($p in @(Get-EventFilePath -Text $det -Fields (ConvertFrom-HayabusaDetail -Text $det))) { if (-not ($paths -contains $p)) { [void]$paths.Add($p) } }
+            }
+            $extra = if ($colExtra) { [string]$row.$colExtra } else { '' }
+            if ($extra -and $extra -ne '-') { [void]$lines.Add(('    ' + (Limit-Text -Text $extra -Max 200))) }
         }
-        $ev = ($samples -join "`n")
+        if ($colRule -and [string]$first.$colRule) { [void]$lines.Add(("Rule: {0}" -f [string]$first.$colRule)) }
+        $search = @(Get-DetectionSearchTerm -RuleTitle $r.Title -Channel $chan -EventId $eid -DetailText ($allDetail -join "`n") -Path @($paths))
         [void]$f.Add((New-DfirFinding -Id ("HAYA-{0}" -f $shown) -Category 'Hayabusa (event-log hunt)' -Title ("[{0}] {1}" -f $r.LevelRaw, $r.Title) -Severity $r.Sev -Status $r.Status `
-            -What ("Hayabusa matched this detection {0} time(s) in your event logs." -f $r.Count) `
-            -Why 'This rule corresponds to a known attacker technique or suspicious activity recorded by Windows.' `
-            -WhatToDo 'Look at the sample events below. If this is not activity you recognise, investigate the affected account/time. Full details are in the Hayabusa CSV (Restore & Logs tab).' -Evidence $ev))
+            -What (Format-MatchSummary -Tool 'Hayabusa' -Count $r.Count -Guidance $guide) `
+            -Why 'Hayabusa flags patterns attackers use; legitimate software can match too. The events below show which program, file or account was involved.' `
+            -WhatToDo (Format-DetectionGuidance -Guidance $guide -SearchTerm $search -FullReport $CsvPath) -Evidence ($lines -join "`n") `
+            -Paths @(Get-ExistingFilePath -Path @($paths))))
     }
     if (@($ranked).Count -gt $shown) {
         [void]$f.Add((New-DfirFinding -Id 'HAYA-MORE' -Category 'Hayabusa (event-log hunt)' -Title ("+ {0} more rule(s) in the full report" -f (@($ranked).Count - $shown)) -Severity 'Info' -Status 'Info' -What 'Additional lower-priority detections were truncated here.' -Why '' -WhatToDo ("Open the full CSV: {0}" -f $CsvPath) -Evidence ''))
@@ -2561,7 +2996,10 @@ function ConvertFrom-HayabusaCsv {
 
 function ConvertFrom-ChainsawJson {
     <# Aggregates Chainsaw's JSON hunt output into finding cards (one per rule). #>
-    param([Parameter(Mandatory)][string]$JsonPath, [int]$MaxCards = 40)
+    param(
+        [Parameter(Mandatory)][string]$JsonPath, [int]$MaxCards = 40,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'low'
+    )
     $f = New-Object System.Collections.ArrayList
     if (-not (Test-Path $JsonPath)) {
         [void]$f.Add((New-DfirFinding -Id 'CHAIN-NONE' -Category 'Chainsaw (event-log hunt)' -Title 'Chainsaw produced no output' -Severity 'Info' -Status 'Info' -What 'No results file was created. Either no detections, or the logs could not be read (admin needed).' -Why '' -WhatToDo 'Re-run elevated via Start.bat if you expected results.' -Evidence ''))
@@ -2583,7 +3021,16 @@ function ConvertFrom-ChainsawJson {
         try { if ($d.PSObject.Properties.Name -contains 'level') { $level = $d.level } } catch { }
         try { if ($d.PSObject.Properties.Name -contains 'timestamp') { $ts = $d.timestamp } } catch { }
         if (-not $name) { $name = 'Detection' }
-        [pscustomobject]@{ Name=$name; Level=$level; Ts=$ts }
+        $info = $null
+        try { $info = Get-ChainsawEventInfo -Detection $d } catch { Write-CoreLog -Message ("Chainsaw detection details could not be read: {0}" -f $_.Exception.Message) -Level DEBUG }
+        [pscustomobject]@{ Name=$name; Level=$level; Ts=$ts; Info=$info }
+    }
+    $minRank = Get-ExternalLevelRank -Level $MinLevel
+    $norm = @($norm | Where-Object { (Get-ExternalLevelRank -Level ([string]$_.Level)) -ge $minRank })
+    $items = @($norm)
+    if ($items.Count -eq 0) {
+        [void]$f.Add((New-DfirFinding -Id 'CHAIN-CLEAN' -Category 'Chainsaw (event-log hunt)' -Title ("Chainsaw found no detections at level {0} or above" -f $MinLevel) -Severity 'Info' -Status 'Clean' -What 'Chainsaw scanned the event logs and did not flag anything at or above the level you chose.' -Why '' -WhatToDo 'No action needed. Choose a lower minimum level in Pro Tools to see more.' -Evidence ''))
+        return $f.ToArray()
     }
 
     $byLevel = $norm | Group-Object Level
@@ -2604,11 +3051,30 @@ function ConvertFrom-ChainsawJson {
     foreach ($r in $ranked) {
         if ($shown -ge $MaxCards) { break }
         $shown++
-        $samples = $r.Group.Group | Select-Object -First 3 | ForEach-Object { "  {0}" -f $_.Ts }
+        # The event behind the rule, its fields and concrete search terms.
+        $first = @($r.Group.Group)[0]
+        $chan = if ($first.Info) { [string]$first.Info.Channel } else { '' }
+        $eid = if ($first.Info) { [string]$first.Info.EventId } else { '' }
+        $guide = Get-EventGuidance -Channel $chan -EventId $eid
+        $lines = New-Object System.Collections.ArrayList
+        $allDetail = New-Object System.Collections.ArrayList
+        $paths = New-Object System.Collections.ArrayList
+        foreach ($s in @($r.Group.Group | Select-Object -First 3)) {
+            if (-not $s.Info) { [void]$lines.Add([string]$s.Ts); continue }
+            [void]$lines.Add(("{0} | {1} | {2} event {3}" -f $s.Ts, $s.Info.Computer, $s.Info.Channel, $s.Info.EventId))
+            $fieldText = Format-EventField -Fields $s.Info.Fields
+            if ($fieldText) {
+                [void]$lines.Add(('    ' + $fieldText))
+                [void]$allDetail.Add($fieldText)
+                foreach ($p in @(Get-EventFilePath -Text $fieldText -Fields $s.Info.Fields)) { if (-not ($paths -contains $p)) { [void]$paths.Add($p) } }
+            }
+        }
+        $search = @(Get-DetectionSearchTerm -RuleTitle $r.Title -Channel $chan -EventId $eid -DetailText ($allDetail -join "`n") -Path @($paths))
         [void]$f.Add((New-DfirFinding -Id ("CHAIN-{0}" -f $shown) -Category 'Chainsaw (event-log hunt)' -Title ("[{0}] {1}" -f $r.LevelRaw, $r.Title) -Severity $r.Sev -Status $r.Status `
-            -What ("Chainsaw matched this rule {0} time(s) in your event logs." -f $r.Count) `
-            -Why 'This Sigma rule corresponds to a known attacker technique recorded by Windows.' `
-            -WhatToDo 'Review the sample timestamps below. If unexpected, investigate. Full details are in the Chainsaw JSON (Restore & Logs tab).' -Evidence (($samples) -join "`n")))
+            -What (Format-MatchSummary -Tool 'Chainsaw' -Count $r.Count -Guidance $guide) `
+            -Why 'Chainsaw flags patterns from Sigma rules that attackers use; legitimate software can match too. The events below show which program, file or account was involved.' `
+            -WhatToDo (Format-DetectionGuidance -Guidance $guide -SearchTerm $search -FullReport $JsonPath) -Evidence ($lines -join "`n") `
+            -Paths @(Get-ExistingFilePath -Path @($paths))))
     }
     if (@($ranked).Count -gt $shown) {
         [void]$f.Add((New-DfirFinding -Id 'CHAIN-MORE' -Category 'Chainsaw (event-log hunt)' -Title ("+ {0} more rule(s) in the full report" -f (@($ranked).Count - $shown)) -Severity 'Info' -Status 'Info' -What 'Additional lower-priority detections were truncated here.' -Why '' -WhatToDo ("Open the full JSON: {0}" -f $JsonPath) -Evidence ''))
@@ -2622,58 +3088,50 @@ function Invoke-ExternalDfirScan {
       run -> parse -> return finding cards. The GUI calls this after
       Install-ExternalTool has succeeded (which itself is consent-gated).
     #>
-    param([Parameter(Mandatory)][string]$Key, [string]$ExePath, [scriptblock]$Progress)
+    param(
+        [Parameter(Mandatory)][string]$Key, [string]$ExePath, [scriptblock]$Progress,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
     $tool = Get-ExternalTool -Key $Key
     if (-not $tool) { throw "Unknown tool '$Key'." }
     if (-not $ExePath) { $ExePath = Test-ExternalToolInstalled -Key $Key }
     if (-not $ExePath) { throw "$($tool.Name) is not installed. Download it first." }
 
-    # Re-verify the binary's hash against the hash recorded at INSTALL time BEFORE
-    # running it elevated. Fails CLOSED: if the install manifest or the pinned exe
-    # hash is missing (e.g. a non-admin planted the exe without going through our
-    # verified installer), we refuse to run rather than trusting whatever is there.
+    # Re-verify the binary immediately before running it elevated: recorded exe
+    # hash for every tool, plus the MS signature for Authenticode tools. Fails closed.
     try {
-        # The tools root must be admin-locked first - a user-writable location means
-        # anything in it (incl. install.json / exe.sha256) could have been forged.
-        if (-not (Test-ToolsRootSecure)) {
-            throw "$($tool.Name) lives in a non-protected folder; refusing to run it elevated. Delete it in Restore & Logs and re-download via Pro Tools (as admin)."
-        }
-
-        $installDir  = Split-Path $ExePath -Parent
-        $metaPath    = Join-Path $installDir 'install.json'
-        $exeHashPath = Join-Path $installDir 'exe.sha256'
-
-        # Fail closed when the trust anchors our installer writes are absent.
-        if (-not (Test-Path $metaPath)) {
-            throw "$($tool.Name) has no install manifest (install.json) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-        if (-not (Test-Path $exeHashPath)) {
-            throw "$($tool.Name) has no pinned executable hash (exe.sha256) - it was not installed by this tool's verified downloader. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-
-        $pinned    = (Get-Content $exeHashPath -Raw).Trim().ToUpper()
-        $curExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToUpper()
-        if (-not $pinned) {
-            throw "$($tool.Name)'s pinned hash file is empty. Refusing to run. Delete it in Restore & Logs and re-download."
-        }
-        if ($pinned -ne $curExeHash) {
-            throw "The $($tool.Name) executable's hash changed since it was installed (possible tampering). Refusing to run. Delete it in Restore & Logs and re-download."
-        }
+        Assert-ExternalToolIntegrity -Tool $tool -ExePath $ExePath
     } catch {
-        if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { } }
+        if ($Progress) { try { & $Progress ("Integrity check failed: {0}" -f $_.Exception.Message) } catch { Write-CoreLog -Message 'Progress callback failed.' -Level DEBUG } }
         throw
     }
 
     switch ($tool.OutputKind) {
         'HayabusaCsv' {
-            $run = Invoke-HayabusaScan -ExePath $ExePath -Progress $Progress
+            $run = Invoke-HayabusaScan -ExePath $ExePath -MinLevel $MinLevel -Progress $Progress
             return (ConvertFrom-HayabusaCsv -CsvPath $run.OutputPath)
         }
         'ChainsawJson' {
-            $run = Invoke-ChainsawScan -ExePath $ExePath -Progress $Progress
-            return (ConvertFrom-ChainsawJson -JsonPath $run.OutputPath)
+            $run = Invoke-ChainsawScan -ExePath $ExePath -MinLevel $MinLevel -Progress $Progress
+            return (ConvertFrom-ChainsawJson -JsonPath $run.OutputPath -MinLevel $MinLevel)
+        }
+        'AutorunsCsv' {
+            $run = Invoke-AutorunsScan -ExePath $ExePath -Progress $Progress
+            return (ConvertFrom-AutorunsCsv -CsvPath $run.OutputPath)
         }
         default { throw "No parser for output kind '$($tool.OutputKind)'." }
     }
 }
 
+
+#region FeatureLoader
+# ----------------------------------------------------------------------------
+#  Feature files. Explicit, ordered list (no wildcard) so load order is fixed
+#  and a stray .ps1 dropped into the folder is never run. Build-Exe.ps1 inlines
+#  the same list in the same order and drops this block.
+# ----------------------------------------------------------------------------
+$script:FeatureFiles = @('Common.ps1', 'EventGuidance.ps1', 'Autoruns.ps1', 'Baseline.ps1', 'Hardening.ps1', 'Sysmon.ps1', 'Report.ps1', 'Evidence.ps1')
+foreach ($featureFile in $script:FeatureFiles) {
+    . (Join-Path (Join-Path $PSScriptRoot 'features') $featureFile)
+}
+#endregion FeatureLoader

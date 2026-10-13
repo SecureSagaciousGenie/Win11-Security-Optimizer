@@ -1,0 +1,417 @@
+# Integration run on a real Windows runner (elevated). Runs on demand and when
+# the workflow or anything under src changes.
+# Author: Ahmad Shaukat
+# Captures raw tool output for test fixtures. Nothing from Sysinternals is
+# committed to the repo; only the CSV output is uploaded as an artifact.
+name: Integration
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/integration.yml'
+      - 'src/**'
+      - 'config/**'
+
+permissions:
+  contents: read
+
+jobs:
+  autoruns-fixture:
+    name: Capture Autoruns CSV
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download, verify and run autorunsc
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          $work = Join-Path $env:RUNNER_TEMP 'autoruns'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $zip = Join-Path $work 'Autoruns.zip'
+          Invoke-WebRequest -Uri 'https://download.sysinternals.com/files/Autoruns.zip' -OutFile $zip -UseBasicParsing
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [System.IO.Compression.ZipFile]::OpenRead($zip)
+          try { $z.Entries | ForEach-Object { '{0}  {1}' -f $_.FullName, $_.Length } } finally { $z.Dispose() }
+          Expand-Archive -Path $zip -DestinationPath $work -Force
+          $exe = Join-Path $work 'autorunsc64.exe'
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          'Signature: {0} | {1}' -f $sig.Status, $sig.SignerCertificate.Subject
+          if ($sig.Status -ne 'Valid') { throw 'autorunsc64.exe is not validly signed' }
+          $out = Join-Path $work 'autoruns.csv'
+          $p = Start-Process -FilePath $exe -ArgumentList '-accepteula', '-a', '*', '-c', '-h', '-s', '-t', '*' -RedirectStandardOutput $out -NoNewWindow -Wait -PassThru
+          'ExitCode: {0}' -f $p.ExitCode
+          $bytes = [System.IO.File]::ReadAllBytes($out)
+          'Bytes: {0} | first 8: {1}' -f $bytes.Length, (($bytes | Select-Object -First 8) -join ',')
+          New-Item -ItemType Directory -Path fixtures-out -Force | Out-Null
+          Copy-Item -LiteralPath $out -Destination 'fixtures-out\autoruns-full.csv'
+
+          # Trimmed fixture: the real header plus up to 3 real rows per
+          # category and signer class, written back as UTF-16 LE with BOM like
+          # the original. Printed gzip+base64 so it can be read from the log.
+          $lines = @([System.IO.File]::ReadAllText($out, [System.Text.Encoding]::Unicode) -split "`r?`n")
+          $header = $lines[0]
+          'Rows (parsed): {0} | lines: {1}' -f @(ConvertFrom-Csv -InputObject @($lines | Where-Object { $_ })).Count, $lines.Count
+          $keep = New-Object System.Collections.Generic.List[string]
+          $keep.Add($header)
+          $seen = @{}
+          for ($i = 1; $i -lt $lines.Count; $i++) {
+            $l = $lines[$i]
+            if (-not $l) { continue }
+            $r = @(ConvertFrom-Csv -InputObject @($header, $l))[0]
+            $cls = if (-not $r.Entry) { 'location' } elseif ($r.Signer -like '(Verified) Microsoft*') { 'ms' } elseif ($r.Signer -like '(Verified)*') { 'verified' } else { 'other' }
+            $k = '{0}|{1}' -f $r.Category, $cls
+            if (-not $seen.ContainsKey($k)) { $seen[$k] = 0 }
+            if ($seen[$k] -lt 3) { $seen[$k]++; $keep.Add($l) }
+          }
+          $fixture = 'fixtures-out\autoruns.csv'
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) $fixture), (($keep -join "`r`n") + "`r`n"), [System.Text.Encoding]::Unicode)
+          $seen.Keys | Sort-Object | ForEach-Object { 'class {0} = {1}' -f $_, $seen[$_] }
+          $raw = [System.IO.File]::ReadAllBytes((Join-Path (Get-Location) $fixture))
+          $ms = New-Object System.IO.MemoryStream
+          $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+          $gz.Write($raw, 0, $raw.Length); $gz.Dispose()
+          $b64 = [Convert]::ToBase64String($ms.ToArray())
+          'FIXTURE-BEGIN bytes={0} sha256={1}' -f $raw.Length, (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
+          for ($o = 0; $o -lt $b64.Length; $o += 120) { 'B64:' + $b64.Substring($o, [Math]::Min(120, $b64.Length - $o)) }
+          'FIXTURE-END'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: fixtures-out
+
+  pro-tools:
+    name: Pro Tools pipeline on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: GetNewClosure scope semantics on Windows PowerShell 5.1
+        run: |
+          $script:Probe = 'outer'
+          function Test-Closure { $sb = { "closure reads script:Probe = [$script:Probe]" }.GetNewClosure(); & $sb }
+          Test-Closure
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Autoruns via the tool's own downloader, signature check, run, cards and tamper refusal
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $res = Resolve-ExternalToolRelease -Key 'autoruns'
+          'Resolved {0} ({1} MB, integrity: {2})' -f $res.DownloadUrl, $res.SizeMB, $res.Sha256Source
+          $inst = Install-ExternalTool -Key 'autoruns' -ConsentAccepted -Resolution $res -Progress $say
+          if (-not $inst.Success) { throw $inst.Message }
+          'Installed {0}' -f $inst.ExePath
+          'Signer: {0}' -f (Get-AuthenticodeSignature -LiteralPath $inst.ExePath).SignerCertificate.Subject
+          'Test-MicrosoftSigned: {0}' -f (Test-MicrosoftSigned -Path $inst.ExePath)
+          $cards = @(Invoke-ExternalDfirScan -Key 'autoruns' -ExePath $inst.ExePath -Progress $say)
+          'Cards: {0}' -f $cards.Count
+          foreach ($c in $cards) { '  [{0}/{1}] {2} | paths {3}' -f $c.Status, $c.Severity, $c.Title, @($c.Paths).Count }
+          if ($cards.Count -eq 0) { throw 'No cards were produced.' }
+          $base = Join-Path $env:ProgramData 'Win11SecurityOptimizer'
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root $base)
+          'Tools root secure: {0}' -f (Test-ToolsRootSecure)
+          if (-not (Test-TreeOwnership -Root $base)) { throw 'The next launch would quarantine the base.' }
+          $b = [System.IO.File]::ReadAllBytes($inst.ExePath)
+          $b[4096] = $b[4096] -bxor 0xFF
+          [System.IO.File]::WriteAllBytes($inst.ExePath, $b)
+          $refused = $false
+          try { Invoke-ExternalDfirScan -Key 'autoruns' -ExePath $inst.ExePath | Out-Null } catch { $refused = $true; 'Refused after one flipped byte: {0}' -f $_.Exception.Message }
+          if (-not $refused) { throw 'A tampered exe was NOT refused.' }
+
+      - name: Hayabusa and Chainsaw end to end (pinned download, run, cards)
+        env:
+          W11SO_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $failed = @()
+          foreach ($key in @('hayabusa', 'chainsaw')) {
+           try {
+            $res = Resolve-ExternalToolRelease -Key $key
+            'Resolved {0} {1} (integrity: {2})' -f $res.Name, $res.Version, $res.Sha256Source
+            if ($res.Sha256Source -ne 'pinned') { throw "$key did not resolve to the pinned, reviewed hash" }
+            $inst = Install-ExternalTool -Key $key -ConsentAccepted -Resolution $res -Progress $say
+            if (-not $inst.Success) { throw $inst.Message }
+            $t0 = Get-Date
+            $cards = @(Invoke-ExternalDfirScan -Key $key -ExePath $inst.ExePath -MinLevel 'low' -Progress $say)
+            $secs = [int]((Get-Date) - $t0).TotalSeconds
+            $summary = '{0}: {1} card(s) in {2}s: {3}' -f $key, $cards.Count, $secs, ((@($cards) | ForEach-Object { '[{0}] {1}' -f $_.Status, $_.Title }) -join ' | ')
+            $summary
+            Write-Output ('::notice title=' + $key + '::' + ($summary -replace '[\r\n]', ' '))
+            if ($cards.Count -eq 0) { throw "$key produced no cards" }
+            if (@($cards | Where-Object { $_.Id -match 'NONE$' }).Count -gt 0) {
+              $log = Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer\logs') -Filter 'session_*.log' | Sort-Object LastWriteTime | Select-Object -Last 1
+              $why = (@(Get-Content -LiteralPath $log.FullName | Where-Object { $_ -match 'wrote no results|finished \(exit' }) | Select-Object -Last 2) -join ' / '
+              throw "$key produced no output file: $why"
+            }
+           } catch {
+            $failed += $key
+            Write-Output ('::error title=' + $key + '::' + (($_.Exception.Message + ' @ ' + $_.InvocationInfo.PositionMessage) -replace '[\r\n]+', ' '))
+           }
+          }
+          if ($failed.Count -gt 0) { throw ('Failed: ' + ($failed -join ', ')) }
+          'Tools root still secure: {0}' -f (Test-ToolsRootSecure)
+          if (-not (Test-ToolsRootSecure)) { throw 'The tools root failed the ownership gate after the runs.' }
+
+      - name: Chainsaw pinned download and --level support
+        # Unauthenticated GitHub API calls from shared runner IPs are often rate
+        # limited (403), which says nothing about the tool, so this is advisory.
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $say = { param($m) [Console]::WriteLine('  ' + $m) }
+          $res = Resolve-ExternalToolRelease -Key 'chainsaw'
+          'Resolved {0} {1} (integrity: {2})' -f $res.Name, $res.Version, $res.Sha256Source
+          $inst = Install-ExternalTool -Key 'chainsaw' -ConsentAccepted -Resolution $res -Progress $say
+          if (-not $inst.Success) { throw $inst.Message }
+          $help = (& $inst.ExePath 'hunt' '--help' 2>&1 | Out-String)
+          'hunt --help lists --level: {0}' -f ($help -match '--level')
+
+  gui:
+    name: GUI self-test and Run Full Scan on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Autoruns through the tool's own verified downloader
+        # The self-test runs it through the real GUI path (picker, Start-ProScan,
+        # background job, OnDone, cards), which is where v1.2.0 lost results.
+        # Hayabusa and Chainsaw are left out so the self-test also drives the
+        # consent window and the download.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          [void](Initialize-SecureToolsRoot)
+          $res = Resolve-ExternalToolRelease -Key 'autoruns'
+          $inst = Install-ExternalTool -Key 'autoruns' -ConsentAccepted -Resolution $res
+          if (-not $inst.Success) { throw $inst.Message }
+          'Installed {0}' -f $inst.ExePath
+
+      - name: Self-test drives every action a user takes after a scan
+        timeout-minutes: 80
+        env:
+          W11SO_SELFTEST_PROTOOLS: autoruns,hayabusa,chainsaw
+          W11SO_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', '.\src\Optimizer.ps1', '-SelfTest' -NoNewWindow -Wait -PassThru -RedirectStandardOutput selftest.out.txt -RedirectStandardError selftest.err.txt
+          'Exit code: {0}' -f $p.ExitCode
+          '--- stdout ---'
+          Get-Content selftest.out.txt -Raw -ErrorAction SilentlyContinue
+          '--- stderr ---'
+          Get-Content selftest.err.txt -Raw -ErrorAction SilentlyContinue
+          $log = Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Win11SecurityOptimizer\logs') -Filter 'session_*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
+          $logLines = @()
+          if ($log) { $logLines = @(Get-Content -LiteralPath $log.FullName); '--- session log (last 60 lines) ---'; $logLines | Select-Object -Last 60 }
+          # Result lines go to stdout and to the session log; read both.
+          $lines = @(Get-Content selftest.out.txt -ErrorAction SilentlyContinue) + $logLines
+          # Surface the result lines as annotations so they are readable from the API.
+          foreach ($l in @($lines | Where-Object { $_ -match 'SELFTEST_' } | Select-Object -Unique)) { Write-Output ('::notice title=selftest::' + ($l -replace '[\r\n]', ' ')) }
+          if (@($lines -match 'SELFTEST_FAIL').Count -gt 0) { throw 'The self-test reported a failure.' }
+          if (@($lines -match 'SELFTEST_UIERROR').Count -gt 0) { throw 'A UI handler raised an unhandled error.' }
+          if (@($lines -match 'SELFTEST_FULLSCAN done=True').Count -eq 0) { throw 'Run Full Scan did not finish.' }
+          if (@($lines -match 'SELFTEST_UI ok').Count -eq 0) { throw 'The filter chips and Refresh were not exercised.' }
+          # The runner is elevated, so every step must run; none may be skipped.
+          if (@($lines -match "SELFTEST_STEP '.*' skipped").Count -gt 0) { throw 'A self-test step was skipped.' }
+          if (@($lines -match 'SELFTEST_STEPS ok').Count -eq 0) { throw 'Not every user action passed.' }
+          if (@($lines -match 'SELFTEST_OK').Count -eq 0) { throw 'The self-test did not pass.' }
+
+      - name: On failure, rerun with .NET exception tracing
+        if: failure()
+        timeout-minutes: 20
+        run: |
+          $cs = @'
+          using System; using System.IO; using System.Threading;
+          public static class W11Diag {
+              static string _path; static int _n; [ThreadStatic] static bool _busy;
+              static readonly object _lock = new object();
+              public static void Install(string path) {
+                  _path = path;
+                  AppDomain.CurrentDomain.UnhandledException += (s, e) => Log("UNHANDLED terminating=" + e.IsTerminating + " thread=" + Thread.CurrentThread.ManagedThreadId + " " + e.ExceptionObject);
+                  AppDomain.CurrentDomain.FirstChanceException += (s, e) => {
+                      if (_busy || Interlocked.Increment(ref _n) > 4000) return;
+                      _busy = true;
+                      try { Log("FIRST thread=" + Thread.CurrentThread.ManagedThreadId + " " + e.Exception.GetType().FullName + ": " + e.Exception.Message); } finally { _busy = false; }
+                  };
+                  AppDomain.CurrentDomain.ProcessExit += (s, e) => Log("PROCESS EXIT");
+                  System.Windows.Threading.Dispatcher.CurrentDispatcher.UnhandledException += (s, e) => Log("DISPATCHER UNHANDLED " + e.Exception);
+              }
+              public static void Log(string m) {
+                  try { lock (_lock) { File.AppendAllText(_path, DateTime.Now.ToString("HH:mm:ss.fff") + " " + m + Environment.NewLine); } } catch { }
+              }
+          }
+          '@
+          $diagLog = Join-Path $PWD 'diag.log'
+          $wrapper = @"
+          Add-Type -TypeDefinition @'
+          $cs
+          '@ -ReferencedAssemblies WindowsBase
+          [W11Diag]::Install('$diagLog')
+          [W11Diag]::Log('START')
+          & '$PWD\src\Optimizer.ps1' -SelfTest
+          [W11Diag]::Log('SCRIPT RETURNED')
+          "@
+          Set-Content -LiteralPath diag-wrapper.ps1 -Value $wrapper -Encoding UTF8
+          $p = Start-Process -FilePath powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', '.\diag-wrapper.ps1' -NoNewWindow -Wait -PassThru -RedirectStandardOutput diag.out.txt -RedirectStandardError diag.err.txt
+          'Exit code: {0}' -f $p.ExitCode
+          '--- stdout ---'; Get-Content diag.out.txt -Raw -ErrorAction SilentlyContinue
+          '--- stderr ---'; Get-Content diag.err.txt -Raw -ErrorAction SilentlyContinue
+          '--- unhandled, dispatcher and exit ---'
+          Select-String -LiteralPath $diagLog -Pattern 'UNHANDLED|PROCESS EXIT|SCRIPT RETURNED|START' | ForEach-Object { $_.Line }
+          '--- last 150 trace lines ---'
+          Get-Content -LiteralPath $diagLog -Tail 150
+
+  baseline:
+    name: Baseline save and compare on real data
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Snapshot, save, compare
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 2.0
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $snap = Get-SystemSnapshot
+          'Errors: [{0}]' -f (@($snap.Errors.Keys) -join ', ')
+          foreach ($k in @($snap.Collections.Keys)) { '  {0}: {1}' -f $k, $(if ($null -eq $snap.Collections[$k]) { 'ERROR' } else { @($snap.Collections[$k].Keys).Count }) }
+          $p = Save-Baseline -Snapshot $snap
+          'Saved {0} (owned by Administrators: {1})' -f $p, (Test-FolderOwnedBySystemOrAdmins $p)
+          'Chip: {0}' -f (Get-BaselineInfo).CreatedUtc.ToString('o')
+          $cards = @(Invoke-BaselineDrift)
+          foreach ($c in $cards) { '  [{0}/{1}] {2}' -f $c.Status, $c.Severity, $c.Title }
+          if (@($cards | Where-Object { $_.Status -eq 'Alert' }).Count -gt 0) { throw 'An immediate re-compare raised an Alert.' }
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))
+
+  hardening:
+    name: Hardening checks, fixes and rollback on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checks, apply twice, run the rollback script
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          foreach ($f in @(Invoke-ExtraSecurityCheck)) { '  [{0}] {1}: {2} (fixable: {3})' -f $f.Status, $f.Id, $f.Observed, $f.Fixable }
+          # Put WDigest in the unsafe state first so its fix and rollback both do real work.
+          New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -Name 'UseLogonCredential' -Value 1 -PropertyType DWord -Force | Out-Null
+          $ids = @('WDIGEST', 'MDNS', 'SMB-SIGN', 'NBTNS')
+          $before = @{}
+          foreach ($id in $ids) { $before[$id] = [bool](Test-SecurityFixApplied -Id $id) }
+          foreach ($id in $ids) {
+            $r = Invoke-SecurityFix -Id $id
+            '{0}: success {1}, verified {2} {3}' -f $id, $r.Success, $r.Verified, $r.Message
+            if (-not $r.Success -or -not $r.Verified) { throw "$id did not apply." }
+          }
+          $n = $script:Core.Rollback.Count
+          foreach ($id in $ids) { [void](Invoke-SecurityFix -Id $id) }
+          'Rollback entries after first apply: {0}, after second apply: {1}' -f $n, $script:Core.Rollback.Count
+          if ($script:Core.Rollback.Count -ne $n) { throw 'A second apply added rollback entries.' }
+          'Rollback script: {0} (owned by Administrators: {1})' -f $script:Core.RollbackFile, (Test-FolderOwnedBySystemOrAdmins $script:Core.RollbackFile)
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:Core.RollbackFile
+          'Rollback exit code: {0}' -f $LASTEXITCODE
+          foreach ($id in $ids) {
+            $after = [bool](Test-SecurityFixApplied -Id $id)
+            '{0}: before {1}, after rollback {2}' -f $id, $before[$id], $after
+            if ($after -ne $before[$id]) { throw "$id was not restored by the rollback script." }
+          }
+
+  sysmon:
+    name: Sysmon enable and rollback on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable through the Security fix, check, roll back
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $s = Get-SysmonState
+          'Before: state {0}, service {1}, feature {2}' -f $s.State, $s.Service, $s.Feature
+          $f = Get-SysmonSecurityFinding
+          'Card: [{0}] {1} (fixable {2})' -f $f.Status, $f.Observed, $f.Fixable
+          $r = Invoke-SecurityFix -Id 'SYSMON'
+          'Fix: success {0}, verified {1} {2}' -f $r.Success, $r.Verified, $r.Message
+          if (-not $r.Success -or -not $r.Verified) { throw 'Sysmon was not enabled.' }
+          $s = Get-SysmonState
+          'After: state {0}, service {1}, log max {2} MB' -f $s.State, $s.Service, $(if ($s.Log) { $s.Log.MaxBytes / 1MB } else { 'no log' })
+          (Get-SysmonDfirFinding).Title
+          'Tools kept while installed: {0}' -f (Test-SysmonToolInUse)
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))
+          Get-Content -LiteralPath $script:Core.RollbackFile | Select-String -Pattern 'sysmon|wevtutil|Sysmon' | ForEach-Object { '  rollback: ' + $_.Line.Trim() }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:Core.RollbackFile
+          'Rollback exit code: {0}' -f $LASTEXITCODE
+          $s = Get-SysmonState
+          'After rollback: state {0}, service {1}' -f $s.State, $s.Service
+          if ($s.Installed) { throw 'Sysmon is still installed after the rollback.' }
+
+  reporting:
+    name: Headless scan, report and evidence pack on a real runner
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan.ps1, HTML report, evidence pack
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $json = Join-Path $env:RUNNER_TEMP 'scan.json'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\src\Scan.ps1 -OutJson $json -Deep
+          $code = $LASTEXITCODE
+          'Scan.ps1 exit code: {0}' -f $code
+          if ($code -eq 3) { throw 'Scan.ps1 reported an error.' }
+          $j = Get-Content -LiteralPath $json -Raw | ConvertFrom-Json
+          'JSON: {0} security findings, {1} investigate cards, recorded exit code {2}, score {3}' -f @($j.Security).Count, @($j.Investigate).Count, $j.ExitCode, $j.Score.Score
+          if ([int]$j.ExitCode -ne $code) { throw 'The exit code does not match the JSON.' }
+          . .\src\SecurityCore.ps1
+          Initialize-Core | Out-Null
+          $html = New-HtmlReport -SecurityFindings @($j.Security) -DfirCards @($j.Investigate) -Tools @(Get-InstalledToolSummary) -MachineName $env:COMPUTERNAME
+          'Report: {0} characters, contains a script tag: {1}' -f $html.Length, ($html -match '<script')
+          $zip = Join-Path $env:RUNNER_TEMP 'evidence.zip'
+          $r = New-EvidencePack -Destination $zip -Findings @($j.Investigate) -Progress { param($m) [Console]::WriteLine('  ' + $m) }
+          'Evidence pack: {0} files, {1:N1} MB. Notes: {2}' -f $r.FileCount, ($r.SizeBytes / 1MB), (@($r.Notes) -join ' | ')
+          $out = Join-Path $env:RUNNER_TEMP 'ev'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out -Force
+          $m = Get-Content -LiteralPath (Join-Path $out 'manifest.json') -Raw | ConvertFrom-Json
+          foreach ($f in @($m.Files)) {
+            if ((Get-FileHash -LiteralPath (Join-Path $out $f.Path) -Algorithm SHA256).Hash -ne $f.Sha256) { throw ("Hash mismatch: {0}" -f $f.Path) }
+          }
+          'Manifest verified for {0} files: {1}' -f @($m.Files).Count, ((@($m.Files) | ForEach-Object { $_.Path }) -join ', ')
+          'Staging removed: {0}' -f (@(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData 'Win11SecurityOptimizer\evidence') -Directory -Filter 'stage_*' -ErrorAction SilentlyContinue).Count -eq 0)
+          'Base tree owned by Administrators/SYSTEM: {0}' -f (Test-TreeOwnership -Root (Join-Path $env:ProgramData 'Win11SecurityOptimizer'))

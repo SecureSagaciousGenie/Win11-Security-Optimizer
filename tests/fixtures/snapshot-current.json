@@ -1,0 +1,106 @@
+{
+  "SchemaVersion": 1,
+  "MachineName": "PC1",
+  "ToolVersion": "1.2.0",
+  "CreatedUtc": "2026-10-12T09:30:00.0000000Z",
+  "Elevated": true,
+  "Collections": {
+    "startup": {
+      "registryrun|hkcu|hkcu:\\software\\microsoft\\windows\\currentversion\\run|onedrive": {
+        "command": "c:\\users\\bob\\appdata\\roaming\\evil.exe /background",
+        "enabled": "True"
+      },
+      "registryrun|hkcu|hkcu:\\software\\microsoft\\windows\\currentversion\\run|updater": {
+        "command": "c:\\program files\\updater\\upd.exe",
+        "enabled": "True"
+      }
+    },
+    "services": {
+      "spooler": {
+        "path": "c:\\windows\\system32\\spoolsv.exe",
+        "startmode": "Auto",
+        "account": "localsystem"
+      },
+      "evilsvc": {
+        "path": "c:\\users\\public\\evil.exe",
+        "startmode": "Auto",
+        "account": "localsystem"
+      },
+      "goodsvc": {
+        "path": "\"c:\\program files\\good\\good.exe\" -k",
+        "startmode": "Manual",
+        "account": "localsystem"
+      }
+    },
+    "tasks": {
+      "\\contoso\\update": {
+        "execute": "c:\\program files\\contoso\\update.exe",
+        "arguments": "",
+        "principal": "system"
+      }
+    },
+    "localadmins": {
+      "s-1-5-21-1-2-3-500": {
+        "name": "PC1\\Administrator"
+      },
+      "s-1-5-21-1-2-3-1002": {
+        "name": "PC1\\eve"
+      }
+    },
+    "localusers": {
+      "s-1-5-21-1-2-3-1001": {
+        "name": "bob",
+        "enabled": "True"
+      },
+      "s-1-5-21-1-2-3-1002": {
+        "name": "eve",
+        "enabled": "True"
+      }
+    },
+    "defenderexclusions": {
+      "path|c:\\temp": {
+        "type": "path"
+      }
+    },
+    "listeningports": {
+      "tcp|0.0.0.0|135": {
+        "process": "svchost",
+        "path": "c:\\windows\\system32\\svchost.exe"
+      },
+      "tcp|0.0.0.0|4444": {
+        "process": "nc",
+        "path": "c:\\users\\public\\nc.exe"
+      },
+      "tcp|0.0.0.0|49700": {
+        "process": "svchost",
+        "path": "c:\\windows\\system32\\svchost.exe"
+      }
+    },
+    "hosts": {},
+    "asr": {
+      "d4f940ab-401b-4efc-aadc-ad5f3c50688a": {
+        "action": "2"
+      }
+    },
+    "firewall": {
+      "domain": {
+        "enabled": "True"
+      },
+      "private": {
+        "enabled": "True"
+      },
+      "public": {
+        "enabled": "False"
+      }
+    },
+    "wmi": {
+      "filter|scm event log filter": {
+        "detail": "select * from msft_scmeventlogevent"
+      },
+      "consumer|commandlineeventconsumer|updater": {
+        "detail": "powershell -enc aaaa"
+      }
+    }
+  },
+  "Errors": {}
+}

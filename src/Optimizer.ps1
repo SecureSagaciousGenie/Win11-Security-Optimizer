@@ -1,6 +1,8 @@
 <#
     Optimizer.ps1  --  Windows 11 Security Optimizer (WPF GUI)
     ----------------------------------------------------------
+    Author: Ahmad Shaukat
+
     Everything the user does happens in this window:
       Dashboard | Security | Debloat | Investigate (DFIR) | Startup | Restore & Logs
 
@@ -49,6 +51,8 @@ namespace W11SO {
     public string Description {get;set;}
     public string AppxName {get;set;}
     public string ReinstallNote {get;set;}
+    public string Impact {get;set;}
+    public string Risk {get;set;}
   }
   public class StartupRow : NotifyBase {
     private bool _en;
@@ -202,6 +206,15 @@ $script:Xaml = @'
           <Border Height="1" Background="{StaticResource Stroke}" Margin="0,14,0,6"/>
         </StackPanel>
         <StackPanel DockPanel.Dock="Bottom" Margin="18,10,18,16">
+          <Border x:Name="ChipBaseline" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipBaselineText" Text="Baseline: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
+          <Border x:Name="ChipSysmon" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipSysmonText" Text="Sysmon: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
+          <Border x:Name="ChipTools" Background="{StaticResource Panel}" CornerRadius="6" Padding="10,6" Margin="0,0,0,6">
+            <TextBlock x:Name="ChipToolsText" Text="Pro Tools: checking..." Foreground="{StaticResource Muted}" FontSize="11.5" TextWrapping="Wrap"/>
+          </Border>
           <Border x:Name="AdminBadge" Background="#2A1E12" CornerRadius="6" Padding="10,7" Margin="0,0,0,8">
             <TextBlock x:Name="AdminText" Text="Not elevated" Foreground="{StaticResource Warn}" FontSize="11.5" TextWrapping="Wrap"/>
           </Border>
@@ -321,7 +334,8 @@ $script:Xaml = @'
           <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnBloatScan" Style="{StaticResource Primary}" Content="Scan Installed Apps"/>
-            <Button x:Name="BtnBloatSelectRec" Style="{StaticResource Ghost}" Content="Select Recommended" Margin="10,0,0,0"/>
+            <Button x:Name="BtnBloatSelectRec" Style="{StaticResource Ghost}" Content="Preset: Recommended" Margin="10,0,0,0"/>
+            <Button x:Name="BtnBloatSelectMin" Style="{StaticResource Ghost}" Content="Preset: Minimal" Margin="10,0,0,0"/>
             <Button x:Name="BtnBloatClear" Style="{StaticResource Ghost}" Content="Clear" Margin="10,0,0,0"/>
           </StackPanel>
           <ListView x:Name="BloatList" Grid.Row="1">
@@ -332,7 +346,11 @@ $script:Xaml = @'
                 </GridViewColumn>
                 <GridViewColumn Header="App" Width="220" DisplayMemberBinding="{Binding Name}"/>
                 <GridViewColumn Header="Category" Width="110" DisplayMemberBinding="{Binding Category}"/>
-                <GridViewColumn Header="What it is / why remove it" Width="430" >
+                <GridViewColumn Header="Impact" Width="70" DisplayMemberBinding="{Binding Impact}"/>
+                <GridViewColumn Header="If removed" Width="230">
+                  <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Risk}" TextWrapping="Wrap"/></DataTemplate></GridViewColumn.CellTemplate>
+                </GridViewColumn>
+                <GridViewColumn Header="What it is / why remove it" Width="330" >
                   <GridViewColumn.CellTemplate><DataTemplate><TextBlock Text="{Binding Description}" TextWrapping="Wrap" Foreground="#8B949E"/></DataTemplate></GridViewColumn.CellTemplate>
                 </GridViewColumn>
               </GridView>
@@ -346,14 +364,28 @@ $script:Xaml = @'
 
         <!-- INVESTIGATE / DFIR -->
         <Grid x:Name="PageInvestigate" Visibility="Collapsed">
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,12">
             <Button x:Name="BtnDfirScan" Style="{StaticResource Primary}" Content="Investigate This PC"/>
             <Button x:Name="BtnDeepScan" Style="{StaticResource Ghost}" Content="+ Deep Scan (processes &amp; logs)" Margin="10,0,0,0"/>
-            <Button x:Name="BtnProScan" Style="{StaticResource Ghost}" Content="+ Pro Tools (Hayabusa / Chainsaw)" Margin="10,0,0,0"/>
+            <Button x:Name="BtnProScan" Style="{StaticResource Ghost}" Content="+ Pro Tools (Hayabusa / Chainsaw / Autoruns)" Margin="10,0,0,0"/>
             <TextBlock x:Name="DfirSummary" Text="Checks for hidden admins, backdoors, remote access, and tampering." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0"/>
           </StackPanel>
-          <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+          <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,12">
+            <Button x:Name="BtnBaselineSave" Style="{StaticResource Ghost}" Content="Save as baseline"/>
+            <Button x:Name="BtnBaselineCompare" Style="{StaticResource Ghost}" Content="Compare with baseline" Margin="10,0,0,0"/>
+            <TextBlock x:Name="BaselineStatus" Text="A baseline records how this PC looks now, so later checks show only what is new." Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="14,0,0,0" TextWrapping="Wrap"/>
+          </StackPanel>
+          <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="Show:" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <RadioButton x:Name="FilterAll" GroupName="CardFilter" Content="All" IsChecked="True" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterAlert" GroupName="CardFilter" Content="Alert" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterReview" GroupName="CardFilter" Content="Review" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterInfo" GroupName="CardFilter" Content="Info" Foreground="{StaticResource Text}" Margin="0,0,14,0" VerticalAlignment="Center"/>
+            <RadioButton x:Name="FilterClean" GroupName="CardFilter" Content="Clean" Foreground="{StaticResource Text}" VerticalAlignment="Center"/>
+          </StackPanel>
+          <TextBlock x:Name="DfirEmpty" Grid.Row="3" Text="Nothing here yet. Click &quot;Investigate This PC&quot; to check for signs of compromise." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="2,8,0,0"/>
+          <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
             <ItemsControl x:Name="DfirList">
               <ItemsControl.ItemTemplate>
                 <DataTemplate>
@@ -373,6 +405,17 @@ $script:Xaml = @'
                           <TextBlock Text="{Binding WhatToDo}" TextWrapping="Wrap" Margin="0,4,0,0" Foreground="{StaticResource Text}"/>
                         </StackPanel>
                       </Border>
+                      <Border Background="#10151D" CornerRadius="6" Padding="10" Margin="0,10,0,0" Visibility="{Binding EvidenceVis}">
+                        <StackPanel>
+                          <TextBlock Text="Evidence" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="12"/>
+                          <TextBox Text="{Binding Evidence, Mode=OneWay}" IsReadOnly="True" TextWrapping="Wrap" BorderThickness="0" Background="Transparent" Foreground="{StaticResource Muted}" FontFamily="Consolas" FontSize="12" Margin="0,4,0,0"/>
+                        </StackPanel>
+                      </Border>
+                      <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+                        <Button Style="{StaticResource Ghost}" Content="Scan with Defender" Tag="{Binding}" Visibility="{Binding ScanVis}" Margin="0,0,8,0"/>
+                        <Button Style="{StaticResource Ghost}" Content="Open location" Tag="{Binding}" Visibility="{Binding OpenVis}" Margin="0,0,8,0"/>
+                        <Button Style="{StaticResource Ghost}" Content="Copy details" Tag="{Binding}"/>
+                      </StackPanel>
                     </StackPanel>
                   </Border>
                 </DataTemplate>
@@ -419,6 +462,12 @@ $script:Xaml = @'
               <Button x:Name="BtnMakeRestore" Style="{StaticResource Ghost}" Content="Create Restore Point Now" Margin="10,0,0,0"/>
               <Button x:Name="BtnRemoveTools" Style="{StaticResource Ghost}" Content="Remove Downloaded Tools" Margin="10,0,0,0"/>
             </StackPanel>
+            <TextBlock Text="Share and preserve" FontSize="15" FontWeight="SemiBold" Margin="0,18,0,0"/>
+            <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,6,0,0" Text="The report is one HTML file you can print or send to someone helping you. The evidence pack zips event logs and system details for an investigator. Both contain user names and file paths."/>
+            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+              <Button x:Name="BtnSaveReport" Style="{StaticResource Ghost}" Content="Save HTML Report"/>
+              <Button x:Name="BtnEvidencePack" Style="{StaticResource Ghost}" Content="Create Evidence Pack" Margin="10,0,0,0"/>
+            </StackPanel>
           </StackPanel>
           <Border Grid.Row="1" Background="#0B0E14" BorderBrush="{StaticResource Stroke}" BorderThickness="1" CornerRadius="8">
             <ScrollViewer x:Name="LogScroller" VerticalScrollBarVisibility="Auto" Padding="12">
@@ -457,13 +506,18 @@ function New-OptimizerWindow {
         'PageDashboard','PageSecurity','PageDebloat','PageInvestigate','PageStartup','PageRestore',
         'CardScore','CardGrade','CardIssues','CardDfir','CardBloat','BtnFullScan',
         'BtnSecScan','BtnSecFixSafe','ChkHighRisk','SecList',
-        'BtnBloatScan','BtnBloatSelectRec','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
+        'BtnBloatScan','BtnBloatSelectRec','BtnBloatSelectMin','BtnBloatClear','BloatList','BloatStatus','BtnBloatRemove',
         'BtnDfirScan','BtnDeepScan','BtnProScan','DfirSummary','DfirList',
+        'FilterAll','FilterAlert','FilterReview','FilterInfo','FilterClean','DfirEmpty','BtnSaveReport','BtnEvidencePack',
+        'BtnBaselineSave','BtnBaselineCompare','BaselineStatus','ChipBaseline','ChipBaselineText','ChipTools','ChipToolsText','ChipSysmon','ChipSysmonText',
         'BtnStartupScan','StartupListView',
         'BtnOpenData','BtnOpenRollback','BtnMakeRestore','BtnRemoveTools','LogView','LogScroller',
         'StatusText','Busy'
     )
-    foreach ($n in $names) { $ui[$n] = $win.FindName($n) }
+    foreach ($n in $names) {
+        $ui[$n] = $win.FindName($n)
+        if ($null -eq $ui[$n]) { throw ("The main window is missing the element {0}." -f $n) }
+    }
     return @{ Window=$win; UI=$ui }
 }
 
@@ -486,10 +540,30 @@ function Invoke-Background {
         [Parameter(Mandatory)][scriptblock]$Work,
         [Parameter(Mandatory)]$OnDone,
         [string]$Status = 'Working...',
-        [hashtable]$Vars = @{}
+        [hashtable]$Vars = @{},
+        $Control = $null,
+        # Runs after this job ends and the busy flag is cleared, so it can start
+        # the next job of a chain. Gets the error text, or '' on success.
+        [scriptblock]$Next = $null
     )
+    # One background job at a time. A second click while busy is ignored with a
+    # status message instead of starting overlapping scans.
+    if ($script:State.Busy) {
+        $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'
+        return
+    }
+    $script:State.Busy = $true
+    if ($Control) { try { $Control.IsEnabled = $false } catch { Write-CoreLog -Message 'Could not disable the control.' -Level DEBUG } }
     $script:UIRef.UI.StatusText.Text = $Status
     $script:UIRef.UI.Busy.Visibility = 'Visible'
+    # The timer handler below is a GetNewClosure() block. Inside it $script:
+    # points at the closure's own module, not this script, so everything it
+    # needs is captured as locals here.
+    $ui = $script:UIRef.UI
+    $state = $script:State
+    # Script functions are not visible inside the closure either; keep a
+    # reference so a failed job reaches the session log.
+    $writeLog = ${function:Write-CoreLog}
 
     # Thread-safe channel so the background work can push live status to the UI.
     $shared = [hashtable]::Synchronized(@{ Status = $Status })
@@ -499,7 +573,11 @@ function Invoke-Background {
     $rs.ThreadOptions  = 'ReuseThread'
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('CorePath', $script:CorePath)
-    $rs.SessionStateProxy.SetVariable('WorkBody', $Work)
+    # A scriptblock stays bound to the runspace that created it. Invoked on the
+    # background thread it would run against this (UI) runspace while the UI
+    # thread uses it too, which corrupts state and can kill the process. Pass
+    # the source text instead and rebuild it inside the background runspace.
+    $rs.SessionStateProxy.SetVariable('WorkText', $Work.ToString())
     $rs.SessionStateProxy.SetVariable('SharedState', $shared)
     foreach ($k in $Vars.Keys) { $rs.SessionStateProxy.SetVariable($k, $Vars[$k]) }
 
@@ -507,11 +585,11 @@ function Invoke-Background {
     $ps.Runspace = $rs
     [void]$ps.AddScript({
         . $CorePath
-        Initialize-Core | Out-Null
-        # Progress helper available to $WorkBody as $Report.
+        Initialize-Core -ReadOnly | Out-Null
+        # Progress helper available to the work as $Report.
         $Report = { param($m) try { $SharedState.Status = $m } catch { } }
         Set-Variable -Name Report -Value $Report -Scope Global
-        & $WorkBody
+        & ([scriptblock]::Create($WorkText))
     })
 
     $handle = $ps.BeginInvoke()
@@ -521,19 +599,35 @@ function Invoke-Background {
     $timer.Interval = [TimeSpan]::FromMilliseconds(150)
     $timer.Add_Tick({
         # live progress
-        try { if ($shared.Status) { $script:UIRef.UI.StatusText.Text = $shared.Status } } catch { }
+        try { if ($shared.Status) { $ui.StatusText.Text = $shared.Status } } catch { }
         if ($handle.IsCompleted) {
             $timer.Stop()
             $result = $null; $err = $null
             try { $result = $ps.EndInvoke($handle) } catch { $err = $_ }
             try { $ps.Dispose() } catch { }
             try { $rs.Close(); $rs.Dispose() } catch { }
-            $script:UIRef.UI.Busy.Visibility = 'Collapsed'
-            $script:UIRef.UI.StatusText.Text = 'Ready.'
-            if ($err) {
-                $script:UIRef.UI.StatusText.Text = "Error: $($err.Exception.Message)"
-            } else {
-                & $OnDone $result
+            $failure = ''
+            try {
+                $ui.Busy.Visibility = 'Collapsed'
+                $ui.StatusText.Text = 'Ready.'
+                if ($err) {
+                    $failure = [string]$err.Exception.Message
+                    $ui.StatusText.Text = "Error: $failure"
+                } else {
+                    & $OnDone $result
+                }
+            } catch {
+                $failure = [string]$_.Exception.Message
+                try { $ui.StatusText.Text = "Error: $failure" } catch { }
+            } finally {
+                $state.Busy = $false
+                if ($Control) { try { $Control.IsEnabled = $true } catch { } }
+            }
+            if ($failure) {
+                try { & $writeLog -Message ("Background task '{0}' failed: {1}" -f $Status, $failure) -Level ERROR } catch { $ui.StatusText.Text = "Error: $failure (not logged)" }
+            }
+            if ($Next) {
+                try { & $Next $failure } catch { try { $ui.StatusText.Text = "Error: $($_.Exception.Message)" } catch { } }
             }
         }
     }.GetNewClosure())
@@ -544,6 +638,54 @@ function Invoke-Background {
 function Set-Busy { param([string]$Text='Working...',[bool]$On=$true)
     $script:UIRef.UI.StatusText.Text = if($On){$Text}else{'Ready.'}
     $script:UIRef.UI.Busy.Visibility = if($On){'Visible'}else{'Collapsed'}
+}
+
+function Test-SelfTestMode {
+    $st = Get-Variable -Name State -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    return [bool]($st -and $st.SelfTest)
+}
+
+function Show-AppMessage {
+    <# Every message box goes through here. Under -SelfTest nothing modal opens:
+       the box is logged and the scripted reply ($script:SelfTestReply) is
+       returned. Without a scripted reply the answer is No, so a test never
+       confirms a change it did not ask for. #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [string]$Title = '',
+        [string]$Buttons = 'OK',
+        [string]$Icon = 'None',
+        [string]$Default = ''
+    )
+    if (Test-SelfTestMode) {
+        $reply = 'OK'
+        if ($Buttons -ne 'OK') { $reply = if ($script:SelfTestReply) { [string]$script:SelfTestReply } else { 'No' } }
+        [void]$script:SelfTestDialogs.Add([pscustomobject]@{ Icon = $Icon; Title = $Title; Text = $Text; Reply = $reply })
+        Write-SelfTestLine ("SELFTEST_DIALOG icon={0} title={1} reply={2} text={3}" -f $Icon, $Title, $reply, ($Text -replace '\r?\n', ' '))
+        return [System.Windows.MessageBoxResult]$reply
+    }
+    if ($Default) { return [System.Windows.MessageBox]::Show($Text, $Title, $Buttons, $Icon, $Default) }
+    return [System.Windows.MessageBox]::Show($Text, $Title, $Buttons, $Icon)
+}
+
+function Select-SaveFilePath {
+    <# Save dialog; $null when cancelled. Under -SelfTest it opens nothing and
+       returns a path in a temp folder. #>
+    param([Parameter(Mandatory)][string]$FileName, [Parameter(Mandatory)][string]$Filter)
+    if (Test-SelfTestMode) {
+        $dir = Join-Path ([System.IO.Path]::GetTempPath()) 'W11SO-SelfTest'
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $path = Join-Path $dir $FileName
+        $script:SelfTestLastSave = $path
+        Write-SelfTestLine ("SELFTEST_SAVEAS {0}" -f $path)
+        return $path
+    }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.InitialDirectory = [Environment]::GetFolderPath('MyDocuments')
+    $dlg.FileName = $FileName
+    $dlg.Filter = $Filter
+    if ($dlg.ShowDialog($script:UIRef.Window)) { return $dlg.FileName }
+    return $null
 }
 
 # ============================================================================
@@ -595,6 +737,12 @@ function ConvertTo-DfirCard {
     $f | Add-Member -NotePropertyName AccentBrush -NotePropertyValue (Get-Brush $hex) -Force
     $f | Add-Member -NotePropertyName WhyVis -NotePropertyValue $(if ($f.Why) { 'Visible' } else { 'Collapsed' }) -Force
     $f | Add-Member -NotePropertyName DoVis  -NotePropertyValue $(if ($f.WhatToDo) { 'Visible' } else { 'Collapsed' }) -Force
+    $hasEvidence = ($f.PSObject.Properties.Name -contains 'Evidence') -and [string]$f.Evidence
+    $f | Add-Member -NotePropertyName EvidenceVis -NotePropertyValue $(if ($hasEvidence) { 'Visible' } else { 'Collapsed' }) -Force
+    $paths = @()
+    if ($f.PSObject.Properties.Name -contains 'Paths') { $paths = @($f.Paths | Where-Object { $_ }) }
+    $f | Add-Member -NotePropertyName ScanVis -NotePropertyValue $(if ($paths.Count -gt 0 -and $script:State.IsAdmin) { 'Visible' } else { 'Collapsed' }) -Force
+    $f | Add-Member -NotePropertyName OpenVis -NotePropertyValue $(if ($paths.Count -gt 0) { 'Visible' } else { 'Collapsed' }) -Force
     return $f
 }
 
@@ -608,7 +756,8 @@ function Update-LogView {
 #  ACTIONS: SECURITY
 # ============================================================================
 function Start-SecurityScan {
-    Invoke-Background -Status 'Scanning security settings...' -Work {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Scanning security settings...' -Next $Next -Work {
         $f = Invoke-SecurityScan
         [pscustomobject]@{ Findings=$f; Score=(Get-SecurityScore $f) }
     } -OnDone {
@@ -629,13 +778,14 @@ function Invoke-SecFix {
     $finding = $script:State.Security | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
     if (-not $finding) { return }
     $msg = "Apply this fix?`n`n$($finding.Name)`n`nCurrent: $($finding.Observed)`nTarget: $($finding.Expected)"
+    if (($finding.PSObject.Properties.Name -contains 'ConfirmText') -and $finding.ConfirmText) { $msg += "`n`n$($finding.ConfirmText)" }
     if ($finding.RiskTier -eq 'HighRisk') { $msg += "`n`nWARNING: High-impact change. Make sure you understand the effect." }
     $msg += "`n`nA System Restore point is created before the first change, and this is reversible via the rollback script."
-    $r = [System.Windows.MessageBox]::Show($msg, 'Confirm fix', 'YesNo', $(if($finding.RiskTier -eq 'HighRisk'){'Warning'}else{'Question'}))
+    $r = (Show-AppMessage -Text ($msg) -Title ('Confirm fix') -Buttons ('YesNo') -Icon ($(if($finding.RiskTier -eq 'HighRisk'){'Warning'}else{'Question'})))
     if ($r -ne 'Yes') { return }
 
     if (-not (Test-IsAdmin)) {
-        [System.Windows.MessageBox]::Show("This change needs administrator rights. Please relaunch via Start.bat (it will prompt for elevation).", 'Administrator required', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("This change needs administrator rights. Please relaunch via Start.bat (it will prompt for elevation).") -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return
     }
     Set-Busy -Text "Applying $($finding.Name)..."
@@ -643,24 +793,27 @@ function Invoke-SecFix {
     Set-Busy -On $false
     if ($res.Success) {
         $script:UIRef.UI.StatusText.Text = "Applied: $($finding.Name)."
+        try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
         Start-SecurityScan
     } else {
-        [System.Windows.MessageBox]::Show("Could not apply fix:`n$($res.Message)", 'Fix failed', 'OK', 'Error') | Out-Null
+        (Show-AppMessage -Text ("Could not apply fix:`n$($res.Message)") -Title ('Fix failed') -Buttons ('OK') -Icon ('Error')) | Out-Null
     }
 }
 
 function Invoke-SecApplyAllSafe {
     if (-not (Test-IsAdmin)) {
-        [System.Windows.MessageBox]::Show("Applying fixes needs administrator rights. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("Applying fixes needs administrator rights. Relaunch via Start.bat.") -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return
     }
     $incHigh = [bool]$script:UIRef.UI.ChkHighRisk.IsChecked
+    # Opt-in features (IndividualOnly) are never part of a bulk apply.
     $targets = $script:State.Security | Where-Object {
         $_.Fixable -and $_.Status -ne 'Pass' -and $_.RiskTier -ne 'AuditOnly' -and
-        ($_.RiskTier -ne 'HighRisk' -or $incHigh)
+        ($_.RiskTier -ne 'HighRisk' -or $incHigh) -and
+        -not (($_.PSObject.Properties.Name -contains 'IndividualOnly') -and $_.IndividualOnly)
     }
     if (-not $targets -or @($targets).Count -eq 0) {
-        [System.Windows.MessageBox]::Show('Nothing to apply with the current options.', 'Nothing to do', 'OK', 'Information') | Out-Null
+        (Show-AppMessage -Text ('Nothing to apply with the current options.') -Title ('Nothing to do') -Buttons ('OK') -Icon ('Information')) | Out-Null
         return
     }
     # Group by tier so the user sees exactly what is Safe vs the more impactful
@@ -672,7 +825,7 @@ function Invoke-SecApplyAllSafe {
     if ($safe.Count)     { [void]$sb.AppendLine("SAFE (low-risk):");          $safe     | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
     if ($elevated.Count) { [void]$sb.AppendLine("");[void]$sb.AppendLine("ELEVATED (standard hardening, may affect some setups):"); $elevated | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
     if ($high.Count)     { [void]$sb.AppendLine("");[void]$sb.AppendLine("HIGH-RISK:"); $high | ForEach-Object { [void]$sb.AppendLine("   - $($_.Name)") } }
-    $r = [System.Windows.MessageBox]::Show(("Apply these {0} fix(es)? They are grouped by risk tier below.`n`n{1}`nA System Restore point is created first; every change is reversible via the rollback script." -f @($targets).Count, $sb.ToString()), 'Confirm batch', 'YesNo', 'Question')
+    $r = (Show-AppMessage -Text (("Apply these {0} fix(es)? They are grouped by risk tier below.`n`n{1}`nA System Restore point is created first; every change is reversible via the rollback script." -f @($targets).Count, $sb.ToString())) -Title ('Confirm batch') -Buttons ('YesNo') -Icon ('Question'))
     if ($r -ne 'Yes') { return }
 
     # State-changing actions run SYNCHRONOUSLY on the main thread, because the
@@ -710,7 +863,8 @@ function Find-VisualChildren {
 #  ACTIONS: DEBLOAT
 # ============================================================================
 function Start-BloatScan {
-    Invoke-Background -Status 'Scanning installed apps...' -Work { Get-DebloatInventory } -OnDone {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Scanning installed apps...' -Next $Next -Work { Get-DebloatInventory } -OnDone {
         param($inv)
         $rows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         foreach ($a in @($inv)) {
@@ -718,6 +872,7 @@ function Start-BloatScan {
             $row.Selected=$false; $row.Name=$a.Name; $row.Publisher=$a.Publisher; $row.Category=$a.Category
             $row.Version=$a.Version; $row.Description=$a.Description; $row.AppxName=$a.PackageFullName
             $row.ReinstallNote=$a.ReinstallNote
+            $row.Impact=[string]$a.Impact; $row.Risk=[string]$a.Risk
             # keep the wildcard for removal + a 'Recommended' hint
             $row | Add-Member -NotePropertyName Wildcard -NotePropertyValue (Get-DebloatWildcard $a.Key) -Force
             $row | Add-Member -NotePropertyName Recommended -NotePropertyValue $a.Recommended -Force
@@ -740,15 +895,16 @@ function Invoke-BloatRemove {
     if (-not $script:State.Bloat) { return }
     $selected = @($script:State.Bloat | Where-Object { $_.Selected })
     if ($selected.Count -eq 0) {
-        [System.Windows.MessageBox]::Show('No apps are ticked. Tick the apps you want to remove first.', 'Nothing selected', 'OK', 'Information') | Out-Null
+        (Show-AppMessage -Text ('No apps are ticked. Tick the apps you want to remove first.') -Title ('Nothing selected') -Buttons ('OK') -Icon ('Information')) | Out-Null
         return
     }
     if (-not (Test-IsAdmin)) {
-        [System.Windows.MessageBox]::Show("Removing apps needs administrator rights. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("Removing apps needs administrator rights. Relaunch via Start.bat.") -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return
     }
-    $list = ($selected | ForEach-Object { " - $($_.Name)" }) -join "`n"
-    $r = [System.Windows.MessageBox]::Show("Remove these $($selected.Count) app(s)?`n`n$list`n`nAll are reinstallable from the Microsoft Store. A restore point is created first and the removal is logged.", 'Confirm removal', 'YesNo', 'Question')
+    # One line per app keeps the buttons on screen even with every app ticked.
+    $list = ($selected | ForEach-Object { " - {0} ({1} impact). {2}" -f $_.Name, $_.Impact, $_.ReinstallNote }) -join "`n"
+    $r = (Show-AppMessage -Text ("Remove these $($selected.Count) app(s)?`n`n$list`n`nA restore point is created first and every removal is logged. See docs\REINSTALL.md for more ways to reinstall.") -Title ('Confirm removal') -Buttons ('YesNo') -Icon ('Question') -Default ('No'))
     if ($r -ne 'Yes') { return }
 
     Set-Busy -Text 'Removing selected apps...'
@@ -761,7 +917,7 @@ function Invoke-BloatRemove {
     Set-Busy -On $false
     $summary = "Removed $ok of $($selected.Count) app(s)."
     if ($fail.Count -gt 0) { $summary += "`n`nNot removed:`n" + ($fail -join "`n") }
-    [System.Windows.MessageBox]::Show($summary, 'Debloat complete', 'OK', 'Information') | Out-Null
+    (Show-AppMessage -Text ($summary) -Title ('Debloat complete') -Buttons ('OK') -Icon ('Information')) | Out-Null
     Start-BloatScan
 }
 
@@ -769,23 +925,20 @@ function Invoke-BloatRemove {
 #  ACTIONS: DFIR
 # ============================================================================
 function Start-DfirScan {
-    param([switch]$Deep)
+    param([switch]$Deep, [scriptblock]$Next = $null)
     $statusMsg = if ($Deep) { 'Running deep scan (processes + event logs)...' } else { 'Investigating this PC...' }
-    Invoke-Background -Status $statusMsg -Vars @{ DeepFlag = [bool]$Deep } -Work {
-        $f = Invoke-DfirTriage
+    Invoke-Background -Status $statusMsg -Next $Next -Vars @{ DeepFlag = [bool]$Deep } -Work {
+        $f = @(Invoke-DfirTriage)
+        $f += @(Get-SysmonDfirFinding)
         if ($DeepFlag) {
             foreach ($x in @(Invoke-DeepScan)) { $f += $x }
         }
         [pscustomobject]@{ Findings=$f; Summary=(Get-DfirSummary $f) }
     } -OnDone {
         param($res)
-        $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
-        # Alerts/Reviews first, then clean
-        $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $cards | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
-        $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
+        $res = @($res) | Select-Object -First 1
+        Set-DfirList -Cards @($res.Findings | ForEach-Object { ConvertTo-DfirCard $_ })
         $s = $res.Summary
-        $script:UIRef.UI.CardDfir.Text = "$($s.Alerts + $s.Reviews)"
         $script:UIRef.UI.DfirSummary.Text = "$($s.Alerts) alert(s), $($s.Reviews) to review, $($s.Clean) clean."
         $script:UIRef.UI.StatusText.Text = 'Investigation complete.'
     }
@@ -834,9 +987,9 @@ $script:ConsentXaml = @'
           <StackPanel>
             <TextBlock Text="Please understand before continuing:" Foreground="#D29922" FontWeight="SemiBold" Margin="0,0,0,6"/>
             <TextBlock TextWrapping="Wrap" Foreground="#C9D1D9" LineHeight="19">
-              - This downloads a separate program from the internet (the official GitHub release above) and runs it on your PC to read your Windows event logs.<LineBreak/>
+              - This downloads a separate program from its official source (shown above) and runs it on your PC. It only reads: event logs or startup locations.<LineBreak/>
               - It is licensed under its own license (shown above), NOT the optimizer's MIT license. The optimizer only runs it; it does not include or redistribute it.<LineBreak/>
-              - It runs read-only against your logs. The optimizer refuses to install unless the download's SHA-256 matches a trusted hash (see "Integrity" above), but you are trusting the upstream project itself.<LineBreak/>
+              - It runs read-only. The optimizer refuses to install unless the download passes the check under "Integrity" above, and re-checks the program before every run, but you are trusting the upstream project itself.<LineBreak/>
               - Some antivirus/EDR products flag security tools like these (they are "hacktools" by category). That does not necessarily mean they are malicious, but you should be comfortable with that.
             </TextBlock>
           </StackPanel>
@@ -867,7 +1020,7 @@ function Show-ConsentDialog {
     try { $res = Resolve-ExternalToolRelease -Key $Key } catch { $err = $_.Exception.Message }
     Set-Busy -On $false
     if (-not $res) {
-        [System.Windows.MessageBox]::Show("Could not reach the release server for $($tool.Name).`n`n$err`n`nCheck your internet connection and try again.", 'Could not resolve download', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("Could not reach the release server for $($tool.Name).`n`n$err`n`nCheck your internet connection and try again.") -Title ('Could not resolve download') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return $null
     }
 
@@ -891,8 +1044,13 @@ function Show-ConsentDialog {
     $src = ''; try { $src = [string]$res.Sha256Source } catch { }
     $hasHash = $false; try { $hasHash = [bool]$res.Sha256Expected } catch { }
     $cInteg = & $g 'CIntegrity'
-    if (-not $hasHash -or $src -eq 'none') {
-        [System.Windows.MessageBox]::Show("$($tool.Name) cannot be installed: no trusted SHA-256 is available for this download (the project has no pinned hash for it and GitHub advertised no digest).`n`nBecause this tool runs with administrator rights, it will not be downloaded from an unverifiable source.", 'Download refused (no verifiable hash)', 'OK', 'Warning') | Out-Null
+    if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
+        (& $g 'CVersion').Text = 'Latest from Sysinternals'
+        (& $g 'CSize').Text = $(if ($null -ne $res.SizeMB) { "{0} MB  ({1})" -f $res.SizeMB, $res.AssetName } else { "Unknown size  ({0})" -f $res.AssetName })
+        $cInteg.Text = 'MS publishes no hash for this file. After download the program must carry a valid MS signature (Authenticode); otherwise it is deleted and never run. Its hash is recorded and checked before every run.'
+        try { $cInteg.Foreground = '#3FB950' } catch { }
+    } elseif (-not $hasHash -or $src -eq 'none') {
+        (Show-AppMessage -Text ("$($tool.Name) cannot be installed: no trusted SHA-256 is available for this download (the project has no pinned hash for it and GitHub advertised no digest).`n`nBecause this tool runs with administrator rights, it will not be downloaded from an unverifiable source.") -Title ('Download refused (no verifiable hash)') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return $null
     } elseif ($src -eq 'pinned') {
         $cInteg.Text = ("SHA-256 pinned & reviewed by this project for {0} (verified before running)" -f $res.Version)
@@ -903,23 +1061,265 @@ function Show-ConsentDialog {
     }
 
     $accept = & $g 'CAccept'; $ok = & $g 'COk'; $cancel = & $g 'CCancel'
-    $accept.Add_Checked({   $ok.IsEnabled = $true })
-    $accept.Add_Unchecked({ $ok.IsEnabled = $false })
-    $script:_consentResult = $false
-    $ok.Add_Click({ $script:_consentResult = $true; $dlg.Close() }.GetNewClosure())
-    $cancel.Add_Click({ $script:_consentResult = $false; $dlg.Close() }.GetNewClosure())
+    foreach ($el in @($accept, $ok, $cancel, $cInteg)) { if ($null -eq $el) { throw 'The consent window is missing a control.' } }
+    $accept.Add_Checked({   $ok.IsEnabled = $true }.GetNewClosure())
+    $accept.Add_Unchecked({ $ok.IsEnabled = $false }.GetNewClosure())
+    $cancel.IsCancel = $true
+    # A captured hashtable carries the answer out of the closures; $script: inside
+    # a GetNewClosure() block would write to the closure's own module instead.
+    $answer = @{ Accepted = $false }
+    $ok.Add_Click({ $answer.Accepted = $true; $dlg.Close() }.GetNewClosure())
+    $cancel.Add_Click({ $answer.Accepted = $false; $dlg.Close() }.GetNewClosure())
+    if ((Test-SelfTestMode) -and $script:SelfTestAutoConsent) {
+        # The self-test ticks the box and clicks the download button, as a user would.
+        Write-SelfTestLine ("SELFTEST_CONSENT {0} {1}: {2}" -f $res.Name, $res.Version, $cInteg.Text)
+        $dlg.Add_ContentRendered({ $accept.IsChecked = $true; $ok.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }.GetNewClosure())
+    }
 
     [void]$dlg.ShowDialog()
-    if ($script:_consentResult) { return $res }
+    if ($answer.Accepted) { return $res }
     return $null
 }
 
+function Update-StatusChip {
+    <# Sidebar chips: baseline date and installed Pro Tools. Read-only. #>
+    $info = Get-BaselineInfo
+    if ($info) {
+        $script:UIRef.UI.ChipBaselineText.Text = ("Baseline: {0}" -f $info.CreatedUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
+    } else {
+        $script:UIRef.UI.ChipBaselineText.Text = 'Baseline: none saved'
+    }
+    $installed = @()
+    foreach ($t in @(Get-ExternalToolRegistry)) {
+        $exe = $null
+        try { $exe = Test-ExternalToolInstalled -Key $t.Key } catch { $exe = $null }
+        if ($exe) { $installed += $t.Name }
+    }
+    $script:UIRef.UI.ChipToolsText.Text = $(if ($installed.Count -gt 0) { 'Pro Tools: ' + ($installed -join ', ') } else { 'Pro Tools: none installed' })
+    $sysmonText = 'Sysmon: off'
+    $svc = Get-SysmonServiceName
+    if ($svc) {
+        $log = Get-SysmonLogInfo
+        $sysmonText = if ($log -and $null -ne $log.DaysOfEvidence) { "Sysmon: on, $($log.DaysOfEvidence) day(s) of evidence" } else { 'Sysmon: on' }
+    }
+    $script:UIRef.UI.ChipSysmonText.Text = $sysmonText
+}
+
+function Get-SessionAutorunsCsv {
+    <# The newest Autoruns CSV written during this session, or $null. #>
+    $dir = Join-Path (Get-ExternalToolsRoot) 'autoruns\output'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    $f = @(Get-ChildItem -LiteralPath $dir -Filter 'autoruns_*.csv' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $script:Core.StartTime } | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+    if ($f) { return $f.FullName }
+    return $null
+}
+
+function Add-DfirCard {
+    <# Merges cards into the Investigate list, replacing earlier cards whose Id
+       starts with $ReplacePrefix, then sorts by status and severity rank. #>
+    param([AllowEmptyCollection()][object[]]$Cards, [string]$ReplacePrefix)
+    $existing = @($script:State.Cards)
+    if ($ReplacePrefix) { $existing = @($existing | Where-Object { -not ([string]$_.Id).StartsWith($ReplacePrefix, [System.StringComparison]::OrdinalIgnoreCase) }) }
+    $new = @(@($Cards) | Where-Object { $_ } | ForEach-Object { ConvertTo-DfirCard $_ })
+    Set-DfirList -Cards (@($existing) + @($new))
+}
+
+function Set-DfirList {
+    <# Keeps every card in $script:State.Cards and shows the ones that match the
+       chosen filter chip, sorted by status then severity rank. #>
+    param([AllowEmptyCollection()][object[]]$Cards)
+    $script:State.Cards = @(Sort-DfirFinding -Findings @($Cards))
+    $all = @($script:State.Cards)
+    $script:UIRef.UI.CardDfir.Text = "$(@($all | Where-Object { $_.Status -eq 'Alert' -or $_.Status -eq 'Review' }).Count)"
+    Update-DfirFilter
+}
+
+function Update-DfirFilter {
+    $filter = [string]$script:State.CardFilter
+    $all = @($script:State.Cards)
+    # Wrapped in @(): an if statement unrolls its output, so one match would be a
+    # scalar and none would be $null, and .Count below throws under StrictMode.
+    $shown = @(if ($filter -and $filter -ne 'All') { $all | Where-Object { $_.Status -eq $filter } } else { $all })
+    $script:UIRef.UI.DfirList.ItemsSource = @($shown)
+    if ($shown.Count -gt 0) {
+        $script:UIRef.UI.DfirEmpty.Visibility = 'Collapsed'
+    } else {
+        $script:UIRef.UI.DfirEmpty.Text = if ($all.Count -eq 0) { 'Nothing here yet. Click "Investigate This PC" to check for signs of compromise.' } else { ('No cards with the status "{0}". Choose All to see every card.' -f $filter) }
+        $script:UIRef.UI.DfirEmpty.Visibility = 'Visible'
+    }
+}
+
+function Format-CardText {
+    param($Card)
+    $lines = @($Card.Title, ('Severity: {0} | Status: {1}' -f $Card.Severity, $Card.Status), '', [string]$Card.What)
+    if ($Card.Why) { $lines += @('', 'Why it matters: ' + $Card.Why) }
+    if ($Card.WhatToDo) { $lines += @('', 'What to do: ' + $Card.WhatToDo) }
+    if (($Card.PSObject.Properties.Name -contains 'Evidence') -and $Card.Evidence) { $lines += @('', 'Evidence:', [string]$Card.Evidence) }
+    if (($Card.PSObject.Properties.Name -contains 'Paths') -and @($Card.Paths).Count -gt 0) { $lines += @('', 'Files:') + @($Card.Paths | ForEach-Object { '  ' + $_ }) }
+    return ($lines -join "`r`n")
+}
+
+function Invoke-CardAction {
+    <# Scan with Defender (background), Open location, Copy details. #>
+    param([Parameter(Mandatory)][string]$Action, [Parameter(Mandatory)]$Card)
+    $paths = @()
+    if ($Card.PSObject.Properties.Name -contains 'Paths') { $paths = @($Card.Paths | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }) }
+    switch ($Action) {
+        'Copy details' {
+            try { Set-Clipboard -Value (Format-CardText -Card $Card); $script:UIRef.UI.StatusText.Text = 'Card details copied to the clipboard.' }
+            catch { (Show-AppMessage -Text (("Could not copy: {0}" -f $_.Exception.Message)) -Title ('Copy failed') -Buttons ('OK') -Icon ('Warning')) | Out-Null }
+        }
+        'Open location' {
+            if ($paths.Count -eq 0) { (Show-AppMessage -Text ('The file no longer exists.') -Title ('Open location') -Buttons ('OK') -Icon ('Information')) | Out-Null; return }
+            Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"{0}"' -f $paths[0])
+        }
+        'Scan with Defender' {
+            if (-not $script:State.IsAdmin) { return }
+            if ($paths.Count -eq 0) { (Show-AppMessage -Text ('The files on this card no longer exist.') -Title ('Scan with Defender') -Buttons ('OK') -Icon ('Information')) | Out-Null; return }
+            Invoke-Background -Status ("Microsoft Defender is scanning {0} file(s)..." -f $paths.Count) -Vars @{ ScanPaths = $paths } -Work {
+                Invoke-DefenderPathScan -Path $ScanPaths
+            } -OnDone {
+                param($res)
+                $r = @($res) | Select-Object -First 1
+                $msg = "Scanned {0} file(s)." -f @($r.Scanned).Count
+                if (@($r.Detections).Count -gt 0) {
+                    $msg += "`n`nDefender found:`n" + ((@($r.Detections) | ForEach-Object { '  Threat {0} in {1} (action succeeded: {2})' -f $_.ThreatId, $_.Resources, $_.ActionSuccess }) -join "`n")
+                    $msg += "`n`nOpen Windows Security > Protection history for details and what Defender did."
+                } else { $msg += "`n`nDefender found nothing in these files." }
+                if (@($r.Errors).Count -gt 0) { $msg += "`n`nNot scanned:`n  " + (@($r.Errors) -join "`n  ") }
+                (Show-AppMessage -Text ($msg) -Title ('Defender scan') -Buttons ('OK') -Icon ($(if (@($r.Detections).Count -gt 0) { 'Warning' } else { 'Information' }))) | Out-Null
+            }
+        }
+    }
+}
+
+function Invoke-SaveReport {
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    $target = Select-SaveFilePath -FileName ('SecurityReport_{0}_{1}.html' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm')) -Filter 'HTML report (*.html)|*.html'
+    if (-not $target) { return }
+    $script:State.Busy = $true
+    $script:UIRef.UI.BtnSaveReport.IsEnabled = $false
+    try {
+        Set-Busy -Text 'Writing the report...'
+        $sec = @($script:State.Security)
+        $html = New-HtmlReport -SecurityFindings $sec -Score $(if ($sec.Count -gt 0) { Get-SecurityScore $sec } else { $null }) -DfirCards @($script:State.Cards) `
+            -Changes @($script:Core.Changes.ToArray()) -RollbackPath $script:Core.RollbackFile -Tools @(Get-InstalledToolSummary) -SessionStart $script:Core.StartTime
+        [System.IO.File]::WriteAllText($target, $html, (New-Object System.Text.UTF8Encoding($false)))
+        Set-Busy -On $false
+        $script:UIRef.UI.StatusText.Text = "Report saved: $target"
+    } catch {
+        Set-Busy -On $false
+        (Show-AppMessage -Text (("The report could not be saved:`n{0}" -f $_.Exception.Message)) -Title ('Report not saved') -Buttons ('OK') -Icon ('Error')) | Out-Null
+    } finally {
+        $script:State.Busy = $false
+        $script:UIRef.UI.BtnSaveReport.IsEnabled = $true
+    }
+}
+
+function Invoke-EvidencePack {
+    <# Main thread with per-step status: it writes into the secure base. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    if (-not $script:State.IsAdmin) {
+        (Show-AppMessage -Text ('An evidence pack needs administrator rights (the Security log is admin-only). Relaunch via Start.bat.') -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
+        return
+    }
+    $target = Select-SaveFilePath -FileName ('Evidence_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm')) -Filter 'Zip archive (*.zip)|*.zip'
+    if (-not $target) { return }
+    $script:State.Busy = $true
+    $script:UIRef.UI.BtnEvidencePack.IsEnabled = $false
+    $progress = {
+        param($m)
+        Set-Busy -Text $m
+        # Let WPF repaint the status line between steps.
+        try { $script:UIRef.Window.Dispatcher.Invoke([action]{ }, [System.Windows.Threading.DispatcherPriority]::Background) } catch { }
+    }
+    try {
+        $r = New-EvidencePack -Destination $target -Findings @(@($script:State.Security) + @($script:State.Cards)) -Progress $progress
+        Set-Busy -On $false
+        $msg = "Evidence pack saved:`n{0}`n`n{1} files, {2:N1} MB." -f $r.Path, $r.FileCount, ($r.SizeBytes / 1MB)
+        if (@($r.Notes).Count -gt 0) { $msg += "`n`nNotes:`n  " + (@($r.Notes) -join "`n  ") }
+        if ($r.Warning) { $msg += "`n`n" + $r.Warning }
+        $msg += "`n`nIt contains user names, file paths and event logs. Share it only with someone you trust."
+        (Show-AppMessage -Text ($msg) -Title ('Evidence pack ready') -Buttons ('OK') -Icon ($(if ($r.Warning) { 'Warning' } else { 'Information' }))) | Out-Null
+        Update-LogView
+    } catch {
+        Set-Busy -On $false
+        (Show-AppMessage -Text (("The evidence pack could not be created:`n{0}" -f $_.Exception.Message)) -Title ('Evidence pack failed') -Buttons ('OK') -Icon ('Error')) | Out-Null
+    } finally {
+        $script:State.Busy = $false
+        $script:UIRef.UI.BtnEvidencePack.IsEnabled = $true
+    }
+}
+
+function Invoke-BaselineSave {
+    <# Confirm, snapshot in the background, then write the baseline on the main thread. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    if (-not (Test-IsAdmin)) {
+        (Show-AppMessage -Text ('Saving a baseline needs administrator rights so every check can be read. Relaunch via Start.bat.') -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
+        return
+    }
+    $msg = "Save how this PC looks right now as your baseline?`n`nDo this when you believe the PC is clean. Later, ""Compare with baseline"" shows only what is new or changed since now.`n`nThe previous baseline, if any, is kept as baseline.prev.json."
+    if ((Show-AppMessage -Text ($msg) -Title ('Save as baseline') -Buttons ('YesNo') -Icon ('Question')) -ne 'Yes') { return }
+    Invoke-Background -Status 'Taking a snapshot of this PC...' -Control $script:UIRef.UI.BtnBaselineSave -Vars @{ SnapAutoruns = (Get-SessionAutorunsCsv) } -Work {
+        Get-SystemSnapshot -AutorunsCsv $SnapAutoruns
+    } -OnDone {
+        param($res)
+        $snap = @($res) | Select-Object -First 1
+        try {
+            Set-Busy -Text 'Saving baseline...'
+            $path = Save-Baseline -Snapshot $snap
+            Set-Busy -On $false
+            $script:UIRef.UI.BaselineStatus.Text = "Baseline saved: $path"
+            Update-StatusChip
+        } catch {
+            Set-Busy -On $false
+            (Show-AppMessage -Text (("The baseline was not saved:`n{0}" -f $_.Exception.Message)) -Title ('Baseline not saved') -Buttons ('OK') -Icon ('Warning')) | Out-Null
+        }
+    }
+}
+
+function Start-BaselineCompare {
+    <# Snapshot now and compare with the saved baseline in the background. #>
+    Invoke-Background -Status 'Comparing this PC with the baseline...' -Control $script:UIRef.UI.BtnBaselineCompare -Vars @{ SnapAutoruns = (Get-SessionAutorunsCsv) } -Work {
+        try { @(Invoke-BaselineDrift -AutorunsCsv $SnapAutoruns) }
+        catch {
+            @(New-DfirFinding -Id 'DRIFT-ERROR' -Category 'Changes since baseline' -Title 'Could not compare with the baseline' -Severity 'Info' -Status 'Info' `
+                -What ("The comparison could not run: {0}" -f $_.Exception.Message) -Why 'A failed comparison is reported rather than shown as "no changes".' -WhatToDo 'Run as administrator. If the baseline came from another PC, save a new one here.' -Evidence '')
+        }
+    } -OnDone {
+        param($res)
+        $cards = @($res)
+        Add-DfirCard -Cards $cards -ReplacePrefix 'DRIFT-'
+        $alerts = @($cards | Where-Object { $_.Status -eq 'Alert' }).Count
+        $reviews = @($cards | Where-Object { $_.Status -eq 'Review' }).Count
+        $script:UIRef.UI.BaselineStatus.Text = ("Compared with the baseline: {0} alert(s), {1} to review." -f $alerts, $reviews)
+        $script:UIRef.UI.StatusText.Text = 'Baseline comparison complete.'
+    }
+}
+
+function Show-SecureSetupNotice {
+    <# Shows the quarantine notice once, then clears it. #>
+    if (-not $script:Core.SecureSetupNotice) { return }
+    $text = $script:Core.SecureSetupNotice
+    $script:Core.SecureSetupNotice = $null
+    try {
+        (Show-AppMessage -Text ($text) -Title ('Untrusted data folder moved aside') -Buttons ('OK') -Icon ('Information')) | Out-Null
+    } catch {
+        Write-CoreLog -Message ("Could not show the quarantine notice: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
 function Start-ProScan {
-    param([Parameter(Mandatory)][string]$Key)
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [ValidateSet('low','medium','high','critical')][string]$MinLevel = 'medium'
+    )
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
     $tool = Get-ExternalTool -Key $Key
 
     if (-not (Test-IsAdmin)) {
-        [System.Windows.MessageBox]::Show("$($tool.Name) needs administrator rights to read the Windows Security log. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("$($tool.Name) needs administrator rights to read the Windows Security log. Relaunch via Start.bat.") -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return
     }
 
@@ -930,9 +1330,10 @@ function Start-ProScan {
     # attacker-planted content.
     try { [void](Initialize-SecureToolsRoot) }
     catch {
-        [System.Windows.MessageBox]::Show("Could not secure the tools folder:`n$($_.Exception.Message)", 'Pro Tools blocked', 'OK', 'Error') | Out-Null
+        (Show-AppMessage -Text ("Could not secure the tools folder:`n$($_.Exception.Message)") -Title ('Pro Tools blocked') -Buttons ('OK') -Icon ('Error')) | Out-Null
         return
     }
+    Show-SecureSetupNotice
 
     # Already installed? Offer to reuse without re-consenting to a download.
     $installed = Test-ExternalToolInstalled -Key $Key
@@ -946,51 +1347,205 @@ function Start-ProScan {
     # stays responsive. Consent has already been captured on the UI thread; the
     # resolution object is passed in via -Vars. Progress flows through $Report
     # (injected into the runspace) -> $SharedState.Status -> the status bar.
-    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Vars @{ ProKey = $Key; ProResolution = $resolution } -Work {
-        # Install if not present (consent already given on UI thread when ProResolution is set).
-        $exe = Test-ExternalToolInstalled -Key $ProKey
-        if (-not $exe) {
-            $inst = Install-ExternalTool -Key $ProKey -ConsentAccepted -Resolution $ProResolution -Progress $Report
-            if (-not $inst.Success) { return [pscustomobject]@{ Error = $inst.Message; Findings=@() } }
-            $exe = $inst.ExePath
+    # OnDone runs later from the dispatcher timer, after this function has
+    # returned, so it cannot see $tool or $Key. Everything it needs travels in
+    # the result object (Key, ToolName). Reading $tool there threw under
+    # StrictMode: every Pro Tools run ended in "Error" and no cards appeared.
+    Invoke-Background -Status ("Running {0}..." -f $tool.Name) -Control $script:UIRef.UI.BtnProScan -Vars @{ ProKey = $Key; ProName = [string]$tool.Name; ProResolution = $resolution; ProMinLevel = $MinLevel } -Work {
+        try {
+            # Install if not present (consent already given on UI thread when ProResolution is set).
+            $exe = Test-ExternalToolInstalled -Key $ProKey
+            if (-not $exe) {
+                $inst = Install-ExternalTool -Key $ProKey -ConsentAccepted -Resolution $ProResolution -Progress $Report
+                if (-not $inst.Success) { return [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $inst.Message; Findings = @(); Signer = '' } }
+                $exe = $inst.ExePath
+            }
+            $findings = @(Invoke-ExternalDfirScan -Key $ProKey -ExePath $exe -MinLevel $ProMinLevel -Progress $Report)
+            $signer = ''
+            $tool = Get-ExternalTool -Key $ProKey
+            if ((Get-ExternalToolVerifyMode -Tool $tool) -eq 'Authenticode') {
+                try { $signer = [string](Get-AuthenticodeSignature -LiteralPath $exe).SignerCertificate.Subject } catch { $signer = '' }
+            }
+            [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $null; Findings = $findings; Signer = $signer }
+        } catch {
+            [pscustomobject]@{ Key = $ProKey; ToolName = $ProName; Error = $_.Exception.Message; Findings = @(); Signer = '' }
         }
-        $findings = Invoke-ExternalDfirScan -Key $ProKey -ExePath $exe -Progress $Report
-        [pscustomobject]@{ Error=$null; Findings=$findings }
     } -OnDone {
         param($res)
+        $res = @($res) | Select-Object -First 1
+        if (-not $res) { throw 'The Pro Tools job returned nothing.' }
+        $toolName = [string]$res.ToolName
         if ($res.Error) {
-            [System.Windows.MessageBox]::Show("$($tool.Name) could not complete:`n$($res.Error)", 'Pro tool failed', 'OK', 'Error') | Out-Null
+            Write-CoreLog -Message ("{0} could not complete: {1}" -f $toolName, $res.Error) -Level ERROR
+            $script:UIRef.UI.StatusText.Text = "$toolName could not complete."
+            (Show-AppMessage -Text ("$toolName could not complete:`n$($res.Error)") -Title ('Pro tool failed') -Buttons ('OK') -Icon ('Error')) | Out-Null
             return
         }
-        # Merge the external findings INTO the current Investigate list (keep native ones).
-        $existing = @()
-        if ($script:UIRef.UI.DfirList.ItemsSource) { $existing = @($script:UIRef.UI.DfirList.ItemsSource) }
-        $cards = $res.Findings | ForEach-Object { ConvertTo-DfirCard $_ }
-        $combined = @($existing) + @($cards)
-        $order = @{ 'Alert'=0; 'Review'=1; 'Info'=2; 'Clean'=3 }
-        $sorted = $combined | Sort-Object @{ Expression={ $order[$_.Status] } }, @{ Expression={ $_.Severity } }
-        $script:UIRef.UI.DfirList.ItemsSource = @($sorted)
-        $alerts = @($combined | Where-Object { $_.Status -eq 'Alert' }).Count
-        $reviews = @($combined | Where-Object { $_.Status -eq 'Review' }).Count
-        $script:UIRef.UI.CardDfir.Text = "$($alerts + $reviews)"
-        $script:UIRef.UI.DfirSummary.Text = "$($tool.Name) added $(@($cards).Count) result card(s)."
-        $script:UIRef.UI.StatusText.Text = "$($tool.Name) scan complete."
+        # Merge into the Investigate list, replacing this tool's earlier cards.
+        $cards = @($res.Findings)
+        $prefix = switch ([string]$res.Key) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '' } }
+        Add-DfirCard -Cards $cards -ReplacePrefix $prefix
+        $sigNote = ''
+        if ($res.Signer) { $sigNote = " Signature verified before running: $($res.Signer)." }
+        $script:UIRef.UI.DfirSummary.Text = "$toolName added $(@($cards).Count) result card(s).$sigNote"
+        $script:UIRef.UI.StatusText.Text = "$toolName scan complete."
+        # Make the new cards visible: reset the filter chip to All.
+        if ($script:State.CardFilter -ne 'All') { $script:UIRef.UI.FilterAll.IsChecked = $true }
+        Show-Page 'Investigate'
+        try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
     }
 }
 
+$script:ProToolsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Pro Tools" Height="640" Width="700"
+        WindowStartupLocation="CenterOwner" Background="#0E1117"
+        FontFamily="Segoe UI" FontSize="13" ResizeMode="NoResize" WindowStyle="SingleBorderWindow">
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Grid.Row="0" Background="#0B1B34" Padding="22,18">
+      <StackPanel>
+        <TextBlock Text="Pro Tools" FontSize="19" FontWeight="Bold" Foreground="#E6EDF3"/>
+        <TextBlock TextWrapping="Wrap" Foreground="#9FB3D1" Margin="0,3,0,0" Text="Optional scanners made by other projects. Each is downloaded from its official source the first time you run it, after a consent screen, and checked before every run. Results appear as cards on the Investigate page."/>
+      </StackPanel>
+    </Border>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Padding="22,16">
+      <StackPanel>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="HayName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="HayPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="HayLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="HayInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <TextBlock Text="Minimum level" Foreground="#8B949E" FontSize="11"/>
+              <ComboBox x:Name="HayLevel" Margin="0,2,0,8" SelectedIndex="1">
+                <ComboBoxItem Content="low"/>
+                <ComboBoxItem Content="medium"/>
+                <ComboBoxItem Content="high"/>
+                <ComboBoxItem Content="critical"/>
+              </ComboBox>
+              <Button x:Name="HayRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="ChsName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="ChsPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="ChsLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="ChsInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <TextBlock Text="Minimum level" Foreground="#8B949E" FontSize="11"/>
+              <ComboBox x:Name="ChsLevel" Margin="0,2,0,8" SelectedIndex="1">
+                <ComboBoxItem Content="low"/>
+                <ComboBoxItem Content="medium"/>
+                <ComboBoxItem Content="high"/>
+                <ComboBoxItem Content="critical"/>
+              </ComboBox>
+              <Button x:Name="ChsRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+        <Border Background="#161B22" CornerRadius="8" Padding="16" Margin="0,0,0,12">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Margin="0,0,16,0">
+              <TextBlock x:Name="AutName" FontSize="15" FontWeight="SemiBold" Foreground="#E6EDF3"/>
+              <TextBlock x:Name="AutPurpose" TextWrapping="Wrap" Foreground="#C9D1D9" Margin="0,4,0,0"/>
+              <TextBlock x:Name="AutLicense" TextWrapping="Wrap" Foreground="#D29922" FontSize="12" Margin="0,6,0,0"/>
+              <TextBlock x:Name="AutInstalled" TextWrapping="Wrap" Foreground="#8B949E" FontSize="12" Margin="0,4,0,0"/>
+            </StackPanel>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center" Width="130">
+              <Button x:Name="AutRun" Content="Run" Height="34" Background="#2F81F7" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+          </Grid>
+        </Border>
+      </StackPanel>
+    </ScrollViewer>
+    <Border Grid.Row="2" Background="#0B0E14" BorderBrush="#2A3140" BorderThickness="0,1,0,0" Padding="22,14">
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="PClose" Content="Close" Width="110" Height="36" Background="#21262D" Foreground="#E6EDF3" BorderThickness="0" Cursor="Hand" IsDefault="True" IsCancel="True"/>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+function Get-ProToolInstalledText {
+    <# One line for the Pro Tools dialog: installed version, or not installed. #>
+    param([Parameter(Mandatory)][string]$Key)
+    $exe = $null
+    try { $exe = Test-ExternalToolInstalled -Key $Key } catch { $exe = $null }
+    if (-not $exe) { return 'Not installed. Run downloads it first, after a consent screen.' }
+    $ver = ''
+    $dir = Get-ExternalToolInstallDir -ExePath $exe
+    if (-not $dir) { $dir = Split-Path -Path $exe -Parent }
+    $meta = Join-Path $dir 'install.json'
+    try {
+        if (Test-Path -LiteralPath $meta -PathType Leaf) {
+            $m = Get-Content -LiteralPath $meta -Raw | ConvertFrom-Json
+            if ($m.PSObject.Properties.Name -contains 'Version') { $ver = [string]$m.Version }
+            if (($m.PSObject.Properties.Name -contains 'VersionText') -and $m.VersionText -and $ver -eq 'latest') { $ver = [string]$m.VersionText }
+        }
+    } catch { Write-CoreLog -Message ("Could not read {0}: {1}" -f $meta, $_.Exception.Message) -Level WARN }
+    if (-not $ver) { $ver = 'unknown version' }
+    return ("Installed: {0}" -f $ver)
+}
+
 function Show-ProToolMenu {
-    # Simple chooser: which pro tool to run.
-    $msg = "Pro Tools run best-in-class open-source DFIR scanners against your event logs.`n`nThey are downloaded from their official GitHub release the first time (you'll see a consent screen with the license), then reused.`n`nChoose a tool:`n`n  YES  = Hayabusa (timeline threat hunter)`n  NO   = Chainsaw (Sigma rule hunter)`n  CANCEL = close"
-    $r = [System.Windows.MessageBox]::Show($msg, 'Pro Tools (external, opt-in)', 'YesNoCancel', 'Question')
-    switch ($r) {
-        'Yes' { Start-ProScan -Key 'hayabusa' }
-        'No'  { Start-ProScan -Key 'chainsaw' }
-        default { }
+    <# Pro Tools chooser: one row per tool with its purpose, license, installed
+       version and a Run button. Hayabusa and Chainsaw take a minimum level. #>
+    if ($script:State.Busy) { $script:UIRef.UI.StatusText.Text = 'Still working on the previous task. Please wait for it to finish.'; return }
+    $reader = New-Object System.Xml.XmlNodeReader ([xml]$script:ProToolsXaml)
+    $dlg = [Windows.Markup.XamlReader]::Load($reader)
+    $dlg.Owner = $script:UIRef.Window
+    $c = @{}
+    foreach ($n in @('PClose', 'HayName', 'HayPurpose', 'HayLicense', 'HayInstalled', 'HayLevel', 'HayRun',
+                     'ChsName', 'ChsPurpose', 'ChsLicense', 'ChsInstalled', 'ChsLevel', 'ChsRun',
+                     'AutName', 'AutPurpose', 'AutLicense', 'AutInstalled', 'AutRun')) {
+        $c[$n] = $dlg.FindName($n)
+        if ($null -eq $c[$n]) { throw ("The Pro Tools window is missing {0}." -f $n) }
     }
+    $rows = @(
+        @{ Key = 'hayabusa'; Prefix = 'Hay'; Purpose = 'Builds a timeline of attacker activity from your Windows event logs using thousands of Sigma and Hayabusa rules.' },
+        @{ Key = 'chainsaw'; Prefix = 'Chs'; Purpose = 'Searches your Windows event logs with Sigma rules and flags known attack techniques.' },
+        @{ Key = 'autoruns'; Prefix = 'Aut'; Purpose = 'Lists everything that starts automatically (services, drivers, tasks, Winlogon, WMI, hijacks) and checks every signature. Signed MS entries are hidden.' }
+    )
+    foreach ($r in $rows) {
+        $tool = Get-ExternalTool -Key $r.Key
+        $c[$r.Prefix + 'Name'].Text = ("{0}  |  {1}" -f $tool.Name, $tool.Vendor)
+        $c[$r.Prefix + 'Purpose'].Text = $r.Purpose
+        $c[$r.Prefix + 'License'].Text = ("License: {0}" -f $tool.License)
+        $c[$r.Prefix + 'Installed'].Text = (Get-ProToolInstalledText -Key $r.Key)
+        [System.Windows.Automation.AutomationProperties]::SetName($c[$r.Prefix + 'Run'], ("Run {0}" -f $tool.Name))
+    }
+    # Captured hashtable, not $script:, because the handlers are closures.
+    $choice = @{ Key = $null; MinLevel = 'medium' }
+    $hayLevel = $c.HayLevel; $chsLevel = $c.ChsLevel
+    $c.HayRun.Add_Click({ $choice.Key = 'hayabusa'; $choice.MinLevel = [string]$hayLevel.SelectedItem.Content; $dlg.Close() }.GetNewClosure())
+    $c.ChsRun.Add_Click({ $choice.Key = 'chainsaw'; $choice.MinLevel = [string]$chsLevel.SelectedItem.Content; $dlg.Close() }.GetNewClosure())
+    $c.AutRun.Add_Click({ $choice.Key = 'autoruns'; $dlg.Close() }.GetNewClosure())
+    $c.PClose.Add_Click({ $dlg.Close() }.GetNewClosure())
+    if ((Test-SelfTestMode) -and $script:SelfTestProPick) {
+        # The self-test clicks the scripted tool's Run button once the window shows.
+        $pick = switch ([string]$script:SelfTestProPick) { 'hayabusa' { $c.HayRun } 'chainsaw' { $c.ChsRun } 'autoruns' { $c.AutRun } default { $c.PClose } }
+        $dlg.Add_ContentRendered({ $pick.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))) }.GetNewClosure())
+    }
+    [void]$dlg.ShowDialog()
+    if ($choice.Key) { Start-ProScan -Key $choice.Key -MinLevel $choice.MinLevel }
 }
 # ============================================================================
 function Start-StartupScan {
-    Invoke-Background -Status 'Listing startup apps...' -Work { Get-StartupItems } -OnDone {
+    param([scriptblock]$Next = $null)
+    Invoke-Background -Status 'Listing startup apps...' -Next $Next -Work { Get-StartupItems } -OnDone {
         param($items)
         $rows = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         foreach ($i in @($items)) {
@@ -1019,7 +1574,7 @@ function Invoke-StartupToggle {
     if ($script:State.StartupSuppress) { return }
     if (-not (Test-IsAdmin)) {
         $script:State.StartupSuppress = $true; $Row.Enabled = (-not $Row.Enabled); $script:State.StartupSuppress = $false
-        [System.Windows.MessageBox]::Show("Changing startup items needs administrator rights. Relaunch via Start.bat.", 'Administrator required', 'OK', 'Warning') | Out-Null
+        (Show-AppMessage -Text ("Changing startup items needs administrator rights. Relaunch via Start.bat.") -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         return
     }
     $res = Set-StartupItemState -Type $Row._Type -Location $Row.Location -Name $Row.Name -Enable $Row.Enabled -Command $Row.Command -ValueType $Row._ValueType
@@ -1028,7 +1583,7 @@ function Invoke-StartupToggle {
     } else {
         # revert the toggle visually
         $script:State.StartupSuppress = $true; $Row.Enabled = (-not $Row.Enabled); $script:State.StartupSuppress = $false
-        [System.Windows.MessageBox]::Show("Could not change '$($Row.Name)':`n$($res.Message)", 'Failed', 'OK', 'Error') | Out-Null
+        (Show-AppMessage -Text ("Could not change '$($Row.Name)':`n$($res.Message)") -Title ('Failed') -Buttons ('OK') -Icon ('Error')) | Out-Null
     }
 }
 
@@ -1036,10 +1591,41 @@ function Invoke-StartupToggle {
 #  ACTIONS: FULL SCAN (dashboard)
 # ============================================================================
 function Start-FullScan {
-    Start-SecurityScan
-    Start-BloatScan
-    Start-DfirScan
-    Start-StartupScan
+    <# Security, apps, investigation and startup scans, one after another:
+       only one background job runs at a time, so each scan starts the next
+       when it ends. A failed scan does not stop the rest; failures are
+       listed in the final status and the log. #>
+    $script:State.FullScan = @{ Done = $false; Errors = (New-Object System.Collections.ArrayList) }
+    Start-SecurityScan -Next {
+        param($failure)
+        if ($failure) { [void]$script:State.FullScan.Errors.Add("Security: $failure") }
+        Start-BloatScan -Next {
+            param($failure)
+            if ($failure) { [void]$script:State.FullScan.Errors.Add("Apps: $failure") }
+            Start-DfirScan -Next {
+                param($failure)
+                if ($failure) { [void]$script:State.FullScan.Errors.Add("Investigate: $failure") }
+                Start-StartupScan -Next {
+                    param($failure)
+                    if ($failure) { [void]$script:State.FullScan.Errors.Add("Startup: $failure") }
+                    Complete-FullScan
+                }
+            }
+        }
+    }
+}
+
+function Complete-FullScan {
+    $fs = $script:State.FullScan
+    $errs = @($fs.Errors)
+    if ($errs.Count -eq 0) {
+        $script:UIRef.UI.StatusText.Text = ("Full scan complete: security score {0}/100, {1} removable app(s), {2} investigation card(s)." -f $script:UIRef.UI.CardScore.Text, $script:UIRef.UI.CardBloat.Text, @($script:State.Cards).Count)
+    } else {
+        $text = ("Full scan finished with {0} error(s): {1}" -f $errs.Count, ($errs -join ' | '))
+        $script:UIRef.UI.StatusText.Text = $text
+        Write-CoreLog -Message $text -Level WARN
+    }
+    $fs.Done = $true
 }
 
 # ============================================================================
@@ -1052,15 +1638,15 @@ function Open-DataFolder {
 function Open-RollbackScript {
     $p = $script:Core.RollbackFile
     if ($p -and (Test-Path $p)) { Start-Process notepad.exe $p }
-    else { [System.Windows.MessageBox]::Show('No rollback script yet - it is created after your first change.', 'No rollback yet', 'OK', 'Information') | Out-Null }
+    else { (Show-AppMessage -Text ('No rollback script yet - it is created after your first change.') -Title ('No rollback yet') -Buttons ('OK') -Icon ('Information')) | Out-Null }
 }
 function Invoke-MakeRestorePoint {
-    if (-not (Test-IsAdmin)) { [System.Windows.MessageBox]::Show('Creating a restore point needs admin. Relaunch via Start.bat.','Administrator required','OK','Warning') | Out-Null; return }
+    if (-not (Test-IsAdmin)) { (Show-AppMessage -Text ('Creating a restore point needs admin. Relaunch via Start.bat.') -Title ('Administrator required') -Buttons ('OK') -Icon ('Warning')) | Out-Null; return }
     Set-Busy -Text 'Creating System Restore point...'
     $ok = New-SystemRestorePointOnce -Description 'Win11 Security Optimizer - manual'
     Set-Busy -On $false
     $msg = if ($ok) { 'System Restore point created (or already exists for this session).' } else { 'Could not create a restore point. System Protection may be off for the system drive.' }
-    [System.Windows.MessageBox]::Show($msg, 'Restore point', 'OK', 'Information') | Out-Null
+    (Show-AppMessage -Text ($msg) -Title ('Restore point') -Buttons ('OK') -Icon ('Information')) | Out-Null
     Update-LogView
 }
 
@@ -1077,7 +1663,8 @@ function Register-Handlers {
     $u.NavRestore.Add_Click({ Show-Page 'Restore' })
 
     $u.BtnRefresh.Add_Click({
-        $title = $u.PageTitle.Text
+        # $u is gone by the time this fires (Register-Handlers has returned).
+        $title = $script:UIRef.UI.PageTitle.Text
         switch ($title) {
             'Security'      { Start-SecurityScan }
             'Debloat'       { Start-BloatScan }
@@ -1105,31 +1692,396 @@ function Register-Handlers {
     )
 
     $u.BtnBloatScan.Add_Click({ Start-BloatScan })
-    $u.BtnBloatSelectRec.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = [bool]$r.Recommended } } })
+    $u.BtnBloatSelectRec.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = (Test-DebloatPreset -Entry $r -Preset 'Recommended') } } })
+    $u.BtnBloatSelectMin.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = (Test-DebloatPreset -Entry $r -Preset 'Minimal') } } })
     $u.BtnBloatClear.Add_Click({ if ($script:State.Bloat) { foreach ($r in $script:State.Bloat) { $r.Selected = $false } } })
     $u.BtnBloatRemove.Add_Click({ Invoke-BloatRemove })
 
     $u.BtnDfirScan.Add_Click({ Start-DfirScan })
     $u.BtnDeepScan.Add_Click({ Start-DfirScan -Deep })
     $u.BtnProScan.Add_Click({ Show-ProToolMenu })
+    $u.BtnBaselineSave.Add_Click({ Invoke-BaselineSave })
+    $u.BtnSaveReport.Add_Click({ Invoke-SaveReport })
+    $u.BtnEvidencePack.Add_Click({ Invoke-EvidencePack })
+    foreach ($pair in @(@('FilterAll', 'All'), @('FilterAlert', 'Alert'), @('FilterReview', 'Review'), @('FilterInfo', 'Info'), @('FilterClean', 'Clean'))) {
+        $u[$pair[0]].Tag = $pair[1]
+        $u[$pair[0]].Add_Checked({ param($snd, $e) $script:State.CardFilter = [string]$snd.Tag; Update-DfirFilter })
+    }
+    # Card buttons: catch the bubbled Click at the list and read Tag (the card).
+    $u.DfirList.AddHandler(
+        [System.Windows.Controls.Button]::ClickEvent,
+        [System.Windows.RoutedEventHandler]{
+            param($snd, $e)
+            $src = $e.OriginalSource
+            if ($src -is [System.Windows.Controls.Button] -and $src.Tag -and ([string]$src.Content -in @('Scan with Defender', 'Open location', 'Copy details'))) {
+                Invoke-CardAction -Action ([string]$src.Content) -Card $src.Tag
+            }
+        }
+    )
+    $u.BtnBaselineCompare.Add_Click({ Start-BaselineCompare })
     $u.BtnStartupScan.Add_Click({ Start-StartupScan })
 
     $u.BtnOpenData.Add_Click({ Open-DataFolder })
     $u.BtnOpenRollback.Add_Click({ Open-RollbackScript })
     $u.BtnMakeRestore.Add_Click({ Invoke-MakeRestorePoint })
     $u.BtnRemoveTools.Add_Click({
-        $r = [System.Windows.MessageBox]::Show('Delete all downloaded Pro Tools (Hayabusa/Chainsaw)? They can be re-downloaded later.', 'Remove downloaded tools', 'YesNo', 'Question')
+        $r = (Show-AppMessage -Text ('Delete all downloaded Pro Tools (Hayabusa, Chainsaw, Autoruns)? They can be re-downloaded later.') -Title ('Remove downloaded tools') -Buttons ('YesNo') -Icon ('Question'))
         if ($r -eq 'Yes') {
-            try { $n = Remove-ExternalTools; [System.Windows.MessageBox]::Show("Removed $n downloaded tool folder(s).", 'Done', 'OK', 'Information') | Out-Null }
-            catch { [System.Windows.MessageBox]::Show("Could not remove tools: $($_.Exception.Message)", 'Error', 'OK', 'Error') | Out-Null }
+            try {
+                $kept = Test-SysmonToolInUse
+                $n = Remove-ExternalTools
+                $note = if ($kept) { "`n`nThe downloaded Sysmon was kept because Sysmon is installed and needs it to uninstall. Run the rollback script first to remove Sysmon." } else { '' }
+                (Show-AppMessage -Text ("Removed $n downloaded tool folder(s).$note") -Title ('Done') -Buttons ('OK') -Icon ('Information')) | Out-Null
+                Update-StatusChip
+            }
+            catch { (Show-AppMessage -Text ("Could not remove tools: $($_.Exception.Message)") -Title ('Error') -Buttons ('OK') -Icon ('Error')) | Out-Null }
             Update-LogView
         }
     })
 }
 
 # ============================================================================
+#  SELF-TEST HELPERS
+# ============================================================================
+function Get-SelfTestItemCount {
+    <# -1 when a list was never filled, otherwise its item count. #>
+    param($Items)
+    if ($null -eq $Items) { return -1 }
+    return @($Items).Count
+}
+
+function Write-SelfTestLine {
+    <# SelfTest result line: to stdout for the CI runner and to the session log. #>
+    param([Parameter(Mandatory)][string]$Text)
+    try { Write-CoreLog -Message $Text -Level INFO } catch { [Console]::Error.WriteLine('SelfTest: could not write the session log.') }
+    try { [Console]::Out.WriteLine($Text); [Console]::Out.Flush() }
+    catch { Write-CoreLog -Message ("SelfTest: stdout write failed: {0}" -f $_.Exception.Message) -Level WARN }
+}
+
+function Close-SelfTestWindow {
+    $script:CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:CloseTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:CloseTimer.Add_Tick({ $script:CloseTimer.Stop(); $script:UIRef.Window.Close() })
+    $script:CloseTimer.Start()
+}
+
+function Test-SelfTestFullScan {
+    <# SelfTest timer tick: waits for the Full Scan chain, checks that every
+       scan filled its list and none failed, prints the result and closes. #>
+    try {
+        $fs = $script:State.FullScan
+        $done = ($null -ne $fs) -and [bool]$fs.Done
+        $script:SelfTestTicks++
+        if ($script:SelfTestTicks % 20 -eq 1) {
+            Write-CoreLog -Message ("SelfTest: tick {0}, full scan started={1} done={2} busy={3} status={4}" -f $script:SelfTestTicks, ($null -ne $fs), $done, $script:State.Busy, $script:UIRef.UI.StatusText.Text) -Level INFO
+        }
+        if (-not $done -and (Get-Date) -lt $script:SelfTestDeadline) { return }
+        $script:SelfTestTimer.Stop()
+        $passed = Test-SelfTestResult -FullScan $fs -Done $done
+        if ($passed) { Start-SelfTestStep; return }   # the step timer closes the window
+    } catch {
+        try { $script:SelfTestTimer.Stop() } catch { Write-CoreLog -Message 'SelfTest: timer stop failed.' -Level WARN }
+        Write-SelfTestLine ("SELFTEST_FAIL self-test tick: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
+    }
+    Close-SelfTestWindow
+}
+
+function Test-SelfTestResult {
+    param($FullScan, [bool]$Done)
+    $fs = $FullScan; $done = $Done
+    $u = $script:UIRef.UI
+    $security = Get-SelfTestItemCount $u.SecList.ItemsSource
+    $apps = Get-SelfTestItemCount $u.BloatList.ItemsSource
+    $startup = Get-SelfTestItemCount $u.StartupListView.ItemsSource
+    $cards = @($script:State.Cards).Count
+    Write-SelfTestLine ("SELFTEST_FULLSCAN done={0} security={1} apps={2} cards={3} startup={4} busy={5} status={6}" -f $done, $security, $apps, $cards, $startup, $script:State.Busy, $u.StatusText.Text)
+    $problems = @()
+    if (-not $done) { $problems += 'the full scan did not finish within 10 minutes' }
+    if ($security -lt 1) { $problems += 'no security findings were listed' }
+    if ($apps -lt 0) { $problems += 'the app list was never filled' }
+    if ($cards -lt 1) { $problems += 'no investigation cards were listed' }
+    if ($startup -lt 0) { $problems += 'the startup list was never filled' }
+    if ($script:State.Busy) { $problems += 'the busy flag is still set' }
+    if ($fs) { foreach ($e in @($fs.Errors)) { $problems += [string]$e } }
+    if ($problems.Count -gt 0) { Write-SelfTestLine ("SELFTEST_FAIL full scan: {0}" -f ($problems -join '; ')); return $false }
+
+    # Click every filter chip with no cards, exactly one Alert card and the
+    # real cards. One card or none is what crashed the Alert chip in v1.2.0.
+    $uiProblems = @(Test-SelfTestUi)
+    if ($uiProblems.Count -gt 0) { Write-SelfTestLine ("SELFTEST_FAIL ui: {0}" -f ($uiProblems -join '; ')); return $false }
+    Write-SelfTestLine 'SELFTEST_UI ok'
+    # The action steps follow and print the final OK line.
+    return $true
+}
+
+function Invoke-SelfTestClick {
+    <# Raises Click on a button exactly as a mouse click does. #>
+    param([Parameter(Mandatory)]$Button)
+    $Button.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+}
+
+function Get-SelfTestStep {
+    <# The actions a user takes after a scan, each started the way a click
+       starts it. Start returns 'SKIP: reason' to skip the step; Check
+       returns problems. Pro Tools listed in W11SO_SELFTEST_PROTOOLS (comma
+       separated) run through the picker and, when not installed, the
+       consent window and the download. The blocks run later from the step
+       timer, so they use only script state and functions, never locals. #>
+    $steps = New-Object System.Collections.ArrayList
+    [void]$steps.Add(@{ Name = 'Deep Scan'; Minutes = 10
+        Start = { Invoke-SelfTestClick $script:UIRef.UI.BtnDeepScan }
+        Check = {
+            $p = @()
+            if ($script:UIRef.UI.StatusText.Text -ne 'Investigation complete.') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
+            if (@($script:State.Cards | Where-Object { ([string]$_.Id) -match '^(DEEP|EVT)-' }).Count -lt 1) { $p += 'no Deep Scan cards were listed' }
+            $p
+        } })
+    [void]$steps.Add(@{ Name = 'Debloat presets'; Minutes = 1
+        Start = {
+            if (-not $script:State.Bloat) { return 'SKIP: the app list was never filled' }
+            $rows = @($script:State.Bloat)
+            $script:SelfTestExpect = @{
+                Recommended = @($rows | Where-Object { Test-DebloatPreset -Entry $_ -Preset 'Recommended' }).Count
+                Minimal     = @($rows | Where-Object { Test-DebloatPreset -Entry $_ -Preset 'Minimal' }).Count
+                Got         = @{}
+            }
+            Invoke-SelfTestClick $script:UIRef.UI.BtnBloatSelectRec; $script:SelfTestExpect.Got.Recommended = @($rows | Where-Object { $_.Selected }).Count
+            Invoke-SelfTestClick $script:UIRef.UI.BtnBloatSelectMin; $script:SelfTestExpect.Got.Minimal = @($rows | Where-Object { $_.Selected }).Count
+            Invoke-SelfTestClick $script:UIRef.UI.BtnBloatClear;     $script:SelfTestExpect.Got.Clear = @($rows | Where-Object { $_.Selected }).Count
+        }
+        Check = {
+            $x = $script:SelfTestExpect; $p = @()
+            if ($x.Got.Recommended -ne $x.Recommended) { $p += ("Recommended ticked {0}, expected {1}" -f $x.Got.Recommended, $x.Recommended) }
+            if ($x.Got.Minimal -ne $x.Minimal) { $p += ("Minimal ticked {0}, expected {1}" -f $x.Got.Minimal, $x.Minimal) }
+            if ($x.Got.Clear -ne 0) { $p += ("Clear left {0} ticked" -f $x.Got.Clear) }
+            $p
+        } })
+    [void]$steps.Add(@{ Name = 'Card: Copy details'; Minutes = 1
+        Start = {
+            $card = @(@($script:State.Cards | Where-Object { $_.Evidence }) + @($script:State.Cards)) | Select-Object -First 1
+            if (-not $card) { return 'SKIP: no card to copy' }
+            $script:SelfTestCopied = $card
+            # A routed Click from a card button, as the card template raises it.
+            $btn = New-Object System.Windows.Controls.Button
+            $btn.Content = 'Copy details'; $btn.Tag = $card
+            $script:UIRef.UI.DfirList.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent), $btn))
+        }
+        Check = {
+            $p = @()
+            if ($script:UIRef.UI.StatusText.Text -ne 'Card details copied to the clipboard.') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
+            $clip = [string](Get-Clipboard -Raw)
+            if ($clip -notmatch [regex]::Escape([string]$script:SelfTestCopied.Title)) { $p += 'the clipboard does not hold the card title' }
+            if ($script:SelfTestCopied.Evidence -and $clip -notmatch 'Evidence:') { $p += 'the copied text has no evidence' }
+            $p
+        } })
+    [void]$steps.Add(@{ Name = 'Save report'; Minutes = 2
+        Start = { $script:SelfTestLastSave = $null; Show-Page 'Restore'; Invoke-SelfTestClick $script:UIRef.UI.BtnSaveReport }
+        Check = {
+            $f = $script:SelfTestLastSave
+            if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Leaf)) { return 'no report file was written' }
+            $html = [System.IO.File]::ReadAllText($f)
+            if ($html -notmatch '(?i)<html' -or $html.Length -lt 2000) { return ("the report looks empty ({0} chars)" -f $html.Length) }
+        } })
+    [void]$steps.Add(@{ Name = 'Baseline: save'; Minutes = 10
+        Start = { if (-not (Test-IsAdmin)) { return 'SKIP: needs administrator rights' }; $script:SelfTestReply = 'Yes'; Show-Page 'Investigate'; Invoke-SelfTestClick $script:UIRef.UI.BtnBaselineSave }
+        Check = {
+            $script:SelfTestReply = $null
+            if ($script:UIRef.UI.BaselineStatus.Text -notlike 'Baseline saved:*') { "baseline status is '{0}'" -f $script:UIRef.UI.BaselineStatus.Text }
+        } })
+    [void]$steps.Add(@{ Name = 'Baseline: compare'; Minutes = 10
+        Start = { if (-not (Test-IsAdmin)) { return 'SKIP: needs administrator rights' }; Invoke-SelfTestClick $script:UIRef.UI.BtnBaselineCompare }
+        Check = {
+            $p = @()
+            if ($script:UIRef.UI.StatusText.Text -ne 'Baseline comparison complete.') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
+            if ($script:UIRef.UI.BaselineStatus.Text -notlike 'Compared with the baseline:*') { $p += ("baseline status is '{0}'" -f $script:UIRef.UI.BaselineStatus.Text) }
+            $p
+        } })
+    $keys = @(([string]$(if ($env:W11SO_SELFTEST_PROTOOLS) { $env:W11SO_SELFTEST_PROTOOLS } else { $env:W11SO_SELFTEST_PROTOOL })).Split(',') | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    foreach ($key in $keys) {
+        $prefix = switch ($key) { 'hayabusa' { 'HAYA-' } 'chainsaw' { 'CHAIN-' } 'autoruns' { 'AUTORUNS-' } default { '?' } }
+        [void]$steps.Add(@{ Name = "Pro Tools: $key"; Minutes = 20; Key = $key; Prefix = $prefix
+            Start = {
+                if (-not (Test-IsAdmin)) { return 'SKIP: needs administrator rights' }
+                $step = $script:SelfTestSteps[$script:SelfTestStepIndex]
+                # The picker and, for a missing tool, the consent window are driven by -SelfTest.
+                $script:SelfTestProPick = $step.Key
+                $script:SelfTestAutoConsent = $true
+                Invoke-SelfTestClick $script:UIRef.UI.BtnProScan
+            }
+            Check = {
+                $step = $script:SelfTestSteps[$script:SelfTestStepIndex]
+                $script:SelfTestProPick = $null; $script:SelfTestAutoConsent = $false
+                $p = @()
+                $mine = @($script:State.Cards | Where-Object { ([string]$_.Id).StartsWith($step.Prefix, [System.StringComparison]::OrdinalIgnoreCase) })
+                if ($mine.Count -lt 1) { $p += ("no {0} cards were added" -f $step.Prefix) }
+                # Rule cards must carry the real events and something to search for.
+                $rules = @($mine | Where-Object { ([string]$_.Id) -match '^(HAYA|CHAIN)-\d+$' })
+                foreach ($c in @($rules | Select-Object -First 3)) {
+                    Write-SelfTestLine (("SELFTEST_CARD {0} | {1} | What: {2} | Do: {3} | Evidence: {4}" -f $c.Id, $c.Title, $c.What, $c.WhatToDo, $c.Evidence) -replace '\r?\n', ' / ')
+                    if ([string]$c.Evidence -notmatch ' event \d+') { $p += ("{0} has no event lines in its evidence" -f $c.Id) }
+                    if ([string]$c.WhatToDo -notmatch 'Search for: ') { $p += ("{0} has no search terms" -f $c.Id) }
+                }
+                if ($script:UIRef.UI.StatusText.Text -notmatch 'scan complete') { $p += ("status is '{0}'" -f $script:UIRef.UI.StatusText.Text) }
+                $p
+            } })
+    }
+    [void]$steps.Add(@{ Name = 'Card: Scan with Defender'; Minutes = 15
+        Start = {
+            if (-not (Test-IsAdmin)) { return 'SKIP: needs administrator rights' }
+            $card = @($script:State.Cards | Where-Object { $_.ScanVis -eq 'Visible' }) | Select-Object -First 1
+            if (-not $card) { return 'SKIP: no card lists a file to scan' }
+            $btn = New-Object System.Windows.Controls.Button
+            $btn.Content = 'Scan with Defender'; $btn.Tag = $card
+            $script:UIRef.UI.DfirList.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent), $btn))
+        }
+        Check = {
+            $seen = @($script:SelfTestDialogs | Select-Object -Skip $script:SelfTestDialogMark | Where-Object { $_.Title -eq 'Defender scan' })
+            if ($seen.Count -lt 1) { 'no Defender scan result was shown' }
+            elseif ($seen[0].Text -notmatch '^Scanned \d+ file') { "unexpected result: {0}" -f ($seen[0].Text -replace '\r?\n', ' ') }
+        } })
+    [void]$steps.Add(@{ Name = 'Evidence pack'; Minutes = 15
+        Start = { if (-not (Test-IsAdmin)) { return 'SKIP: needs administrator rights' }; $script:SelfTestLastSave = $null; Show-Page 'Restore'; Invoke-SelfTestClick $script:UIRef.UI.BtnEvidencePack }
+        Check = {
+            $p = @()
+            $f = $script:SelfTestLastSave
+            if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Leaf)) { $p += 'no evidence pack was written' }
+            if (@($script:SelfTestDialogs | Select-Object -Skip $script:SelfTestDialogMark | Where-Object { $_.Title -eq 'Evidence pack ready' }).Count -lt 1) { $p += 'the evidence pack summary was not shown' }
+            $p
+        } })
+    return $steps.ToArray()
+}
+
+function Start-SelfTestStep {
+    $script:SelfTestSteps = @(Get-SelfTestStep)
+    $script:SelfTestStepIndex = -1
+    $script:SelfTestStepRunning = $false
+    $script:SelfTestStepInTick = $false
+    $script:SelfTestStepFailed = New-Object System.Collections.ArrayList
+    $script:SelfTestStepTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:SelfTestStepTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+    $script:SelfTestStepTimer.Add_Tick({ Invoke-SelfTestStepTick })
+    $script:SelfTestStepTimer.Start()
+}
+
+function Invoke-SelfTestStepTick {
+    <# One step at a time: start it, wait while the app is busy, then check it.
+       A step that opens a modal window pumps messages, so this tick can be
+       re-entered; the guard keeps a second tick from starting the next step. #>
+    if ($script:SelfTestStepInTick) { return }
+    $script:SelfTestStepInTick = $true
+    try {
+        if ($script:SelfTestStepRunning) {
+            if ($script:State.Busy -and (Get-Date) -lt $script:SelfTestStepDeadline) { return }
+            $script:SelfTestStepRunning = $false
+            $step = $script:SelfTestSteps[$script:SelfTestStepIndex]
+            $problems = @()
+            if ($script:State.Busy) { $problems += ("still running after {0} minutes" -f $step.Minutes) }
+            else { try { $problems += @(& $step.Check | Where-Object { $_ }) } catch { $problems += ("the check threw: {0}" -f $_.Exception.Message) } }
+            foreach ($d in @($script:SelfTestDialogs | Select-Object -Skip $script:SelfTestDialogMark | Where-Object { $_.Icon -eq 'Error' })) { $problems += ("error box '{0}': {1}" -f $d.Title, ($d.Text -replace '\r?\n', ' ')) }
+            if ($script:State.UiErrors -ne $script:SelfTestUiMark) { $problems += 'an unhandled UI error was raised' }
+            $secs = ((Get-Date) - $script:SelfTestStepStarted).TotalSeconds
+            if ($problems.Count -gt 0) {
+                [void]$script:SelfTestStepFailed.Add($step.Name)
+                Write-SelfTestLine ("SELFTEST_FAIL step '{0}' after {1:N0}s: {2}" -f $step.Name, $secs, ($problems -join '; '))
+            } else { Write-SelfTestLine ("SELFTEST_STEP '{0}' ok in {1:N0}s" -f $step.Name, $secs) }
+        }
+        $script:SelfTestStepIndex++
+        if ($script:SelfTestStepIndex -ge @($script:SelfTestSteps).Count) {
+            $script:SelfTestStepTimer.Stop()
+            if ($script:SelfTestStepFailed.Count -eq 0) { Write-SelfTestLine 'SELFTEST_STEPS ok'; Write-SelfTestLine $script:SelfTestLine }
+            Close-SelfTestWindow
+            return
+        }
+        $step = $script:SelfTestSteps[$script:SelfTestStepIndex]
+        $script:SelfTestDialogMark = $script:SelfTestDialogs.Count
+        $script:SelfTestUiMark = $script:State.UiErrors
+        $script:SelfTestStepStarted = Get-Date
+        $script:SelfTestStepDeadline = (Get-Date).AddMinutes($step.Minutes)
+        Write-CoreLog -Message ("SelfTest: step '{0}' starting." -f $step.Name) -Level INFO
+        $skip = $null
+        try { $skip = @(& $step.Start | Where-Object { ($_ -is [string]) -and $_.StartsWith('SKIP: ') }) | Select-Object -First 1 }
+        catch {
+            [void]$script:SelfTestStepFailed.Add($step.Name)
+            Write-SelfTestLine ("SELFTEST_FAIL step '{0}' could not start: {1} | {2}" -f $step.Name, $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
+            return
+        }
+        if ($skip) { Write-SelfTestLine ("SELFTEST_STEP '{0}' skipped: {1}" -f $step.Name, $skip.Substring(6)); return }
+        $script:SelfTestStepRunning = $true
+    } catch {
+        try { $script:SelfTestStepTimer.Stop() } catch { Write-CoreLog -Message 'SelfTest: step timer stop failed.' -Level WARN }
+        Write-SelfTestLine ("SELFTEST_FAIL step runner: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
+        Close-SelfTestWindow
+    } finally {
+        $script:SelfTestStepInTick = $false
+    }
+}
+
+function Test-SelfTestUi {
+    <# SelfTest: drives the controls a user clicks after a scan. Returns problems. #>
+    $u = $script:UIRef.UI
+    $problems = @()
+    $real = @($script:State.Cards)
+    $oneAlert = ConvertTo-DfirCard (New-DfirFinding -Id 'SELFTEST-ALERT' -Category 'Self-test' -Title 'Self-test alert card' -Severity 'High' -Status 'Alert' -What 'x' -Why 'x' -WhatToDo 'x' -Evidence 'x')
+    $sets = @(
+        @{ Name = 'no cards';       Cards = @() },
+        @{ Name = 'one Alert card'; Cards = @($oneAlert) },
+        @{ Name = 'real cards';     Cards = $real }
+    )
+    $chips = @('FilterAlert', 'FilterReview', 'FilterInfo', 'FilterClean', 'FilterAll')
+    foreach ($set in $sets) {
+        try { $null = Set-DfirList -Cards @($set.Cards) } catch { $problems += ("Set-DfirList with {0}: {1}" -f $set.Name, $_.Exception.Message); continue }
+        foreach ($chip in $chips) {
+            $before = $script:State.UiErrors
+            try {
+                $u[$chip].IsChecked = $true
+                $shown = Get-SelfTestItemCount $u.DfirList.ItemsSource
+                Write-CoreLog -Message ("SelfTest: {0} with {1} shows {2} card(s)." -f $chip, $set.Name, $shown) -Level INFO
+            } catch { $problems += ("{0} with {1}: {2}" -f $chip, $set.Name, $_.Exception.Message) }
+            if ($script:State.UiErrors -ne $before) { $problems += ("{0} with {1} raised a UI error" -f $chip, $set.Name) }
+        }
+    }
+    try { $null = Set-DfirList -Cards $real } catch { $problems += ("restoring cards: {0}" -f $_.Exception.Message) }
+    # Refresh on the Restore & Logs page runs synchronously (Update-LogView).
+    try {
+        $null = Show-Page 'Restore'
+        $before = $script:State.UiErrors
+        $u.BtnRefresh.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+        if ($script:State.UiErrors -ne $before) { $problems += 'Refresh raised a UI error' }
+        $null = Show-Page 'Investigate'
+    } catch { $problems += ("Refresh: {0}" -f $_.Exception.Message) }
+    if ($script:State.UiErrors -gt 0) { $problems += ("{0} unhandled UI error(s) during the self-test" -f $script:State.UiErrors) }
+    return $problems
+}
+
+# ============================================================================
 #  MAIN
 # ============================================================================
+function Register-CrashGuard {
+    <# Last line of defence: an exception thrown inside any button, chip or timer
+       handler bubbles up through the WPF dispatcher and, unhandled, ends
+       ShowDialog and closes the app. Catch it on the dispatcher, write the full
+       PowerShell error to the session log, tell the user and keep running. #>
+    $script:UIRef.Window.Dispatcher.Add_UnhandledException({
+        param($snd, $e)
+        $ex = $e.Exception
+        while ($ex.InnerException -and ($ex -is [System.Management.Automation.MethodInvocationException] -or $ex -is [System.Reflection.TargetInvocationException])) { $ex = $ex.InnerException }
+        $where = ''
+        try { if ($ex.ErrorRecord -and $ex.ErrorRecord.InvocationInfo) { $where = $ex.ErrorRecord.InvocationInfo.PositionMessage } } catch { }
+        try { Write-CoreLog -Message ("Unhandled UI error: {0}`n{1}`n{2}" -f $ex.Message, $where, $ex.StackTrace) -Level ERROR } catch { }
+        try { $script:State.UiErrors++ } catch { }
+        $e.Handled = $true
+        if ($script:State.SelfTest) { try { Write-SelfTestLine ("SELFTEST_UIERROR {0} | {1}" -f $ex.Message, ($where -replace '\r?\n', ' ')) } catch { }; return }
+        try {
+            $script:UIRef.UI.Busy.Visibility = 'Collapsed'
+            $script:UIRef.UI.StatusText.Text = 'Something went wrong. The details are in Restore & Logs.'
+        } catch { }
+        try {
+            (Show-AppMessage -Text (("That action failed, but the app is still running.`n`n{0}`n`nThe full error is in the Restore & Logs tab." -f $ex.Message)) -Title ('Action failed') -Buttons ('OK') -Icon ('Warning')) | Out-Null
+        } catch { }
+        $e.Handled = $true
+    })
+}
+
 function Start-Optimizer {
     param([switch]$SelfTest)
 
@@ -1137,7 +2089,11 @@ function Start-Optimizer {
     $info = Get-CoreSystemInfo
 
     $script:UIRef = New-OptimizerWindow
-    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false }
+    $script:State = @{ Security=@(); Bloat=$null; Startup=$null; StartupSuppress=$false; Busy=$false; Cards=@(); CardFilter='All'; FullScan=$null; IsAdmin=[bool]$info.Admin; UiErrors=0; SelfTest=[bool]$SelfTest }
+    # Self-test plumbing; Show-AppMessage and the dialogs read these.
+    $script:SelfTestDialogs = New-Object System.Collections.ArrayList
+    $script:SelfTestReply = $null; $script:SelfTestLastSave = $null
+    $script:SelfTestProPick = $null; $script:SelfTestAutoConsent = $false
 
     # header / admin badge
     $script:UIRef.UI.VersionText.Text = "v$($script:Core.Version)  -  Build $($info.Build)"
@@ -1163,24 +2119,27 @@ function Start-Optimizer {
     }
 
     Register-Handlers
+    Register-CrashGuard
     Show-Page 'Dashboard'
+    try { Update-StatusChip } catch { Write-CoreLog -Message ("Status chips could not be updated: {0}" -f $_.Exception.Message) -Level WARN }
 
     # If we are elevated but could NOT secure the ProgramData data folder (e.g. a
     # standard user pre-created it and denied Administrators), Initialize-Core fell
     # back to %LOCALAPPDATA% for rollback/backup files. That is user-writable, so
     # warn the user explicitly rather than letting it pass silently.
+    if (-not $SelfTest) { Show-SecureSetupNotice }
     if (-not $SelfTest -and $script:Core.SecureSetupWarning) {
         try {
-            [System.Windows.MessageBox]::Show(
-                ($script:Core.SecureSetupWarning + "`n`nUntil this is resolved, treat the generated rollback script as lower-trust and review it before running it elevated."),
-                'Could not secure the backup folder', 'OK', 'Warning') | Out-Null
+            (Show-AppMessage -Text (($script:Core.SecureSetupWarning + "`n`nUntil this is resolved, treat the generated rollback script as lower-trust and review it before running it elevated.")) -Title ('Could not secure the backup folder') -Buttons ('OK') -Icon ('Warning')) | Out-Null
         } catch { }
     }
 
     if ($SelfTest) {
-        # Build + render the window, run read-only scans synchronously, then auto-close.
+        # Render the window and run the read-only engines synchronously, then
+        # click Run Full Scan for real and wait for the whole chain to finish.
         Write-CoreLog -Message 'SelfTest: window constructed OK.' -Level OK
         $script:UIRef.Window.Add_ContentRendered({
+            $driving = $false
             try {
                 Write-CoreLog -Message 'SelfTest: content rendered.' -Level OK
                 $sec = Invoke-SecurityScan;  Write-CoreLog -Message ("SelfTest: security findings = {0}" -f @($sec).Count) -Level INFO
@@ -1190,19 +2149,31 @@ function Start-Optimizer {
                 $deep = Invoke-DeepScan;     Write-CoreLog -Message ("SelfTest: deep-scan findings = {0}" -f @($deep).Count) -Level INFO
                 # External-tool plumbing (no download/run): registry + consent XAML parse.
                 $reg = Get-ExternalToolRegistry; Write-CoreLog -Message ("SelfTest: external tools registered = {0}" -f @($reg).Count) -Level INFO
-                $consentOk = $false
-                try { $cr = New-Object System.Xml.XmlNodeReader ([xml]$script:ConsentXaml); [void][Windows.Markup.XamlReader]::Load($cr); $consentOk = $true } catch { Write-CoreLog -Message ("SelfTest: consent XAML FAILED: {0}" -f $_.Exception.Message) -Level ERROR }
-                Write-Host "SELFTEST_OK findings=$(@($sec).Count) apps=$(@($inv).Count) dfir=$(@($df).Count) startup=$(@($st).Count) deep=$(@($deep).Count) extTools=$(@($reg).Count) consentXaml=$consentOk"
+                $consentOk = $true
+                foreach ($xv in @('ConsentXaml', 'ProToolsXaml')) {
+                    try { $cr = New-Object System.Xml.XmlNodeReader ([xml](Get-Variable -Name $xv -Scope Script -ValueOnly)); [void][Windows.Markup.XamlReader]::Load($cr) }
+                    catch { $consentOk = $false; Write-CoreLog -Message ("SelfTest: {0} FAILED: {1}" -f $xv, $_.Exception.Message) -Level ERROR }
+                }
+                $script:SelfTestLine = "SELFTEST_OK findings=$(@($sec).Count) apps=$(@($inv).Count) dfir=$(@($df).Count) startup=$(@($st).Count) deep=$(@($deep).Count) extTools=$(@($reg).Count) consentXaml=$consentOk"
+                # The path a user takes: background jobs, the busy guard, the
+                # OnDone handlers and the scan chain, run by a real click.
+                $script:SelfTestDeadline = (Get-Date).AddMinutes(10)
+                $script:SelfTestTicks = 0
+                $script:SelfTestTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $script:SelfTestTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+                $script:SelfTestTimer.Add_Tick({ Test-SelfTestFullScan })
+                $script:UIRef.UI.BtnFullScan.RaiseEvent((New-Object System.Windows.RoutedEventArgs ([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)))
+                $script:SelfTestTimer.Start()
+                Write-CoreLog -Message ("SelfTest: clicked Run Full Scan; full scan started={0}, busy={1}" -f ($null -ne $script:State.FullScan), $script:State.Busy) -Level INFO
+                $driving = $true
             } catch {
-                Write-Host "SELFTEST_FAIL $($_.Exception.Message)"
+                Write-SelfTestLine ("SELFTEST_FAIL {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- '))
             } finally {
-                $script:CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
-                $script:CloseTimer.Interval = [TimeSpan]::FromMilliseconds(400)
-                $script:CloseTimer.Add_Tick({ $script:CloseTimer.Stop(); $script:UIRef.Window.Close() })
-                $script:CloseTimer.Start()
+                if (-not $driving) { Close-SelfTestWindow }
             }
         })
-        [void]$script:UIRef.Window.ShowDialog()
+        try { [void]$script:UIRef.Window.ShowDialog() }
+        catch { Write-SelfTestLine ("SELFTEST_FAIL the window stopped with an error: {0} | {1}" -f $_.Exception.Message, ($_.ScriptStackTrace -replace '\r?\n', ' <- ')) }
         return
     }
 

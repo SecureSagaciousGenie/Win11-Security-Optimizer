@@ -1,9 +1,9 @@
 # Reinstalling apps you removed
 
-Every app removed by the Debloat tab is reinstallable — removal only uninstalls
-the app, it doesn't blacklist it. You have three options.
+Every app removed by the Debloat tab is reinstallable. Removal only uninstalls
+the app; it doesn't blacklist it. You have three options.
 
-## Option 1 — Microsoft Store (easiest)
+## Option 1: MS Store (easiest)
 
 1. Open the **Microsoft Store**.
 2. Search for the app by name (see the table below).
@@ -29,9 +29,11 @@ the app, it doesn't blacklist it. You have three options.
 | People | `People` |
 | Phone Link | `Phone Link` |
 | Quick Assist | `Quick Assist` |
+| Family Safety | `Microsoft Family Safety` |
+| Web Search (Bing) app | `Bing` |
 | Microsoft To Do | `Microsoft To Do` |
 
-## Option 2 — Reinstall ALL built-in apps at once (PowerShell)
+## Option 2: Reinstall ALL built-in apps at once (PowerShell)
 
 Open an **elevated** PowerShell (Run as administrator) and run:
 
@@ -44,7 +46,7 @@ Get-AppxPackage -AllUsers | ForEach-Object {
 This re-registers every inbox app that still has files staged on the system. It's
 safe to run; already-installed apps are skipped.
 
-## Option 3 — Reinstall one specific app by package name
+## Option 3: Reinstall one specific app by package name
 
 The tool logs the exact package family of everything it removes. Open the
 **Restore & Logs** tab (or `%LOCALAPPDATA%\Win11SecurityOptimizer\logs\`) to find
