@@ -54,8 +54,9 @@ All notable changes to this project. Versions follow [Semantic Versioning](https
 - Sidebar chips for elevation, Sysmon, baseline and Pro Tools.
 - Pester test suite, PSScriptAnalyzer gate and an integration workflow that
   runs the real fixes, downloads and rollbacks on an elevated Windows runner.
-- Release workflow: tags `v*` publish a zip of the repository and
-  `SHA256SUMS.txt`.
+- Release workflow: a `v*` tag builds a draft release with a zip of the
+  repository and `SHA256SUMS.txt`. The Publish release workflow, run by hand
+  with the tag, re-checks the checksums and publishes it.
 
 ### Fixed
 - In 1.1.0 the window closed with "The property 'Visibility' cannot be found

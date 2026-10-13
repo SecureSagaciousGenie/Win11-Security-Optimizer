@@ -66,9 +66,22 @@ Describe 'Release' {
         (Read-RepoText $file).Contains([string][char]0x2014) | Should -BeFalse
     }
     It 'puts the author line in <file>' -ForEach @(
-        @{ file = 'CHANGELOG.md' }, @{ file = 'SECURITY.md' }, @{ file = '.github\workflows\release.yml' }, @{ file = 'tests\Release.Tests.ps1' }
+        @{ file = 'CHANGELOG.md' }, @{ file = 'SECURITY.md' }, @{ file = '.github\workflows\release.yml' }, @{ file = '.github\workflows\publish-release.yml' }, @{ file = 'tests\Release.Tests.ps1' }
     ) {
         (Read-RepoText $file) | Should -Match 'Author: Ahmad Shaukat'
+    }
+    It 'publishes only a vN.N.N draft, and only after its checksums verify' {
+        $y = Read-RepoText '.github\workflows\publish-release.yml'
+        $y | Should -Match '(?m)^on:\s*\r?\n\s+workflow_dispatch:'
+        $y | Should -Not -Match '(?m)^\s+(push|pull_request|schedule):'
+        $y | Should -Match ([regex]::Escape('TAG: ${{ inputs.tag }}'))
+        $y | Should -Not -Match ([regex]::Escape('run: ${{'))
+        $y | Should -Match ([regex]::Escape('^v[0-9]+\.[0-9]+\.[0-9]+$'))
+        $y | Should -Match 'isDraft'
+        $check = $y.IndexOf('sha256sum -c SHA256SUMS.txt')
+        $publish = $y.IndexOf('--draft=false')
+        $check | Should -BeGreaterThan 0
+        $publish | Should -BeGreaterThan $check
     }
     It 'releases on v* tags with the zip and SHA256SUMS.txt, gated on the tests' {
         $y = Read-RepoText '.github\workflows\release.yml'
